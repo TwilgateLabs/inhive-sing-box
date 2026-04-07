@@ -16,6 +16,9 @@ _htest/
 /*.jar
 /*.aar
 /*.xcframework/
+/experimental/libbox/*.aar
+/experimental/libbox/*.xcframework/
+/experimental/libbox/*.nupkg
 .DS_Store
 /config.d/
 /venv/

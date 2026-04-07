@@ -35,6 +35,7 @@ const (
 	TypeSSMAPI       = "ssm-api"
 	TypeCCM          = "ccm"
 	TypeOCM          = "ocm"
+	TypeOOMKiller    = "oom-killer"
 
 	TypeHInvalidConfig = "hinvalid" //H
 	TypeXray           = "xray"     //H
@@ -103,6 +104,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "AnyTLS"
 	case TypePsiphon:
 		return "Psiphon"
+	case TypeTailscale:
+		return "Tailscale"
 	case TypeSelector:
 		return "Selector"
 	case TypeURLTest:

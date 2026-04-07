@@ -23,9 +23,10 @@ import (
 )
 
 func BaseContext(platformInterface PlatformInterface) context.Context {
-	return FromContext(context.Background(), platformInterface)
+	return baseContext(platformInterface)
 }
-func FromContext(ctx context.Context, platformInterface PlatformInterface) context.Context {
+
+func baseContext(platformInterface PlatformInterface) context.Context {
 	dnsRegistry := include.DNSTransportRegistry()
 	if platformInterface != nil {
 		if localTransport := platformInterface.LocalDNSTransport(); localTransport != nil {
@@ -48,7 +49,7 @@ func parseConfig(ctx context.Context, configContent string) (option.Options, err
 }
 
 func CheckConfig(configContent string) error {
-	ctx := BaseContext(nil)
+	ctx := baseContext(nil)
 	options, err := parseConfig(ctx, configContent)
 	if err != nil {
 		return err
@@ -199,7 +200,7 @@ func (s *interfaceMonitorStub) MyInterface() string {
 }
 
 func FormatConfig(configContent string) (*StringBox, error) {
-	options, err := parseConfig(BaseContext(nil), configContent)
+	options, err := parseConfig(baseContext(nil), configContent)
 	if err != nil {
 		return nil, err
 	}
