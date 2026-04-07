@@ -378,30 +378,15 @@ func (m *ConnectionManager) connectionCopyEarlyWrite(source net.Conn, destinatio
 		}
 		return err
 	}
-	var (
-		isTimeout bool
-		isEOF     bool
-	)
 	_, err = payload.ReadOnceFrom(source)
-	if err != nil {
-		if E.IsTimeout(err) {
-			isTimeout = true
-		} else if errors.Is(err, io.EOF) {
-			isEOF = true
-		} else {
-			return E.Cause(err, "read payload")
-		}
+	if err != nil && !E.IsTimeout(err) && !errors.Is(err, io.EOF) {
+		return E.Cause(err, "read payload")
 	}
 	_ = source.SetReadDeadline(time.Time{})
 	if !payload.IsEmpty() || writeHandshake {
 		_, err = destination.Write(payload.Bytes())
 		if err != nil {
 			return E.Cause(err, "write payload")
-		}
-	}
-	if !done.Swap(true) {
-		if onClose != nil {
-			onClose(err)
 		}
 	}
 	return nil

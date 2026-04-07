@@ -238,7 +238,6 @@ func (c *Connector[T]) Close() error {
 		c.access.Unlock()
 		return nil
 	}
-	hasConnectiopn := c.hasConnection
 	c.closed = true
 	c.hasConnection = false
 	c.access.Unlock()
