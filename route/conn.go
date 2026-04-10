@@ -278,7 +278,9 @@ func (m *ConnectionManager) preConnectionCopy(ctx context.Context, source net.Co
 		}
 		if err != nil {
 			if done.Swap(true) {
-				onClose(err)
+				if onClose != nil {
+					onClose(err)
+				}
 			}
 			common.Close(source, destination)
 			if !direction {
@@ -308,7 +310,9 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
 				cachedBuffer.Release()
 				if err != nil {
 					if done.Swap(true) {
-						onClose(err)
+						if onClose != nil {
+							onClose(err)
+						}
 					}
 					common.Close(source, destination)
 					if !direction {
