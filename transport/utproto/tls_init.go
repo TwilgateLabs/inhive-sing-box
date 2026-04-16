@@ -63,9 +63,13 @@ func opBeg() op                     { return op{kind: opBeginScope} }
 func opEnd() op                     { return op{kind: opEndScope} }
 func opPad() op                     { return op{kind: opPadding} }
 func opPerm(parts [][]op) op        { return op{kind: opPermutation, parts: parts} }
+// opRandVal picks a random sub-sequence from parts. An empty parts slice is
+// a programming error in the profile definition; we emit a sentinel op with
+// valueIdx = -1 so the two-pass renderer returns an error instead of panicking
+// inside a connection handler.
 func opRandVal(parts [][]op) op {
 	if len(parts) == 0 {
-		panic("utproto: random_value with empty parts")
+		return op{kind: opRandomValue, parts: nil, valueIdx: -1}
 	}
 	return op{kind: opRandomValue, parts: parts, valueIdx: mrand.IntN(len(parts))}
 }
@@ -208,6 +212,9 @@ func calcLength(ops []op, c *ctxData) (int, error) {
 					}
 				}
 			case opRandomValue:
+				if len(o.parts) == 0 || o.valueIdx < 0 || o.valueIdx >= len(o.parts) {
+					return errors.New("utproto: random_value with invalid parts")
+				}
 				if err := walk(o.parts[o.valueIdx]); err != nil {
 					return err
 				}
@@ -301,6 +308,9 @@ func store(dst []byte, ops []op, c *ctxData) error {
 					pos += len(p)
 				}
 			case opRandomValue:
+				if len(o.parts) == 0 || o.valueIdx < 0 || o.valueIdx >= len(o.parts) {
+					return errors.New("utproto: random_value with invalid parts")
+				}
 				if err := walk(o.parts[o.valueIdx]); err != nil {
 					return err
 				}
