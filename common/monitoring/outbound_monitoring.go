@@ -324,7 +324,10 @@ func (m *OutboundMonitoring) Start(stage adapter.StartStage) error {
 		}
 
 		m.started = true
-		m.Touch()
+		// inhive: НЕ зовём Touch() здесь. Раньше при PostStart стартовал
+		// 5-мин URLTest тикер на 10 мин (до idleTimeout) даже без UI подписчика
+		// — зря грел CPU и сеть. Теперь тикер запускается строго on-demand:
+		// OutboundsHistory / SubscribeGroup / TestNow (ручной пинг из UI).
 	}
 
 	return nil
