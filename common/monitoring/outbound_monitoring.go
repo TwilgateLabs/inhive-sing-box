@@ -18,7 +18,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service"
 
-	"github.com/sagernet/sing-box/hiddify/ipinfo"
+	"github.com/sagernet/sing-box/inhive/ipinfo"
 	"github.com/sagernet/sing/common/x/list"
 
 	"github.com/sagernet/sing/common"

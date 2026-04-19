@@ -21,7 +21,7 @@ type _V2RayTransportOptions struct {
 	GRPCOptions        V2RayGRPCOptions        `json:"-"`
 	HTTPUpgradeOptions V2RayHTTPUpgradeOptions `json:"-"`
 	XHTTPOptions       V2RayXHTTPOptions       `json:"-"`
-	DNSTTOptions       DnsttOptions            `json:"-"`
+	// DNSTTOptions removed 2026-04-19 (dehiddification)
 }
 
 type V2RayTransportOptions _V2RayTransportOptions

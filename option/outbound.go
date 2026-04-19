@@ -91,7 +91,7 @@ type DialerOptions struct {
 	// Deprecated: migrated to domain resolver
 	DomainStrategy DomainStrategy `json:"domain_strategy,omitempty"`
 
-	TLSFragment TLSFragmentOptions `json:"tls_fragment,omitempty"` //hiddify
+	TLSFragment TLSFragmentOptions `json:"tls_fragment,omitempty"` // InHive extension
 
 }
 

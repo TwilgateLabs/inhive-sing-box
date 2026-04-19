@@ -1,6 +1,6 @@
 package option
 
-type HInvalidOptions struct {
+type InvalidOptions struct {
 	InvalidConfig any
 	Err           error
 }

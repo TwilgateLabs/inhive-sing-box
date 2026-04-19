@@ -1,4 +1,4 @@
-package hinvalid
+package invalid
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 )
 
 func RegisterOutbound(registry *outbound.Registry) {
-	outbound.Register[option.HInvalidOptions](registry, C.TypeHInvalidConfig, New)
+	outbound.Register[option.InvalidOptions](registry, C.TypeInvalidConfig, New)
 }
 
 var _ adapter.Outbound = (*Outbound)(nil)
@@ -24,12 +24,12 @@ var _ adapter.Outbound = (*Outbound)(nil)
 type Outbound struct {
 	outbound.Adapter
 	logger         logger.ContextLogger
-	InvalidOptions option.HInvalidOptions
+	InvalidOptions option.InvalidOptions
 }
 
-func New(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, invalidOptions option.HInvalidOptions) (adapter.Outbound, error) {
+func New(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, invalidOptions option.InvalidOptions) (adapter.Outbound, error) {
 	return &Outbound{
-		Adapter:        outbound.NewAdapter(C.TypeHInvalidConfig, tag, []string{N.NetworkTCP, N.NetworkUDP}, nil),
+		Adapter:        outbound.NewAdapter(C.TypeInvalidConfig, tag, []string{N.NetworkTCP, N.NetworkUDP}, nil),
 		logger:         logger,
 		InvalidOptions: invalidOptions,
 	}, nil

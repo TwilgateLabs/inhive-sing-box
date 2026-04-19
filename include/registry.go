@@ -23,10 +23,8 @@ import (
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing-box/protocol/group/balancer"
-	"github.com/sagernet/sing-box/protocol/hiddify/dnstt"
-	"github.com/sagernet/sing-box/protocol/hiddify/hinvalid"
+	"github.com/sagernet/sing-box/protocol/invalid"
 
-	"github.com/sagernet/sing-box/protocol/hiddify/xray"
 	"github.com/sagernet/sing-box/protocol/http"
 	"github.com/sagernet/sing-box/protocol/mieru"
 	"github.com/sagernet/sing-box/protocol/mixed"
@@ -104,9 +102,7 @@ func OutboundRegistry() *outbound.Registry {
 	// psiphon.RegisterOutbound(registry) // removed — breaks Go 1.26 TLS
 	mieru.RegisterOutbound(registry)
 	anytls.RegisterOutbound(registry)
-	hinvalid.RegisterOutbound(registry)
-	xray.RegisterOutbound(registry)
-	dnstt.RegisterOutbound(registry)
+	invalid.RegisterOutbound(registry)
 	utproto.RegisterOutbound(registry)
 	balancer.RegisterLoadBalance(registry)
 

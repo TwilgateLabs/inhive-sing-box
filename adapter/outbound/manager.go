@@ -270,10 +270,10 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 		return os.ErrInvalid
 	}
 	outbound, err := m.registry.CreateOutbound(ctx, router, logger, tag, inboundType, options)
-	if err != nil { // hiddify fallback to invalid config
+	if err != nil { // InHive: fallback to invalid config вместо жёсткого fail
 		err2 := E.New("parse outbound[", tag, "] error: ", err)
 		m.logger.Error(err2)
-		outbound, err = m.registry.CreateOutbound(ctx, router, logger, tag, C.TypeHInvalidConfig, &option.HInvalidOptions{
+		outbound, err = m.registry.CreateOutbound(ctx, router, logger, tag, C.TypeInvalidConfig, &option.InvalidOptions{
 			InvalidConfig: options,
 			Err:           err2,
 		})

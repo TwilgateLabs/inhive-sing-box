@@ -5,7 +5,7 @@ import (
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common/json/badoption"
-	hiddify "github.com/sagernet/wireguard-go/hiddify"
+	warpobf "github.com/sagernet/wireguard-go/warpobf"
 )
 
 type WireGuardEndpointOptions struct {
@@ -22,7 +22,7 @@ type WireGuardEndpointOptions struct {
 	DisablePauses              bool                             `json:"disable_pauses,omitempty"`
 	DialerOptions
 
-	Noise hiddify.NoiseOptions `json:"noise,omitempty"`
+	Noise warpobf.NoiseOptions `json:"noise,omitempty"`
 }
 
 type WireGuardPeer struct {
@@ -48,7 +48,7 @@ type WireGuardWARPEndpointOptions struct {
 
 	UniqueIdentifier string               `json:"unique_identifier,omitempty"` //h
 	ServerOptions                         //H
-	Noise            hiddify.NoiseOptions `json:"noise,omitempty"` //H
+	Noise            warpobf.NoiseOptions `json:"noise,omitempty"` //H
 	*C.WARPConfig                         //H
 	MTU              uint32               `json:"mtu,omitempty"`
 }
@@ -80,7 +80,7 @@ type LegacyWireGuardOutboundOptions struct {
 	MTU                        uint32      `json:"mtu,omitempty"`
 	Network                    NetworkList `json:"network,omitempty"`
 
-	Noise hiddify.NoiseOptions `json:"noise,omitempty"`
+	Noise warpobf.NoiseOptions `json:"noise,omitempty"`
 }
 
 type LegacyWireGuardPeer struct {
