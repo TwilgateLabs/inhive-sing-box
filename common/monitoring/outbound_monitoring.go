@@ -105,7 +105,9 @@ func (m *OutboundMonitoring) Name() string {
 }
 
 func (m *OutboundMonitoring) OutboundsHistory(groupTag string) map[string]*adapter.URLTestHistory {
-
+	// inhive: Touch здесь — UI (Flutter через gRPC AllProxiesInfoStream) спрашивает
+	// пинги, значит активен → бустрапим ticker.
+	m.Touch()
 	histories := make(map[string]*adapter.URLTestHistory)
 
 	grp, ok := m.groups[groupTag]
@@ -189,12 +191,17 @@ func (m *OutboundMonitoring) getMinGroupOutboundHistory(groupTag string) *adapte
 
 }
 
+// inhive: НЕ вызываем Touch() на трафик.
+// Раньше каждое TCP/UDP соединение через sing-box продлевало жизнь
+// monitoring ticker'а → URLTest всех outbounds крутился каждые 5 минут
+// пока VPN включён, даже если юзер не смотрел список серверов.
+// Теперь тикер просыпается только когда реально нужны свежие пинги:
+// OutboundsHistory / SubscribeGroup / TestNow. Через idleTimeout (10 мин)
+// без чтений scheduleLoop сам глушит тикер.
 func (m *OutboundMonitoring) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
-	m.Touch()
 	return conn
 }
 func (m *OutboundMonitoring) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
-	m.Touch()
 	return conn
 }
 
@@ -364,6 +371,8 @@ func (m *OutboundMonitoring) SignalChange(outboundTag string) error {
 
 }
 func (m *OutboundMonitoring) TestNow(outboundTag string) error {
+	// inhive: ручной пинг (selector change / Clash API /delay) → бустрапим тикер.
+	m.Touch()
 	m.testParents(outboundTag, true)
 	return m.testNow(outboundTag, true)
 }
@@ -427,7 +436,8 @@ func (m *OutboundMonitoring) InvalidateTest(outboundTag string) error {
 }
 
 func (m *OutboundMonitoring) SubscribeGroup(groupTag string) (observer <-chan GroupEvent, err error) {
-
+	// inhive: подписка = UI открыл стрим пингов, бустрапим тикер пока он активен.
+	m.Touch()
 	if g, ok := m.groups[groupTag]; ok {
 		return g.observer.Subscribe(1), nil
 	}
