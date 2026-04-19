@@ -1,76 +1,57 @@
+// debug_http.go — pprof и debug HTTP server. По умолчанию ВЫКЛЮЧЕНО.
+// Чтобы включить для локальной диагностики CPU/goroutine leaks —
+// выставь env var INHIVE_PPROF=1 перед запуском приложения.
+//
+// Доступ только с localhost (127.0.0.1:9091). Наружу не выставляется.
+// В production deployment переменная не ставится → сервер не поднимается.
 package box
 
 import (
+	"log"
+	"net"
 	"net/http"
-	"net/http/pprof"
-	"runtime"
-	"runtime/debug"
-	"strings"
+	_ "net/http/pprof" // регистрирует /debug/pprof/* handlers
+	"os"
+	"sync"
 
-	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common/byteformats"
-	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/json"
-	"github.com/sagernet/sing/common/json/badjson"
-
-	"github.com/go-chi/chi/v5"
 )
 
-var debugHTTPServer *http.Server
+var (
+	debugHTTPServer interface{ Close() error }
+	debugHTTPOnce   sync.Once
+)
 
-func applyDebugListenOption(options option.DebugOptions) {
-	if debugHTTPServer != nil {
-		debugHTTPServer.Close()
-		debugHTTPServer = nil
-	}
-	if options.Listen == "" {
+// init поднимает pprof при загрузке пакета, если env var выставлена.
+// Это гарантирует запуск pprof даже если в sing-box конфиге нет debug секции.
+func init() {
+	if os.Getenv("INHIVE_PPROF") != "1" {
 		return
 	}
-	r := chi.NewMux()
-	r.Route("/debug", func(r chi.Router) {
-		r.Get("/gc", func(writer http.ResponseWriter, request *http.Request) {
-			writer.WriteHeader(http.StatusNoContent)
-			go debug.FreeOSMemory()
-		})
-		r.Get("/memory", func(writer http.ResponseWriter, request *http.Request) {
-			var memStats runtime.MemStats
-			runtime.ReadMemStats(&memStats)
+	debugHTTPOnce.Do(startPprofServer)
+}
 
-			var memObject badjson.JSONObject
-			memObject.Put("heap", byteformats.FormatMemoryBytes(memStats.HeapInuse))
-			memObject.Put("stack", byteformats.FormatMemoryBytes(memStats.StackInuse))
-			memObject.Put("idle", byteformats.FormatMemoryBytes(memStats.HeapIdle-memStats.HeapReleased))
-			memObject.Put("goroutines", runtime.NumGoroutine())
-			memObject.Put("rss", rusageMaxRSS())
-
-			encoder := json.NewEncoder(writer)
-			encoder.SetIndent("", "  ")
-			encoder.Encode(&memObject)
-		})
-		r.Route("/pprof", func(r chi.Router) {
-			r.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
-				if !strings.HasSuffix(request.URL.Path, "/") {
-					http.Redirect(writer, request, request.URL.Path+"/", http.StatusMovedPermanently)
-				} else {
-					pprof.Index(writer, request)
-				}
-			})
-			r.HandleFunc("/*", pprof.Index)
-			r.HandleFunc("/cmdline", pprof.Cmdline)
-			r.HandleFunc("/profile", pprof.Profile)
-			r.HandleFunc("/symbol", pprof.Symbol)
-			r.HandleFunc("/trace", pprof.Trace)
-		})
-	})
-	debugHTTPServer = &http.Server{
-		Addr:    options.Listen,
-		Handler: r,
+// applyDebugListenOption — вызывается из конфига, оставлен для совместимости.
+func applyDebugListenOption(_ option.DebugOptions) {
+	if os.Getenv("INHIVE_PPROF") != "1" {
+		return
 	}
+	debugHTTPOnce.Do(startPprofServer)
+}
+
+func startPprofServer() {
+	const addr = "127.0.0.1:9091"
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("[inhive-pprof] failed to listen on %s: %v", addr, err)
+		return
+	}
+	server := &http.Server{Handler: http.DefaultServeMux}
+	debugHTTPServer = server
+	log.Printf("[inhive-pprof] listening on http://%s/debug/pprof/", addr)
 	go func() {
-		err := debugHTTPServer.ListenAndServe()
-		if err != nil && !E.IsClosed(err) {
-			log.Error(E.Cause(err, "serve debug HTTP server"))
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			log.Printf("[inhive-pprof] server error: %v", err)
 		}
 	}()
 }
