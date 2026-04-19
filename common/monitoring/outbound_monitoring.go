@@ -759,8 +759,13 @@ func (m *OutboundMonitoring) applyResult(outcome testOutcome) *adapter.URLTestHi
 	state.queued = false
 	state.priorityQueued = false
 	state.enqueuedCycle = 0
-	state.invalid = outcome.err != nil
+	state.invalid = false
 	state.lastURL = outcome.url
+	// При ошибке — не перетестировать немедленно, чтобы не молотить дохлые
+	// серверы в цикле. Обновляем Time → следующий тест через mainInterval.
+	if outcome.err != nil && state.history.Time.IsZero() {
+		state.history.Time = time.Now()
+	}
 	if (outcome.history.Delay != state.history.Delay) || state.history.IpInfo == nil || (outcome.history.IpInfo != nil) {
 		m.cacheDirty.Store(true)
 	}
