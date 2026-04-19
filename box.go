@@ -21,7 +21,6 @@ import (
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
-	"github.com/sagernet/sing-box/dns/transport/local"
 	"github.com/sagernet/sing-box/experimental"
 	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/log"
@@ -348,11 +347,12 @@ func New(options Options) (*Box, error) {
 		)
 	})
 	dnsTransportManager.Initialize(func() (adapter.DNSTransport, error) {
-		return local.NewTransport(
+		return dnsTransportRegistry.CreateDNSTransport(
 			ctx,
 			logFactory.NewLogger("dns/local"),
 			"local",
-			option.LocalDNSServerOptions{},
+			C.DNSTypeLocal,
+			&option.LocalDNSServerOptions{},
 		)
 	})
 	if platformInterface != nil {
