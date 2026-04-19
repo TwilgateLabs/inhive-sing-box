@@ -271,7 +271,9 @@ func (m *ConnectionManager) preConnectionCopy(ctx context.Context, source net.Co
 			err = m.connectionCopyEarlyWrite(source, destination, readHandshake, writeHandshake)
 			if err == nil && N.NeedHandshakeForRead(source) {
 				continue
-			} else if E.IsMulti(err, os.ErrInvalid, context.DeadlineExceeded, io.EOF) {
+			} else if isBenignPreConnError(err) {
+				// inhive: fast-path замена E.IsMulti (reflection). На hot path
+				// одно TCP соединение = один этот вызов, errors.As жрал ~10% CPU.
 				err = nil
 			}
 			break
@@ -382,9 +384,25 @@ func (m *ConnectionManager) connectionCopyEarlyWrite(source net.Conn, destinatio
 		}
 		return err
 	}
+	// inhive Fix v3: возвращаем timeout/EOF наружу, НЕ проглатываем.
+	// Иначе preConnectionCopy видит err=nil + handshake still pending → hot loop.
+	// Upstream sing-box 12b05598 (Fix preConnectionCopy, sekai.icu, 2025-09-14).
+	// Регрессия в коммите 80908859 случайно откатила этот fix → 500% CPU burn
+	// при failed VLESS handshake (сервер закрыл сокет на partial read).
+	var (
+		isTimeout bool
+		isEOF     bool
+	)
 	_, err = payload.ReadOnceFrom(source)
-	if err != nil && !E.IsTimeout(err) && !errors.Is(err, io.EOF) {
-		return E.Cause(err, "read payload")
+	if err != nil {
+		if isNetTimeout(err) {
+			// inhive: isNetTimeout вместо E.IsTimeout — избегаем errors.As reflection.
+			isTimeout = true
+		} else if errors.Is(err, io.EOF) {
+			isEOF = true
+		} else {
+			return E.Cause(err, "read payload")
+		}
 	}
 	_ = source.SetReadDeadline(time.Time{})
 	if !payload.IsEmpty() || writeHandshake {
@@ -392,6 +410,11 @@ func (m *ConnectionManager) connectionCopyEarlyWrite(source net.Conn, destinatio
 		if err != nil {
 			return E.Cause(err, "write payload")
 		}
+	}
+	if isTimeout {
+		return context.DeadlineExceeded
+	} else if isEOF {
+		return io.EOF
 	}
 	return nil
 }
@@ -471,4 +494,55 @@ func (c *trackedPacketConn) ReaderReplaceable() bool {
 
 func (c *trackedPacketConn) WriterReplaceable() bool {
 	return true
+}
+
+// isNetTimeout — zero-reflection timeout check. Ручной walk Unwrap chain
+// с type switch. Прошлая версия через err.(interface{Timeout() bool}) не
+// ловила wrapped *net.OpError (inbound источник завёрнут через trackedConn
+// и bufio layers), и fallback errors.As возвращал 12s CPU (17% cum по pprof).
+// Теперь цепочку разворачиваем вручную — выявленно через профайль HOT_061047.
+func isNetTimeout(err error) bool {
+	for cur := err; cur != nil; {
+		switch e := cur.(type) {
+		case *net.OpError:
+			return e.Timeout()
+		case interface{ Timeout() bool }:
+			return e.Timeout()
+		case interface{ Unwrap() error }:
+			cur = e.Unwrap()
+			continue
+		case interface{ Unwrap() []error }:
+			for _, sub := range e.Unwrap() {
+				if isNetTimeout(sub) {
+					return true
+				}
+			}
+			return false
+		}
+		break
+	}
+	return false
+}
+
+// isBenignPreConnError — zero-reflection проверка benign error sentinels.
+// Вместо errors.Is (который тоже проходит через Unwrap с interface dispatch)
+// раскручиваем вручную и сравниваем по значению.
+func isBenignPreConnError(err error) bool {
+	for cur := err; cur != nil; {
+		if cur == os.ErrInvalid || cur == context.DeadlineExceeded || cur == io.EOF {
+			return true
+		}
+		// Пробуем метод Is() если есть (net.errDeadlineExceeded implements Is).
+		if ie, ok := cur.(interface{ Is(error) bool }); ok {
+			if ie.Is(os.ErrInvalid) || ie.Is(context.DeadlineExceeded) || ie.Is(io.EOF) {
+				return true
+			}
+		}
+		if u, ok := cur.(interface{ Unwrap() error }); ok {
+			cur = u.Unwrap()
+			continue
+		}
+		break
+	}
+	return false
 }
