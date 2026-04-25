@@ -42,6 +42,10 @@ func NewDefaultFactory(
 		platformFormatter: Formatter{
 			BaseTime:         formatter.BaseTime,
 			DisableLineBreak: true,
+			// InHive: platformWriter получает сообщения которые идут в UI через
+			// gRPC stream (Flutter LogsPage). ANSI escape-коды для terminal'а
+			// там только мусорят отображение ([36mINFO[0m вместо INFO).
+			DisableColors: true,
 		},
 		writer:         writer,
 		filePath:       filePath,

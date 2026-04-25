@@ -157,7 +157,11 @@ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	tlsConfig.Time = ntp.TimeFuncFromContext(ctx)
 	tlsConfig.RootCAs = adapter.RootPoolFromContext(ctx)
 	if !options.DisableSNI {
-		tlsConfig.ServerName = serverName
+		if options.TLSTricks != nil && options.TLSTricks.MixedCaseSNI {
+			tlsConfig.ServerName = randomizeCase(serverName)
+		} else {
+			tlsConfig.ServerName = serverName
+		}
 	}
 	if options.Insecure {
 		tlsConfig.InsecureSkipVerify = options.Insecure

@@ -72,6 +72,7 @@ func InboundRegistry() *inbound.Registry {
 	anytls.RegisterInbound(registry)
 	mieru.RegisterInbound(registry)
 	ssh.RegisterInbound(registry)
+	utproto.RegisterInbound(registry)
 
 	registerQUICInbounds(registry)
 	registerStubForRemovedInbounds(registry)

@@ -1068,7 +1068,16 @@ func (s *StartedService) WriteMessage(level log.Level, message string) {
 	}
 	s.logAccess.Unlock()
 	s.logSubscriber.Emit(item)
-	if s.debug {
+	// InHive: форвард в PlatformHandler всегда (не только в debug-билде) —
+	// Flutter LogsPage подписана на hcore gRPC log stream через этот мост.
+	// Если handler поддерживает WriteMessage с level — используем (сохраняет
+	// INFO/WARN/ERROR в UI). Fallback на WriteDebugMessage — legacy-путь
+	// для handler'ов без extended interface (обёртка libbox command_server).
+	if leveled, ok := s.handler.(interface {
+		WriteMessage(level log.Level, message string)
+	}); ok {
+		leveled.WriteMessage(level, message)
+	} else {
 		s.handler.WriteDebugMessage(message)
 	}
 }

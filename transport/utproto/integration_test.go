@@ -3,8 +3,10 @@ package utproto
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -469,5 +471,162 @@ func TestVLESSOverUTProto(t *testing.T) {
 		t.Log("Confirmed: response is from example.com ✓")
 	} else if strings.Contains(resp, "200 OK") || strings.Contains(resp, "200") {
 		t.Log("Got HTTP 200 response ✓")
+	}
+}
+
+// TestDialAcceptRoundTrip exercises the full client↔server handshake
+// in-process: Dial from one goroutine, Accept on a loopback listener
+// from another, exchange a message over the established obf2 stream,
+// and verify the server correctly identifies the matching user from a
+// pool of fake users.
+func TestDialAcceptRoundTrip(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	// Build a pool of 5 users with random secrets; the "real" secret
+	// sits in the middle so we prove the multi-user loop actually
+	// iterates (not just returns users[0]).
+	users := make([]ServerUser, 5)
+	for i := range users {
+		if _, err := io.ReadFull(rand.Reader, users[i].Secret[:]); err != nil {
+			t.Fatal(err)
+		}
+		users[i].Name = "fake_" + string(rune('a'+i))
+	}
+	var realSecret [16]byte
+	if _, err := io.ReadFull(rand.Reader, realSecret[:]); err != nil {
+		t.Fatal(err)
+	}
+	users[2].Secret = realSecret
+	users[2].Name = "real_user"
+
+	serverErr := make(chan error, 1)
+	go func() {
+		rawConn, err := ln.Accept()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer rawConn.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		conn, user, err := Accept(ctx, rawConn, users)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if user.Name != "real_user" {
+			serverErr <- errors.New("wrong user matched: " + user.Name)
+			return
+		}
+		buf := make([]byte, 1024)
+		n, err := conn.Read(buf)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		if _, err := conn.Write(buf[:n]); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	rawConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawConn.Close()
+	cfg := &Config{TLSDomain: "learn.microsoft.com", Secret: realSecret}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := Dial(ctx, rawConn, cfg)
+	if err != nil {
+		t.Fatalf("client Dial: %v", err)
+	}
+	defer conn.Close()
+
+	msg := []byte("hello utproto — round trip")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	if string(got) != string(msg) {
+		t.Fatalf("echo mismatch: got %q want %q", got, msg)
+	}
+
+	select {
+	case err := <-serverErr:
+		if err != nil {
+			t.Fatalf("server: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server goroutine did not finish")
+	}
+}
+
+// TestAcceptWrongSecret verifies that Accept rejects connections whose
+// HMAC does not match any configured user secret.
+func TestAcceptWrongSecret(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	var serverSecret [16]byte
+	copy(serverSecret[:], []byte("server_secret_16"))
+	users := []ServerUser{{Name: "srv", Secret: serverSecret}}
+
+	serverDone := make(chan *HandshakeError, 1)
+	go func() {
+		rawConn, err := ln.Accept()
+		if err != nil {
+			serverDone <- &HandshakeError{Kind: "accept_failed", Err: err}
+			return
+		}
+		defer rawConn.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _, err = Accept(ctx, rawConn, users)
+		var he *HandshakeError
+		if errors.As(err, &he) {
+			serverDone <- he
+		} else {
+			serverDone <- nil
+		}
+	}()
+
+	var clientSecret [16]byte
+	copy(clientSecret[:], []byte("client_secret_16"))
+	rawConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawConn.Close()
+	cfg := &Config{TLSDomain: "learn.microsoft.com", Secret: clientSecret}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = Dial(ctx, rawConn, cfg) // expected to fail or hang
+
+	select {
+	case he := <-serverDone:
+		if he == nil {
+			t.Fatal("server accepted wrong secret (expected HandshakeError)")
+		}
+		if he.Kind != "identify_user" {
+			t.Fatalf("wrong HandshakeError Kind: got %q want identify_user", he.Kind)
+		}
+		if len(he.Buffer) < 500 {
+			t.Errorf("expected buffered ClientHello bytes for fallback replay, got %d", len(he.Buffer))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not reject handshake")
 	}
 }
