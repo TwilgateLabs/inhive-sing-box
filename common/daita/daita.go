@@ -10,7 +10,7 @@ package daita
 
 /*
 #include "maybenot.h"
-#cgo LDFLAGS: -L${SRCDIR} -lmaybenot -lm
+#cgo LDFLAGS: -L${SRCDIR} -lmaybenot -lm -lntdll -lws2_32 -luserenv -lbcrypt
 #include <stdlib.h>
 */
 import "C"
