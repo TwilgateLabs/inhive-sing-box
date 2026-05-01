@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/daita"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/option"
@@ -29,11 +30,19 @@ type Options struct {
 
 // TODO: merge with NewWithOptions
 func New(ctx context.Context, options option.DialerOptions, remoteIsDomain bool) (N.Dialer, error) {
-	return NewWithOptions(Options{
+	d, err := NewWithOptions(Options{
 		Context:        ctx,
 		Options:        options,
 		RemoteIsDomain: remoteIsDomain,
 	})
+	if err != nil {
+		return nil, err
+	}
+	// Wrap with DAITA padding if a Framework is present in ctx.
+	if fw := daita.FrameworkFromContext(ctx); fw != nil {
+		return daita.WrapDialer(d, fw), nil
+	}
+	return d, nil
 }
 
 func NewWithOptions(options Options) (N.Dialer, error) {
