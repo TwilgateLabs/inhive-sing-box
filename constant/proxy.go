@@ -21,6 +21,7 @@ const (
 	TypeSSH          = "ssh"
 	TypeShadowTLS    = "shadowtls"
 	TypeMieru        = "mieru"
+	TypeDnstt        = "dnstt"
 	TypeAnyTLS       = "anytls"
 	TypeShadowsocksR = "shadowsocksr"
 	TypeVLESS        = "vless"
@@ -106,6 +107,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Hysteria2"
 	case TypeMieru:
 		return "Mieru"
+	case TypeDnstt:
+		return "DNSTT"
 	case TypeAnyTLS:
 		return "AnyTLS"
 	case TypePsiphon:

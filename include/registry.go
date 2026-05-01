@@ -25,6 +25,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/group/balancer"
 	"github.com/sagernet/sing-box/protocol/invalid"
 
+	"github.com/sagernet/sing-box/protocol/dnstt"
 	"github.com/sagernet/sing-box/protocol/http"
 	"github.com/sagernet/sing-box/protocol/mieru"
 	"github.com/sagernet/sing-box/protocol/mixed"
@@ -102,6 +103,7 @@ func OutboundRegistry() *outbound.Registry {
 	vless.RegisterOutbound(registry)
 	// psiphon.RegisterOutbound(registry) // removed — breaks Go 1.26 TLS
 	mieru.RegisterOutbound(registry)
+	dnstt.RegisterOutbound(registry)
 	anytls.RegisterOutbound(registry)
 	invalid.RegisterOutbound(registry)
 	utproto.RegisterOutbound(registry)
