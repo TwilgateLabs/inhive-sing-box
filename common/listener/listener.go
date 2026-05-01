@@ -32,6 +32,8 @@ type Listener struct {
 	disablePacketOutput      bool
 	setSystemProxy           bool
 	systemProxySOCKS         bool
+	systemProxyUser          string
+	systemProxyPass          string
 	tproxy                   bool
 
 	tcpListener          net.Listener
@@ -55,6 +57,8 @@ type Options struct {
 	DisablePacketOutput      bool
 	SetSystemProxy           bool
 	SystemProxySOCKS         bool
+	SystemProxyUser          string
+	SystemProxyPass          string
 	TProxy                   bool
 }
 
@@ -73,6 +77,8 @@ func New(
 		disablePacketOutput:      options.DisablePacketOutput,
 		setSystemProxy:           options.SetSystemProxy,
 		systemProxySOCKS:         options.SystemProxySOCKS,
+		systemProxyUser:          options.SystemProxyUser,
+		systemProxyPass:          options.SystemProxyPass,
 		tproxy:                   options.TProxy,
 	}
 }
@@ -106,7 +112,7 @@ func (l *Listener) Start() error {
 		} else {
 			listenAddrString = listenAddr.String()
 		}
-		systemProxy, err := settings.NewSystemProxy(l.ctx, M.ParseSocksaddrHostPort(listenAddrString, listenPort), l.systemProxySOCKS)
+		systemProxy, err := settings.NewSystemProxy(l.ctx, M.ParseSocksaddrHostPort(listenAddrString, listenPort), l.systemProxySOCKS, l.systemProxyUser, l.systemProxyPass)
 		if err != nil {
 			return E.Cause(err, "initialize system proxy")
 		}

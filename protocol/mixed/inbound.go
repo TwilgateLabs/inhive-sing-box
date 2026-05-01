@@ -57,6 +57,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		inbound.tlsConfig = tlsConfig
 	}
+	// Pass first user credentials to system proxy so browsers receive them
+	// automatically and don't show an auth prompt.
+	var sysProxyUser, sysProxyPass string
+	if len(options.Users) > 0 {
+		sysProxyUser = options.Users[0].Username
+		sysProxyPass = options.Users[0].Password
+	}
 	inbound.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -65,6 +72,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ConnectionHandler: inbound,
 		SetSystemProxy:    options.SetSystemProxy,
 		SystemProxySOCKS:  true,
+		SystemProxyUser:   sysProxyUser,
+		SystemProxyPass:   sysProxyPass,
 	})
 	return inbound, nil
 }

@@ -33,10 +33,11 @@ var _ StartedServiceServer = (*StartedService)(nil)
 type StartedService struct {
 	ctx context.Context
 	// platform adapter.PlatformInterface
-	handler     PlatformHandler
-	debug       bool
-	logMaxLines int
-	oomKiller   bool
+	handler             PlatformHandler
+	debug               bool
+	logMaxLines         int
+	oomKiller           bool
+	noPlatformLogWriter bool
 	// workingDirectory string
 	// tempDirectory    string
 	// userID           int
@@ -67,10 +68,15 @@ type StartedService struct {
 type ServiceOptions struct {
 	Context context.Context
 	// Platform           adapter.PlatformInterface
-	Handler     PlatformHandler
-	Debug       bool
-	LogMaxLines int
-	OOMKiller   bool
+	Handler             PlatformHandler
+	Debug               bool
+	LogMaxLines         int
+	OOMKiller           bool
+	// NoPlatformLogWriter disables passing s as box.Options.PlatformLogWriter.
+	// When false (default), box enables CacheFile because PlatformLogWriter!=nil.
+	// Set true for side-instances that must NOT share data/clash.db with the
+	// main instance (e.g. bootstrap fetch instances).
+	NoPlatformLogWriter bool
 	// WorkingDirectory   string
 	// TempDirectory      string
 	// UserID             int
@@ -83,10 +89,11 @@ func NewStartedService(options ServiceOptions) *StartedService {
 	s := &StartedService{
 		ctx: options.Context,
 		// platform:                options.Platform,
-		handler:     options.Handler,
-		debug:       options.Debug,
-		logMaxLines: options.LogMaxLines,
-		oomKiller:   options.OOMKiller,
+		handler:             options.Handler,
+		debug:               options.Debug,
+		logMaxLines:         options.LogMaxLines,
+		oomKiller:           options.OOMKiller,
+		noPlatformLogWriter: options.NoPlatformLogWriter,
 		// workingDirectory: options.WorkingDirectory,
 		// tempDirectory:    options.TempDirectory,
 		// userID:           options.UserID,

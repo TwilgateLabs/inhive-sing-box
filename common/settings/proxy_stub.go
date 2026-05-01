@@ -9,6 +9,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 )
 
-func NewSystemProxy(ctx context.Context, serverAddr M.Socksaddr, supportSOCKS bool) (SystemProxy, error) {
+func NewSystemProxy(ctx context.Context, serverAddr M.Socksaddr, supportSOCKS bool, user, pass string) (SystemProxy, error) {
 	return nil, os.ErrInvalid
 }

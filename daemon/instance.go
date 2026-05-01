@@ -108,10 +108,14 @@ func (s *StartedService) newInstanceOptions(options option.Options, overrideOpti
 		cancel:                cancel,
 		urlTestHistoryStorage: urlTestHistoryStorage,
 	}
+	var platformLogWriter log.PlatformWriter
+	if !s.noPlatformLogWriter {
+		platformLogWriter = s
+	}
 	boxInstance, err := box.New(box.Options{
 		Context:           ctx,
 		Options:           options,
-		PlatformLogWriter: s,
+		PlatformLogWriter: platformLogWriter,
 	})
 	if err != nil {
 		cancel()
