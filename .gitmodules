@@ -9,4 +9,5 @@
 	url = https://github.com/hiddify/psiphon-tls
 [submodule "replace/wireguard-go"]
 	path = replace/wireguard-go
-	url = https://github.com/hiddify/wireguard-go
+	url = https://github.com/twilgate/inhive-wireguard-go
+	branch = inhive-patches
