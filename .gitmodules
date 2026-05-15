@@ -1,13 +1,13 @@
 [submodule "replace/tailscale"]
 	path = replace/tailscale
-	url = https://github.com/twilgate/inhive-tailscale
+	url = https://github.com/TwilgateLabs/inhive-tailscale
 [submodule "replace/psiphon-quic-go"]
 	path = replace/psiphon-quic-go
-	url = https://github.com/twilgate/inhive-psiphon-quic-go
+	url = https://github.com/TwilgateLabs/inhive-psiphon-quic-go
 [submodule "replace/psiphon-tls"]
 	path = replace/psiphon-tls
-	url = https://github.com/twilgate/inhive-psiphon-tls
+	url = https://github.com/TwilgateLabs/inhive-psiphon-tls
 [submodule "replace/wireguard-go"]
 	path = replace/wireguard-go
-	url = https://github.com/twilgate/inhive-wireguard-go
+	url = https://github.com/TwilgateLabs/inhive-wireguard-go
 	branch = inhive-patches
