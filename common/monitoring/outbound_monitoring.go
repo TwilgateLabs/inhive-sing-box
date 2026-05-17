@@ -13,6 +13,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -389,6 +390,10 @@ func (m *OutboundMonitoring) testNow(outboundTag string, priority bool) error {
 		state := m.getState(outboundTag)
 		if state == nil {
 			return errors.New("outbound not registered")
+		}
+		// inhive: defensive — block/dns не тестируем даже по ручному запросу.
+		if isNonTestableOutboundType(state.outbound.Type()) {
+			return nil
 		}
 
 		task := &testTask{
@@ -821,6 +826,11 @@ func (m *OutboundMonitoring) collectCycleTargets() []string {
 		if _, ok := m.groups[tag]; ok {
 			continue
 		}
+		// inhive: skip non-network outbounds (block, dns) — URL test для них
+		// всегда падает с `operation not permitted`. См. isNonTestableOutboundType.
+		if isNonTestableOutboundType(state.outbound.Type()) {
+			continue
+		}
 		state.mu.Lock()
 		if state.testing || state.queued || state.priorityQueued {
 			state.mu.Unlock()
@@ -972,6 +982,18 @@ func (m *OutboundMonitoring) groupNotifierLoop(grp *groupState) {
 
 func (m *OutboundMonitoring) getState(tag string) *outboundState {
 	return m.outbounds[tag]
+}
+
+// inhive: URL-test не имеет смысла для outbound типов, которые физически
+// не ходят в сеть как прокси (block — дропает трафик, dns — резолвер).
+// Раньше они засирали логи `outbound block URL test failed: operation not
+// permitted` каждые 5 мин и плодили goroutine в NE 50MB budget. Silent skip.
+func isNonTestableOutboundType(t string) bool {
+	switch t {
+	case C.TypeBlock, C.TypeDNS:
+		return true
+	}
+	return false
 }
 
 type testTask struct {
