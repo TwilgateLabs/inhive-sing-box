@@ -45,11 +45,14 @@ const (
 	// xray-compatible URL schemes (xvless://, xvmess://, xtrojan://) теперь парсятся
 	// через native sing-box VLESS/VMess/Trojan parsers (sing-box 1.12+ имеет TLS Fragment,
 	// XTLS Vision, uTLS fingerprint — всё что нужно).
-	TypeCustom         = "custom"   //H
-	TypeAwg            = "awg"      //H
-	TypeBalancer       = "balancer" //H
+	TypeCustom   = "custom"   //H
+	TypeAwg      = "awg"      //H
+	TypeBalancer = "balancer" //H
 	// TypeDNSTT removed 2026-04-19 (dehiddification). Re-add with clean net2share/vaydns upstream when реально понадобится.
-	TypeUTProto        = "utproto"  //H
+	TypeUTProto = "utproto" //H
+	// TypeOLCRTC: stealth tunnel через легальные WebRTC SFU (jitsi/wbstream/telemost) —
+	// emergency fallback для РФ LTE whitelist'ов. См. project_olcrtc_scope.md.
+	TypeOLCRTC = "olcrtc" //H
 )
 
 const (
@@ -133,6 +136,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Balancer"
 	case TypeUTProto:
 		return "UTProto"
+	case TypeOLCRTC:
+		return "OLCRTC"
 	default:
 		return "Unknown"
 	}
