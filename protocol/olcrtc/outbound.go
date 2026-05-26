@@ -4,15 +4,40 @@
 // stealth tunnel через легальные WebRTC SFU (jitsi/wbstream/telemost). См.
 // project_olcrtc_scope.md для полного контекста (3-carrier failover, mode switching, etc).
 //
-// Использование как embedded Go library — pkg/olcrtc/Session.Dial() возвращает net.Conn
-// готовый для sing-box outbound contract. Никакого SOCKS5 listener middleware.
+// 🚨 STATUS 2026-05-26: ARCHITECTURALLY BROKEN — DialContext returns ErrNotImplemented.
+//
+// Phase 1 (this file) was written under the misconception that pkg/olcrtc.Session
+// supports multiple concurrent net.Conn. It does NOT — Session is a single-stream
+// API: all conn{} instances returned by Session.Dial() share one io.Pipe (pr/pw)
+// and one inner.Send channel. Multiple sing-box streams via this wrapper would:
+//   - Cross-contaminate traffic (TLS bytes of stream A delivered to stream B → decrypt errors)
+//   - Leak goroutines per Dial (each spawns go inner.WatchConnection(ctx))
+//   - Overwrite SetEndedCallback on every Dial (only last gets ended signal)
+//
+// Upstream's correct multiplexing pattern lives in internal/client/client.go:216-217:
+//   conn = muxconn.New(ln, cipher)     // encryption layer
+//   sess = smux.Client(conn, ...)      // smux multiplexing
+//   control = openControlStream(...)   // handshake
+// But muxconn / handshake are in internal/ — not accessible without forking upstream.
+//
+// Server-side pkg/olcrtc/tunnel.Server exists as proper public API; client-side
+// equivalent does not. See:
+//   - memory/project_olcrtc_implementation.md "H-1" section for full analysis
+//   - memory/audit_olcrtc_2026_05_26.md (security review)
+//
+// Resolution path: fork upstream → expose internal/client as pkg/olcrtc/client.
+// Until that's done, Start() returns an explicit error to prevent silent breakage.
 package olcrtc
 
 import (
 	"context"
 	"net"
 
-	upstream "github.com/openlibrecommunity/olcrtc/pkg/olcrtc"
+	// upstream "github.com/openlibrecommunity/olcrtc/pkg/olcrtc" — re-import when
+	// wrapper rewrite is done. Kept in go.mod so go.sum hash stays pinned;
+	// import re-added when Start() is reconnected to upstream.New + session.Connect.
+	_ "github.com/openlibrecommunity/olcrtc/pkg/olcrtc"
+
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	C "github.com/sagernet/sing-box/constant"
@@ -30,17 +55,21 @@ func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.OLCRTCOutboundOptions](registry, C.TypeOLCRTC, NewOutbound)
 }
 
-// Outbound — sing-box adapter поверх olcrtc.Session. TCP only (UDP не поддерживается:
-// WebRTC data channel reliable+ordered, UDP semantic incompatible).
+// Outbound — sing-box adapter (Phase 1 SKELETON). Session intentionally not stored
+// until wrapper rewrite (see package doc). TCP-only by design (UDP не поддерживается).
+//
+// ctx + logger kept as fields for wrapper rewrite — when Start() reconnects to
+// upstream.New(ctx, ...), we need the original ctx (DialerOptions ctx layering)
+// not the per-call ctx.
 type Outbound struct {
 	outbound.Adapter
-	ctx     context.Context
-	logger  logger.ContextLogger
-	session *upstream.Session
+	ctx    context.Context //nolint:unused // see struct doc
+	logger logger.ContextLogger
 }
 
-// NewOutbound создаёт olcrtc outbound из YAML/JSON config. Не подключается к SFU —
-// connection отложен до Start().
+// NewOutbound валидирует config но НЕ создаёт upstream.Session — пока wrapper
+// architecturally broken (см. package doc), не открываем network handles.
+// Validation still happens to give user proper config feedback at parse time.
 func NewOutbound(
 	ctx context.Context,
 	router adapter.Router,
@@ -59,62 +88,49 @@ func NewOutbound(
 		return nil, E.New("direct engine mode requires both url and token")
 	}
 
-	// Register defaults — нужно чтобы все built-in auth providers + engines были
-	// доступны в upstream registry. Идемпотентно (safe to call много раз).
-	upstream.RegisterDefaults()
-
-	cfg := upstream.Config{
-		Auth:      options.AuthProvider,
-		RoomID:    options.RoomID,
-		Engine:    options.Engine,
-		URL:       options.URL,
-		Token:     options.Token,
-		Name:      options.Name,
-		DNSServer: options.DNSServer,
-		ProxyAddr: options.ProxyAddr,
-		ProxyPort: options.ProxyPort,
-	}
-
-	session, err := upstream.New(ctx, cfg)
-	if err != nil {
-		return nil, E.Cause(err, "create olcrtc session")
-	}
+	// Не вызываем upstream.New / RegisterDefaults — выждем до rewrite чтобы:
+	//   - Не делать auth.Get → HTTP request к auth provider (network IO без user intent)
+	//   - Не allocать pion/livekit stacks (RAM на iOS NE Provider 15MB budget)
+	//   - Никаких goroutines в background
+	logger.Warn("olcrtc outbound config accepted but Start() will fail — see package doc")
 
 	return &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(
 			C.TypeOLCRTC, tag, []string{N.NetworkTCP}, options.DialerOptions,
 		),
-		ctx:     ctx,
-		logger:  logger,
-		session: session,
+		ctx:    ctx,
+		logger: logger,
 	}, nil
 }
 
-// Start подключается к выбранному SFU (jitsi room / wbstream / telemost). Блокирует
-// до полного WebRTC handshake'а либо timeout context'а. После Start готов к DialContext.
+// Start: до Phase 2.5 rewrite — возвращает ErrNotImplemented чтобы предотвратить
+// silent traffic corruption. Reason: pkg/olcrtc.Session API single-stream; multiple
+// DialContext calls would cross-contaminate traffic. См. package doc.
+//
+// Когда wrapper будет переписан (fork upstream + smux multiplexing), эта функция
+// снова делает session.Connect(). Пока — fail loud.
 func (o *Outbound) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
-	if err := o.session.Connect(o.ctx); err != nil {
-		return E.Cause(err, "connect to olcrtc SFU")
-	}
-	o.logger.Info("olcrtc session connected")
-	return nil
+	// IMPORTANT: do NOT call o.session.Connect() — would establish WebRTC link
+	// that subsequent DialContext can't safely multiplex. Fail before allocating.
+	return E.New(
+		"olcrtc outbound is architecturally incomplete: pkg/olcrtc.Session is " +
+			"single-stream API, sing-box requires per-stream multiplexing. " +
+			"Tracked in memory/audit_olcrtc_2026_05_26.md (H-1). " +
+			"Resolution: fork olcrtc + expose internal/client as public package, " +
+			"OR embed smux+handshake ourselves (requires matching custom server).",
+	)
 }
 
-// DialContext открывает новый stream поверх существующего WebRTC data channel.
-// Каждый Dial = новый smux stream внутри одной WebRTC session. Multiplexing
-// прозрачен — sing-box получает обычный net.Conn.
+// DialContext: would silently corrupt traffic if Start() were not gated.
+// Returns ErrNotImplemented as defence-in-depth even if Start logic changes.
 func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	_ = destination
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
-		o.logger.InfoContext(ctx, "olcrtc outbound to ", destination)
-		conn, err := o.session.Dial(ctx)
-		if err != nil {
-			return nil, E.Cause(err, "olcrtc dial")
-		}
-		return conn, nil
+		return nil, E.New("olcrtc DialContext not implemented — see Start() error and package doc")
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
@@ -127,7 +143,8 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return nil, E.New("UDP is not supported by olcrtc outbound")
 }
 
-// Close завершает WebRTC session, освобождает все resources.
+// Close no-op пока NewOutbound не создаёт session (см. package doc).
+// После wrapper rewrite — закроет smux session + WebRTC session.
 func (o *Outbound) Close() error {
-	return o.session.Close()
+	return nil
 }
