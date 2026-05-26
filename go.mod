@@ -28,7 +28,7 @@ require (
 	github.com/mholt/acmez/v3 v3.1.6
 	github.com/miekg/dns v1.1.72
 	github.com/openai/openai-go/v3 v3.26.0
-	github.com/openlibrecommunity/olcrtc v0.0.1-inhive
+	github.com/openlibrecommunity/olcrtc v0.0.2-inhive
 	github.com/oschwald/maxminddb-golang v1.13.1
 	github.com/pires/go-proxyproto v0.8.1
 	github.com/sagernet/asc-go v0.0.0-20241217030726-d563060fe4e1
@@ -214,7 +214,7 @@ require (
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
-	github.com/zarazaex69/j v0.0.0-20260525090009-ce2ca552a46b // indirect
+	github.com/zarazaex69/j v0.0.1-inhive // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.opentelemetry.io/otel v1.43.0 // indirect
@@ -238,4 +238,6 @@ require (
 	lukechampine.com/blake3 v1.3.0 // indirect
 )
 
-replace github.com/openlibrecommunity/olcrtc => github.com/TwilgateLabs/inhive-olcrtc v0.0.1-inhive
+replace github.com/openlibrecommunity/olcrtc => github.com/TwilgateLabs/inhive-olcrtc v0.0.2-inhive
+
+replace github.com/zarazaex69/j => github.com/TwilgateLabs/inhive-j-deps v0.0.1-inhive
