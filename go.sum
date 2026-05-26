@@ -24,6 +24,8 @@ github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5 h1:TngWCqHvy9oXAN6lEV
 github.com/Nvveen/Gotty v0.0.0-20120604004816-cd527374f1e5/go.mod h1:lmUJ/7eu/Q8D7ML55dXQrVaamCz2vxCfdQBasLZfHKk=
 github.com/Psiphon-Labs/psiphon-tunnel-core v2.0.28+incompatible h1:d+rqXUuqGXk6JrShHWUQDybeAaKTVKLnLTtuoaiXKZk=
 github.com/Psiphon-Labs/psiphon-tunnel-core v2.0.28+incompatible/go.mod h1:VcNEtiQ0z2sCGJf16ZGcpwCas5+r9rt+P20r6LlJ06U=
+github.com/TwilgateLabs/inhive-olcrtc v0.0.1-inhive h1:AvyNs9eeb5+A+yIs+lWPVSCpYYETgadGuznl00mMWak=
+github.com/TwilgateLabs/inhive-olcrtc v0.0.1-inhive/go.mod h1:i4BS3uBXxu4rxjDIcmAU05sWkv2AVs1wgnv/TElTjME=
 github.com/ajg/form v1.5.1 h1:t9c7v8JUKu/XxOGBU0yjNpaMloxGEJhUkqFRq0ibGeU=
 github.com/ajg/form v1.5.1/go.mod h1:uL1WgH+h2mgNtvBq0339dVnzXdBETtL2LeUXaIv25UY=
 github.com/akutz/memconn v0.1.0 h1:NawI0TORU4hcOMsMr11g7vwlCdkYeLKXBcxWu2W/P8A=
