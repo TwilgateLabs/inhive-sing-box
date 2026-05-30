@@ -171,6 +171,20 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
 	return nil
 }
 
+// Close tears down every outbound. InHive note: an outbound's Close() has no
+// context/deadline (io.Closer), so a wedged one — e.g. a WebRTC/olcrtc
+// outbound stuck draining a peer connection — used to block the whole serial
+// loop. That stalled box teardown -> CoreService.Stop held static.lock -> the
+// gRPC/Mobile Stop never returned -> on iOS the kernel TUN stayed up while
+// traffic poured into a dead tunnel. So we bound the *entire* teardown to a
+// single overall budget (C.StopTimeout) rather than per-outbound: per-outbound
+// would allow N wedged outbounds to cost N*StopTimeout, which is exactly the
+// hang we are fixing. Healthy outbounds (milliseconds) still run effectively
+// in order; once the shared budget is exhausted, any remaining Close() calls
+// are fired-and-forgotten so the loop returns immediately. An abandoned
+// goroutine may leak, which is an acceptable trade for guaranteeing Stop()
+// releases the lock and the tunnel is torn down. Protocol-agnostic: this
+// protects Reality / UTProto / Naive / olcrtc identically.
 func (m *Manager) Close() error {
 	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	m.access.Lock()
@@ -182,18 +196,46 @@ func (m *Manager) Close() error {
 	outbounds := m.outbounds
 	m.outbounds = nil
 	m.access.Unlock()
+	deadline := time.Now().Add(C.StopTimeout)
 	var err error
 	for _, outbound := range outbounds {
-		if closer, isCloser := outbound.(io.Closer); isCloser {
-			name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
-			m.logger.Trace("close ", name)
-			startTime := time.Now()
-			monitor.Start("close ", name)
-			err = E.Append(err, closer.Close(), func(err error) error {
+		closer, isCloser := outbound.(io.Closer)
+		if !isCloser {
+			continue
+		}
+		name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+		// Run every Close() in its own goroutine so a wedged outbound can be
+		// abandoned. done carries the (possibly nil) close error.
+		done := make(chan error, 1)
+		go func() {
+			done <- closer.Close()
+		}()
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			// Shared teardown budget already spent: do not wait. Abandon the
+			// in-flight Close() (its goroutine drains into the buffered chan)
+			// and move on so Stop() can return.
+			m.logger.Warn("close ", name, " abandoned: teardown budget exhausted")
+			continue
+		}
+
+		m.logger.Trace("close ", name)
+		startTime := time.Now()
+		monitor.Start("close ", name)
+		select {
+		case closeErr := <-done:
+			monitor.Finish()
+			err = E.Append(err, closeErr, func(err error) error {
 				return E.Cause(err, "close ", name)
 			})
-			monitor.Finish()
 			m.logger.Trace("close ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
+		case <-time.After(remaining):
+			monitor.Finish()
+			// This outbound wedged. Abandon its goroutine (leak accepted),
+			// log which one, and keep going — the shared deadline is now
+			// effectively expired, so subsequent outbounds take the fast path.
+			m.logger.Warn("close ", name, " timed out after ", F.Seconds(time.Since(startTime).Seconds()), "s, abandoning")
 		}
 	}
 	return nil
