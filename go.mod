@@ -1,6 +1,6 @@
 module github.com/sagernet/sing-box
 
-go 1.26
+go 1.26.3
 
 require (
 	github.com/Psiphon-Labs/psiphon-tunnel-core v2.0.28+incompatible
@@ -238,6 +238,6 @@ require (
 	lukechampine.com/blake3 v1.3.0 // indirect
 )
 
-replace github.com/openlibrecommunity/olcrtc => github.com/TwilgateLabs/inhive-olcrtc v0.0.3-inhive
+replace github.com/openlibrecommunity/olcrtc => github.com/TwilgateLabs/inhive-olcrtc v0.0.4-inhive
 
-replace github.com/zarazaex69/j => github.com/TwilgateLabs/inhive-j-deps v0.0.1-inhive
+replace github.com/zarazaex69/j => github.com/TwilgateLabs/inhive-j-deps v0.0.2-inhive
