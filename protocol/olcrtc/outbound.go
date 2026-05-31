@@ -24,13 +24,16 @@
 //   - SOCKS5 hop = localhost only, latency overhead ~10-50 µs, security surface
 //     ограничена loopback + optional SocksUser/SocksPass auth
 //
-// # Lifecycle
+// # Lifecycle (Вариант C — lazy non-primary)
 //
 //	NewOutbound        — валидирует option.OLCRTCOutboundOptions; не открывает соединений
-//	Start(start)       — резервирует ephemeral port, запускает client.RunWithReady в
-//	                     goroutine, ждёт onReady ИЛИ permanent error ИЛИ timeout
-//	DialContext(ctx)   — connect к localhost SOCKS5, делегирует через sing socks.Client
-//	Close()            — отменяет internal ctx, ждёт client.Run done (с timeout)
+//	Start(start)       — primary: launchClient + блокирует до onReady/error/timeout
+//	                     (blocking-ready, анти-phantom). non-primary: возвращает nil
+//	                     сразу, join откладывается до первого DialContext (lazy).
+//	DialContext(ctx)   — ensureStarted (lazy join non-primary при первом dial),
+//	                     затем connect к localhost SOCKS5 через sing socks.Client
+//	Close()            — отменяет internal ctx; ждёт client.Run done (с timeout)
+//	                     только если goroutine реально запускалась
 //
 // # Hardening
 //
@@ -122,6 +125,12 @@ type Outbound struct {
 
 	logger logger.ContextLogger
 
+	// primary решает start-семантику (Вариант C):
+	//   - true  — eager blocking-ready: Start() ждёт readyCh/timeout (анти-phantom).
+	//   - false — lazy: Start() возвращает nil сразу, join откладывается до
+	//     первого DialContext. Мёртвый non-primary не роняет box-старт.
+	primary bool
+
 	cfg         client.Config
 	socksAddr   string // resolved 127.0.0.1:PORT after ephemeral port reservation
 	socksDialer *socks.Client
@@ -136,6 +145,16 @@ type Outbound struct {
 	runDone chan struct{}
 	runMu   sync.Mutex
 	runErr  error
+
+	// launchOnce гарантирует что client.RunWithReady goroutine спавнится ровно
+	// один раз — из Start() для primary ИЛИ из первого DialContext для lazy
+	// non-primary (конкурентные dials идемпотентны).
+	launchOnce sync.Once
+	// launched (под runMu) = goroutine реально была запущена. Close() ждёт
+	// runDone только если launched — иначе для lazy-never-dialed outbound'а
+	// runDone никогда не закроется (его закрывает defer в goroutine), и Close
+	// зависнет на closeTimeout зря.
+	launched bool
 
 	// readyCh closed когда onReady fires первый раз.
 	readyCh   chan struct{}
@@ -247,6 +266,7 @@ func NewOutbound(
 			C.TypeOLCRTC, tag, []string{N.NetworkTCP}, options.DialerOptions,
 		),
 		logger:    logger,
+		primary:   options.Primary,
 		cfg:       cfg,
 		socksAddr: resolvedAddr,
 		runCtx:    runCtx,
@@ -281,8 +301,20 @@ func resolveLocalAddr(addr string) (string, error) {
 	return resolved, nil
 }
 
-// Start запускает client.RunWithReady в managed goroutine и блокирует Start()
-// до первого onReady ИЛИ permanent error ИЛИ timeout.
+// Start реализует Вариант C (lazy non-primary).
+//
+//   - primary==true → eager blocking-ready: спавним client.RunWithReady и
+//     блокируем Start() до readyCh / permanent error / timeout. Когда Start()
+//     возвращает nil, SOCKS5 detour гарантированно поднят. Это анти-phantom
+//     инвариант: на iOS NE применяет TUN routes как только box ready, поэтому
+//     ВЫБРАННЫЙ канал обязан быть готов до того (откатывали 2e288c2d).
+//
+//   - primary==false → LAZY: Start() возвращает nil НЕМЕДЛЕННО, НЕ спавнит
+//     goroutine, НЕ блокирует. Join в Jitsi откладывается до первого
+//     DialContext. Так мёртвый невыбранный pool-member не может уронить
+//     box-старт через timeout (manager.startOutbounds падает на любой Start()
+//     error). Эталон — WireGuard endpoint: Start не блокирует на handshake,
+//     connect происходит на первом пакете.
 //
 // На permanent error (client.Run возвращает раньше onReady): outbound остаётся
 // зарегистрированным но DialContext будет возвращать last err. Sing-box
@@ -292,32 +324,52 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 		return nil
 	}
 
-	o.logger.Info("starting olcrtc client (carrier=", o.cfg.Carrier, " socks=", o.socksAddr, ")")
+	if !o.primary {
+		// Lazy: никакой network activity на старте. Готовим SOCKS5 dialer
+		// заранее (он не открывает соединений — connect происходит в его
+		// DialContext), а join поднимем при первом dial.
+		o.logger.Info("olcrtc client lazy (non-primary, join deferred to first dial; carrier=", o.cfg.Carrier, " socks=", o.socksAddr, ")")
+		o.socksDialer = o.newSocksDialer()
+		return nil
+	}
 
-	go func() {
-		defer close(o.runDone)
-		err := client.RunWithReady(o.runCtx, o.cfg, o.onReady)
+	o.logger.Info("starting olcrtc client (primary, carrier=", o.cfg.Carrier, " socks=", o.socksAddr, ")")
+	o.launchClient()
+
+	if err := o.awaitReady(startTimeout); err != nil {
+		return err
+	}
+	o.logger.Info("olcrtc client ready (SOCKS5 listener up on ", o.socksAddr, ")")
+	o.socksDialer = o.newSocksDialer()
+	return nil
+}
+
+// launchClient спавнит управляемую client.RunWithReady goroutine ровно один
+// раз (launchOnce). Вызывается из Start() для primary и из первого DialContext
+// для lazy non-primary.
+func (o *Outbound) launchClient() {
+	o.launchOnce.Do(func() {
 		o.runMu.Lock()
-		o.runErr = err
+		o.launched = true
 		o.runMu.Unlock()
-		if err != nil && o.runCtx.Err() == nil {
-			o.logger.Error("olcrtc client exited: ", err)
-		}
-	}()
+		go func() {
+			defer close(o.runDone)
+			err := client.RunWithReady(o.runCtx, o.cfg, o.onReady)
+			o.runMu.Lock()
+			o.runErr = err
+			o.runMu.Unlock()
+			if err != nil && o.runCtx.Err() == nil {
+				o.logger.Error("olcrtc client exited: ", err)
+			}
+		}()
+	})
+}
 
+// awaitReady блокирует до readyCh / runDone (early exit = failure) / timeout.
+// Используется blocking-path'ом primary Start() и lazy-path'ом первого dial.
+func (o *Outbound) awaitReady(timeout time.Duration) error {
 	select {
 	case <-o.readyCh:
-		o.logger.Info("olcrtc client ready (SOCKS5 listener up on ", o.socksAddr, ")")
-		// SOCKS5 client over a plain dialer to loopback. We deliberately
-		// don't use a sing-box dialer here — connection is purely localhost,
-		// shouldn't traverse routing logic / DNS / interfaces.
-		o.socksDialer = socks.NewClient(
-			directLoopbackDialer{},
-			M.ParseSocksaddr(o.socksAddr),
-			socks.Version5,
-			o.cfg.SOCKSUser,
-			o.cfg.SOCKSPass,
-		)
 		return nil
 	case <-o.runDone:
 		// client.Run возвратился до того как onReady fired — это всегда
@@ -333,13 +385,27 @@ func (o *Outbound) Start(stage adapter.StartStage) error {
 			err = E.New("olcrtc client exited before ready")
 		}
 		return E.Cause(err, "olcrtc client start")
-	case <-time.After(startTimeout):
-		o.logger.Warn("olcrtc client start timed out after ", startTimeout, " — cancelling")
+	case <-time.After(timeout):
+		o.logger.Warn("olcrtc client start timed out after ", timeout, " — cancelling")
 		o.runCancel()
 		// Не ждём runDone здесь — Close() сделает proper cleanup. Start error
 		// → manager пометит outbound failed.
-		return E.New("olcrtc client start timed out after ", startTimeout)
+		return E.New("olcrtc client start timed out after ", timeout)
 	}
+}
+
+// newSocksDialer строит SOCKS5 client поверх plain loopback dialer. Не
+// использует sing-box dialer — соединение чисто localhost (наш собственный
+// listener), не должно проходить routing / DNS / interfaces. Сам по себе
+// connection не открывает (это делает его DialContext).
+func (o *Outbound) newSocksDialer() *socks.Client {
+	return socks.NewClient(
+		directLoopbackDialer{},
+		M.ParseSocksaddr(o.socksAddr),
+		socks.Version5,
+		o.cfg.SOCKSUser,
+		o.cfg.SOCKSPass,
+	)
 }
 
 // onReady передаётся в client.RunWithReady. Может быть вызван более одного
@@ -351,8 +417,12 @@ func (o *Outbound) onReady() {
 }
 
 // DialContext тунелирует через локальный SOCKS5 listener поднятый client.Run.
-// Если client.Run уже мёртв (permanent error), socks.NewClient попытается
-// connect, dial fail с "connection refused" → urltest mark unhealthy.
+//
+// Для primary client уже ready после Start(). Для lazy non-primary первый dial
+// запускает join (idempotent через launchOnce) и ждёт readyCh с startTimeout —
+// это и есть "connect on first packet". Если join fail — ошибка возвращается
+// этому dial'у (urltest пометит outbound unhealthy), НИЧЕГО глобально не
+// роняется.
 func (o *Outbound) DialContext(
 	ctx context.Context,
 	network string,
@@ -360,6 +430,9 @@ func (o *Outbound) DialContext(
 ) (net.Conn, error) {
 	switch N.NetworkName(network) {
 	case N.NetworkTCP:
+		if err := o.ensureStarted(ctx); err != nil {
+			return nil, err
+		}
 		// Fast path: если client уже умер, не делаем futile dial.
 		o.runMu.Lock()
 		runErr := o.runErr
@@ -377,6 +450,34 @@ func (o *Outbound) DialContext(
 	}
 }
 
+// ensureStarted — lazy trigger для non-primary. Для primary (или уже
+// запущенного non-primary) это дешёвый no-op: launchOnce уже сработал и readyCh
+// закрыт, так что awaitReady возвращается немедленно. Для первого dial'а на
+// lazy outbound — спавнит join и ждёт ready с startTimeout. Bounded ctx dial'а
+// здесь не используется как deadline join'а намеренно: join (ICE+SFU+smux) может
+// быть дольше одного HTTP-запроса, startTimeout — собственный bound (как у
+// primary Start()).
+func (o *Outbound) ensureStarted(ctx context.Context) error {
+	o.runMu.Lock()
+	launched := o.launched
+	o.runMu.Unlock()
+	if launched {
+		// Goroutine уже бежит (primary или ранее разбуженный non-primary).
+		// Если она ещё не ready — подождём (последующий конкурентный dial).
+		// На уже закрытом readyCh это мгновенно.
+		select {
+		case <-o.readyCh:
+			return nil
+		default:
+			return o.awaitReady(startTimeout)
+		}
+	}
+	// Первый dial на lazy non-primary: поднимаем join сейчас.
+	o.logger.InfoContext(ctx, "olcrtc lazy join on first dial (carrier=", o.cfg.Carrier, ")")
+	o.launchClient()
+	return o.awaitReady(startTimeout)
+}
+
 // ListenPacket — UDP не поддерживается. WebRTC data channel = reliable+ordered,
 // UDP datagram semantic несовместима. Users UDP трафика должны иметь другой
 // outbound в маршрутах.
@@ -385,9 +486,21 @@ func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 }
 
 // Close cancellит client.Run context и ждёт его выхода с timeout. Если client
-// застрял в shutdown — локим warn и возвращаем nil чтобы не блочить sing-box.
+// застрял в shutdown — логим warn и возвращаем nil чтобы не блочить sing-box.
+//
+// Lazy non-primary который ни разу не диалили: goroutine не запускалась, runDone
+// никогда не закроется (его закрывает defer в goroutine). runCancel() всё равно
+// зовём (отменяет runCtx для порядка — idempotent, без эффекта если goroutine
+// не было), но НЕ ждём runDone — иначе Close висел бы closeTimeout зря на каждом
+// невыбранном pool-member.
 func (o *Outbound) Close() error {
 	o.runCancel()
+	o.runMu.Lock()
+	launched := o.launched
+	o.runMu.Unlock()
+	if !launched {
+		return nil
+	}
 	select {
 	case <-o.runDone:
 		// clean exit

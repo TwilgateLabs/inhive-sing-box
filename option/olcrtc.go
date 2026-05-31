@@ -70,4 +70,26 @@ type OLCRTCOutboundOptions struct {
 	Engine string `json:"engine,omitempty"`
 	URL    string `json:"url,omitempty"`
 	Token  string `json:"token,omitempty"`
+
+	// Primary управляет start-семантикой outbound'а (Вариант C — lazy
+	// non-primary, см. feedback_debug_ios_ne_phantom_connected.md).
+	//
+	//   - true  — это выбранный/default outbound (selector tag == defaultTag,
+	//     либо член urltest-pool который является default'ом). Start() блокирует
+	//     до readyCh ИЛИ timeout — гарантирует что когда box сообщает ready,
+	//     SOCKS5 detour уже поднят. Без этого iOS NE применяет TUN routes до
+	//     готовности канала → трафик в неготовый outbound → phantom connected
+	//     (откатывали 2e288c2d). ВЫБРАННЫЙ обязан остаться blocking-ready.
+	//
+	//   - false / omit — это НЕвыбранный pool-member (failover-кандидат). Start()
+	//     возвращает nil НЕМЕДЛЕННО без join'а; реальный join в Jitsi откладывается
+	//     до первого DialContext (lazy, как WireGuard connect-on-first-packet).
+	//     Гарантия: мёртвый невыбранный olcrtc НЕ роняет box-старт по timeout
+	//     (manager.startOutbounds падает на любой Start() error — olcrtc был
+	//     единственным eager-blocking outbound'ом).
+	//
+	// Эмитится app builder'ом: primary=true тому olcrtc, чей tag совпадает с
+	// defaultTag; для V2 multi-room pool primary=true ВСЕМ членам pool (любой
+	// может стать выбранным через urltest).
+	Primary bool `json:"primary,omitempty"`
 }

@@ -241,3 +241,10 @@ require (
 replace github.com/openlibrecommunity/olcrtc => github.com/TwilgateLabs/inhive-olcrtc v0.0.4-inhive
 
 replace github.com/zarazaex69/j => github.com/TwilgateLabs/inhive-j-deps v0.0.2-inhive
+
+// option/wireguard.go импортирует sagernet/wireguard-go/warpobf (Noise/WARP),
+// которого нет в апстрим pseudo-version. warpobf живёт в локальном форке
+// (core outer тоже его replace'ит как ./sing-box/replace/wireguard-go). Без
+// этого `go vet/build` ВНУТРИ submodule с with_olcrtc падает "no required
+// module provides package .../warpobf". Путь относительный к submodule root.
+replace github.com/sagernet/wireguard-go => ./replace/wireguard-go
