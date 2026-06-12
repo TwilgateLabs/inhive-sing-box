@@ -1,3 +1,8 @@
+> **InHive vendored fork.** Patched dependency of [InHive Core](https://github.com/TwilgateLabs/inhive-core).
+> Upstream: [SagerNet/sing-box](https://github.com/SagerNet/sing-box). We track upstream and carry InHive-specific patches.
+
+---
+
 # sing-box-extended
 
 Sing-box with extended features.
