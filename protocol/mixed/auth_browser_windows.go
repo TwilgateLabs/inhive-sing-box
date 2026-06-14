@@ -1,6 +1,8 @@
 package mixed
 
 import (
+	"path/filepath"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -21,14 +23,22 @@ import (
 // carries a chain-valid EMBEDDED Authenticode signature whose cert subject is a
 // known browser vendor.
 //
-// Why signatures and not exe names/paths: a name ("chrome.exe") or an install
-// path is trivially spoofed (drop a renamed binary into a user-writable dir). A
-// CA-issued signature subject ("Google LLC") cannot be forged — the chain is
-// validated against the Windows trusted roots, so a self-signed binary merely
-// *claiming* the subject is rejected. Residual: code injected into an
-// already-running signed browser inherits its trust; that needs real on-device
-// malware sophistication and is out of scope. The random creds remain the real
-// boundary; this gate is the dialog-suppression layer on top of them.
+// Two checks, AND'd — they cover each other's weaknesses:
+//   - exe BASENAME must be a known browser (from the configured whitelist). This
+//     SCOPES the bypass: many non-browser binaries share a trusted signer (e.g.
+//     notepad.exe / powershell.exe are signed "Microsoft Corporation", same as
+//     Edge), so signature alone would hand every Microsoft-signed LOLBin a free
+//     pass. Name alone is trivially spoofed, so it is NOT the boundary — a
+//     browser missing from the list merely shows the dialog (fail-safe).
+//   - signature must be a CHAIN-VALID Authenticode whose cert subject is a known
+//     browser vendor. This is the real boundary: a binary renamed to chrome.exe
+//     can't produce Google's CA-issued signature, and a self-signed binary
+//     claiming the subject fails the chain check.
+//
+// Residual: code injected into an already-running signed browser inherits its
+// trust; that needs real on-device malware sophistication and is out of scope.
+// The random per-install creds remain the ultimate boundary; this gate only
+// suppresses the dialog for genuine browsers.
 //
 // Revocation is intentionally NOT checked (WTD_REVOKE_NONE): online CRL/OCSP
 // would block the connection handshake on a censored/offline network, and worse,
@@ -81,12 +91,17 @@ var (
 	browserSigCacheMu sync.Mutex
 )
 
-// browserBypassAllowed reports whether the connecting process is a chain-valid,
-// vendor-signed mainstream browser. The whitelist arg is unused on Windows — the
-// trust decision is the signature, not a name list (kept for the cross-platform
-// signature shared with auth_browser_other.go).
-func browserBypassAllowed(owner *adapter.ConnectionOwner, _ map[string]bool) bool {
-	if owner == nil || owner.ProcessPath == "" {
+// browserBypassAllowed reports whether the connecting process is a known browser
+// exe (name-scoped via whitelist) AND carries a chain-valid browser-vendor
+// Authenticode signature. Both are required: the name keeps same-vendor non-
+// browser binaries (notepad.exe, powershell.exe …) out; the signature stops a
+// renamed impostor.
+func browserBypassAllowed(owner *adapter.ConnectionOwner, whitelist map[string]bool) bool {
+	if owner == nil || owner.ProcessPath == "" || len(whitelist) == 0 {
+		return false
+	}
+	// Name first (cheap, scopes to browsers). Then the signature (the real check).
+	if !whitelist[strings.ToLower(filepath.Base(owner.ProcessPath))] {
 		return false
 	}
 	return isTrustedBrowserExe(owner.ProcessPath)
