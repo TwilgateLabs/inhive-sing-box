@@ -4,7 +4,6 @@ import (
 	std_bufio "bufio"
 	"context"
 	"net"
-	"path/filepath"
 	"strings"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -149,24 +148,19 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
 	if err != nil {
 		return E.Cause(err, "peek first byte")
 	}
-	// InHive fork: per-process auth bypass. If the connecting process is whitelisted
-	// (browser via the system proxy → its exe basename / android package is in the
-	// set), use a nil authenticator — nil means "no auth" in both the socks and http
-	// handshakes (no 407 / AuthTypeNotRequired), so the browser connects silently.
-	// Every other local app still hits h.authenticator. Fully non-fatal: any searcher
-	// error leaves the configured authenticator in place.
+	// InHive fork: per-process auth bypass. If the connecting process is a trusted
+	// browser, use a nil authenticator — nil means "no auth" in both the socks and
+	// http handshakes (no 407 / AuthTypeNotRequired), so the browser connects
+	// silently while every other local app still hits h.authenticator. The trust
+	// decision is platform-specific (see auth_browser_{windows,other}.go): on
+	// Windows it's a chain-valid Authenticode browser-vendor signature; elsewhere
+	// it's the configured exe-basename / Android-package whitelist. Fully
+	// non-fatal: any searcher error leaves the configured authenticator in place.
 	authenticator := h.authenticator
 	if h.processSearcher != nil && len(h.processWhitelist) > 0 {
 		if owner, err := h.processSearcher.FindProcessInfo(ctx, N.NetworkTCP, metadata.Source.AddrPort(), metadata.Destination.AddrPort()); err == nil && owner != nil {
-			if owner.ProcessPath != "" && h.processWhitelist[strings.ToLower(filepath.Base(owner.ProcessPath))] {
+			if browserBypassAllowed(owner, h.processWhitelist) {
 				authenticator = nil
-			} else {
-				for _, pkg := range owner.AndroidPackageNames {
-					if h.processWhitelist[strings.ToLower(pkg)] {
-						authenticator = nil
-						break
-					}
-				}
 			}
 		}
 	}
