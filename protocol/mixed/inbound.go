@@ -4,10 +4,13 @@ import (
 	std_bufio "bufio"
 	"context"
 	"net"
+	"path/filepath"
+	"strings"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
+	"github.com/sagernet/sing-box/common/process"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/uot"
 	C "github.com/sagernet/sing-box/constant"
@@ -21,6 +24,7 @@ import (
 	"github.com/sagernet/sing/protocol/socks"
 	"github.com/sagernet/sing/protocol/socks/socks4"
 	"github.com/sagernet/sing/protocol/socks/socks5"
+	"github.com/sagernet/sing/service"
 )
 
 func RegisterInbound(registry *inbound.Registry) {
@@ -31,11 +35,13 @@ var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
-	router        adapter.ConnectionRouterEx
-	logger        log.ContextLogger
-	listener      *listener.Listener
-	authenticator *auth.Authenticator
-	tlsConfig     tls.ServerConfig
+	router           adapter.ConnectionRouterEx
+	logger           log.ContextLogger
+	listener         *listener.Listener
+	authenticator    *auth.Authenticator
+	processSearcher  process.Searcher
+	processWhitelist map[string]bool // lowercased exe basenames / android packages
+	tlsConfig        tls.ServerConfig
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HTTPMixedInboundOptions) (adapter.Inbound, error) {
@@ -44,6 +50,25 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		router:        uot.NewRouter(router, logger),
 		logger:        logger,
 		authenticator: auth.NewAuthenticator(options.Users),
+	}
+	// InHive fork: per-process auth bypass. Build the lowercased whitelist set and
+	// a process searcher. Non-fatal — if the searcher can't init (e.g. restricted
+	// socket diag on some Android builds), the whitelist is simply disabled and all
+	// connections fall back to normal auth; startup never crashes.
+	if len(options.ProcessWhitelist) > 0 {
+		inbound.processWhitelist = make(map[string]bool, len(options.ProcessWhitelist))
+		for _, p := range options.ProcessWhitelist {
+			inbound.processWhitelist[strings.ToLower(p)] = true
+		}
+		searcherConfig := process.Config{Logger: logger}
+		if nm := service.FromContext[adapter.NetworkManager](ctx); nm != nil {
+			searcherConfig.PackageManager = nm.PackageManager()
+		}
+		if searcher, err := process.NewSearcher(searcherConfig); err == nil {
+			inbound.processSearcher = searcher
+		} else {
+			logger.Warn(E.Cause(err, "mixed: process whitelist disabled, searcher init failed"))
+		}
 	}
 	if options.TLS != nil {
 		tlsConfig, err := tls.NewServerWithOptions(tls.ServerOptions{
@@ -95,6 +120,7 @@ func (h *Inbound) Close() error {
 	return common.Close(
 		h.listener,
 		h.tlsConfig,
+		h.processSearcher,
 	)
 }
 
@@ -123,11 +149,32 @@ func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata ada
 	if err != nil {
 		return E.Cause(err, "peek first byte")
 	}
+	// InHive fork: per-process auth bypass. If the connecting process is whitelisted
+	// (browser via the system proxy → its exe basename / android package is in the
+	// set), use a nil authenticator — nil means "no auth" in both the socks and http
+	// handshakes (no 407 / AuthTypeNotRequired), so the browser connects silently.
+	// Every other local app still hits h.authenticator. Fully non-fatal: any searcher
+	// error leaves the configured authenticator in place.
+	authenticator := h.authenticator
+	if h.processSearcher != nil && len(h.processWhitelist) > 0 {
+		if owner, err := h.processSearcher.FindProcessInfo(ctx, N.NetworkTCP, metadata.Source.AddrPort(), metadata.Destination.AddrPort()); err == nil && owner != nil {
+			if owner.ProcessPath != "" && h.processWhitelist[strings.ToLower(filepath.Base(owner.ProcessPath))] {
+				authenticator = nil
+			} else {
+				for _, pkg := range owner.AndroidPackageNames {
+					if h.processWhitelist[strings.ToLower(pkg)] {
+						authenticator = nil
+						break
+					}
+				}
+			}
+		}
+	}
 	switch headerBytes[0] {
 	case socks4.Version, socks5.Version:
-		return socks.HandleConnectionEx(ctx, conn, reader, h.authenticator, adapter.NewUpstreamHandlerEx(metadata, h.newUserConnection, h.streamUserPacketConnection), h.listener, 0, metadata.Source, onClose)
+		return socks.HandleConnectionEx(ctx, conn, reader, authenticator, adapter.NewUpstreamHandlerEx(metadata, h.newUserConnection, h.streamUserPacketConnection), h.listener, 0, metadata.Source, onClose)
 	default:
-		return http.HandleConnectionEx(ctx, conn, reader, h.authenticator, adapter.NewUpstreamHandlerEx(metadata, h.newUserConnection, h.streamUserPacketConnection), metadata.Source, onClose)
+		return http.HandleConnectionEx(ctx, conn, reader, authenticator, adapter.NewUpstreamHandlerEx(metadata, h.newUserConnection, h.streamUserPacketConnection), metadata.Source, onClose)
 	}
 }
 
