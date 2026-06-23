@@ -22,8 +22,6 @@ type _Options struct {
 	Route        *RouteOptions        `json:"route,omitempty"`
 	Services     []Service            `json:"services,omitempty"`
 	Experimental *ExperimentalOptions `json:"experimental,omitempty"`
-
-	Custom *map[string]any `json:"custom,omitempty"` //H
 }
 
 type Options _Options
