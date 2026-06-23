@@ -29,7 +29,10 @@ package awg
 //
 // WHEN BUMPING the replace to >= v1.0.4: flip this to true in the SAME change.
 // At true, j1/j2/j3/itime ARE emitted and s3/s4 are suppressed (v1.0.4 rejects
-// them). See protocol/awg/capability_check_v1.go for the compile-time guard that
-// fails the build if this constant claims v1.0.4 support while the v1.0.4-only
-// `device/awg` subpackage is absent.
+// them). After flipping, run the full `make ios`/`make windows`/`make android`
+// build (which runs `go mod tidy` + c-shared link) and confirm it stays green so
+// the capability flag and the actually-linked runtime cannot silently disagree.
+// (A build-tagged compile-time tripwire importing the v1.0.x-only `device/awg`
+// was tried but removed 2026-06-23 — `go mod tidy` analyzes all build tags and
+// could not resolve that import under the v0.2.18 replace, breaking the build.)
 const awgRuntimeSupportsControlledJunk = false
