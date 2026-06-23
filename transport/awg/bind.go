@@ -22,11 +22,18 @@ type bind_adapter struct {
 	dialer N.Dialer
 	ctx    context.Context
 	mutex  sync.Mutex
+	// reserved holds the 3 Cloudflare/WARP reserved bytes injected into the
+	// first outgoing datagram. WireGuard's UAPI has no key for this, so it is
+	// applied here at send time (mirrors transport/wireguard/client_bind.go).
+	reserved    [3]byte
+	hasReserved bool
 }
 
-func newBind(dial N.Dialer) conn.Bind {
+func newBind(dial N.Dialer, reserved [3]byte, hasReserved bool) conn.Bind {
 	return &bind_adapter{
-		dialer: dial,
+		dialer:      dial,
+		reserved:    reserved,
+		hasReserved: hasReserved,
 	}
 }
 
@@ -128,6 +135,12 @@ func (b *bind_adapter) Send(bufs [][]byte, ep conn.Endpoint) error {
 	}
 
 	for _, buf := range bufs {
+		// Inject the Cloudflare/WARP reserved bytes into the first datagram.
+		// Matches transport/wireguard/client_bind.go: bytes [1:4] of a WireGuard
+		// packet are the reserved field.
+		if b.hasReserved && len(buf) > 3 {
+			copy(buf[1:4], b.reserved[:])
+		}
 		if _, err := conn.WriteTo(buf, udpAddr); err != nil {
 			return err
 		}

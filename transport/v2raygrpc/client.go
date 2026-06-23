@@ -63,6 +63,19 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	dialOptions = append(dialOptions, grpc.WithContextDialer(func(ctx context.Context, server string) (net.Conn, error) {
 		return dialer.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddr(server))
 	}))
+	// InHive: opt-in CDN-fronting knobs. Both default to empty → no dial option
+	// appended, so the gRPC :authority/User-Agent stay at grpc-go defaults
+	// (byte-identical to the original behavior).
+	if options.Authority != "" {
+		dialOptions = append(dialOptions, grpc.WithAuthority(options.Authority))
+	}
+	if options.UserAgent != "" {
+		// NOTE: grpc-go appends its own "grpc-go/<ver>" suffix to the UA. Xray
+		// instead injects via reflection for an exact fingerprint; for our
+		// CDN-fronting use the WithUserAgent prefix is what backends route on,
+		// so this is the pragmatic, dependency-free choice.
+		dialOptions = append(dialOptions, grpc.WithUserAgent(options.UserAgent))
+	}
 	//nolint:staticcheck
 	dialOptions = append(dialOptions, grpc.WithReturnConnectionError())
 	return &Client{

@@ -80,12 +80,29 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 
+	// Cloudflare/WARP reserved bytes cannot go through the WireGuard UAPI, so
+	// they are injected in the bind at send time. Take them from the first peer
+	// that defines exactly 3 bytes.
+	var (
+		reserved    [3]byte
+		hasReserved bool
+	)
+	for _, peer := range options.Peers {
+		if len(peer.Reserved) == 3 {
+			copy(reserved[:], peer.Reserved)
+			hasReserved = true
+			break
+		}
+	}
+
 	dev, err := awg.NewDevice(ctx, logger, dial, ipc, awg.DeviceOpts{
 		UseIntegratedTun: options.UseIntegratedTun,
 		Address:          options.Address,
 		AllowedIps:       allowedIps.Prefixes(),
 		ExcludedIps:      excludedIps.Prefixes(),
 		MTU:              options.MTU,
+		Reserved:         reserved,
+		HasReserved:      hasReserved,
 	})
 	if err != nil {
 		return nil, err
@@ -125,11 +142,18 @@ func genIpcConfig(opts option.AwgEndpointOptions) (string, error) {
 	if opts.S2 != 0 {
 		s += "\ns2=" + format.ToString(opts.S2)
 	}
-	if opts.S3 != 0 {
-		s += "\ns3=" + format.ToString(opts.S3)
-	}
-	if opts.S4 != 0 {
-		s += "\ns4=" + format.ToString(opts.S4)
+	// s3/s4 (message-padding sizes) are only a valid UAPI key on amneziawg-go
+	// v0.2.x. v1.0.x dropped them, and emitting an unknown key aborts the whole
+	// IpcSet. Gate emission so a config carrying s3/s4 stays parseable across the
+	// version bump (the values are still parsed and stored, just not emitted when
+	// the linked runtime would reject them). See capability.go.
+	if !awgRuntimeSupportsControlledJunk {
+		if opts.S3 != 0 {
+			s += "\ns3=" + format.ToString(opts.S3)
+		}
+		if opts.S4 != 0 {
+			s += "\ns4=" + format.ToString(opts.S4)
+		}
 	}
 	if opts.H1 != "" {
 		s += "\nh1=" + opts.H1
@@ -157,6 +181,25 @@ func genIpcConfig(opts option.AwgEndpointOptions) (string, error) {
 	}
 	if opts.I5 != "" {
 		s += "\ni5=" + opts.I5
+	}
+
+	// AmneziaWG 1.5 controlled-junk generators (j1/j2/j3) and inter-handshake
+	// timeout (itime) are only a valid UAPI key on amneziawg-go >= v1.0.0. On
+	// v0.2.x they hit the `default:` case and abort IpcSet, so emit them only
+	// when the linked runtime supports them. See capability.go.
+	if awgRuntimeSupportsControlledJunk {
+		if opts.J1 != "" {
+			s += "\nj1=" + opts.J1
+		}
+		if opts.J2 != "" {
+			s += "\nj2=" + opts.J2
+		}
+		if opts.J3 != "" {
+			s += "\nj3=" + opts.J3
+		}
+		if opts.Itime != 0 {
+			s += "\nitime=" + format.ToString(opts.Itime)
+		}
 	}
 
 	for _, peer := range opts.Peers {

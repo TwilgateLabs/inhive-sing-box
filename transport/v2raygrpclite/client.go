@@ -34,6 +34,7 @@ type Client struct {
 	options    option.V2RayGRPCOptions
 	url        *url.URL
 	host       string
+	header     http.Header
 }
 
 func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayGRPCOptions, tlsConfig tls.Config) adapter.V2RayClientTransport {
@@ -42,6 +43,19 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		host = M.ParseSocksaddrHostPort(tlsConfig.ServerName(), serverAddr.Port).String()
 	} else {
 		host = serverAddr.String()
+	}
+	// InHive: per-client header so a custom User-Agent does not mutate the
+	// package-level defaultClientHeader shared across all clients. When
+	// options.UserAgent is empty the header is byte-identical to the default.
+	header := defaultClientHeader.Clone()
+	if options.UserAgent != "" {
+		header.Set("User-Agent", options.UserAgent)
+	}
+	// InHive: authority override. The lite path carries :authority via the
+	// request Host; default to the TLS-SNI/serverAddr-derived host (current
+	// behavior) and only override when an explicit authority is supplied.
+	if options.Authority != "" {
+		host = options.Authority
 	}
 	client := &Client{
 		ctx:        ctx,
@@ -58,7 +72,8 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 			Path:    "/" + options.ServiceName + "/Tun",
 			RawPath: "/" + url.PathEscape(options.ServiceName) + "/Tun",
 		},
-		host: host,
+		host:   host,
+		header: header,
 	}
 	if tlsConfig == nil {
 		client.transport.DialTLSContext = func(ctx context.Context, network, addr string, cfg *tls.STDConfig) (net.Conn, error) {
@@ -83,7 +98,7 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		Method: http.MethodPost,
 		Body:   pipeInReader,
 		URL:    c.url,
-		Header: defaultClientHeader,
+		Header: c.header,
 		Host:   c.host,
 	}
 	request = request.WithContext(ctx)

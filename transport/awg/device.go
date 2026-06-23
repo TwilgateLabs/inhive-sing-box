@@ -24,6 +24,10 @@ type DeviceOpts struct {
 	AllowedIps       []netip.Prefix
 	ExcludedIps      []netip.Prefix
 	MTU              uint32
+	// Reserved holds the 3 Cloudflare/WARP reserved bytes; HasReserved gates
+	// injection in the bind (WireGuard UAPI has no reserved key).
+	Reserved    [3]byte
+	HasReserved bool
 }
 
 type Device struct {
@@ -63,7 +67,7 @@ func NewDevice(ctx context.Context, logger logger.ContextLogger, dial network.Di
 
 	return &Device{
 		tun:       tun,
-		bind:      newBind(dial),
+		bind:      newBind(dial, opts.Reserved, opts.HasReserved),
 		logger:    awgLogger,
 		ipcConfig: ipcConfig,
 	}, nil

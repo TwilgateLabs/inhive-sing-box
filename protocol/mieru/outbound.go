@@ -208,6 +208,11 @@ func buildMieruClientConfig(options option.MieruOutboundOptions, dialer mieruDia
 			Level: mierupb.MultiplexingLevel(multiplexing).Enum(),
 		}
 	}
+	// Optional MTU (official sharing-link param, range 1280-1400). Left unset when
+	// absent so the mieru library applies its own default.
+	if options.MTU > 0 {
+		config.Profile.Mtu = proto.Int32(options.MTU)
+	}
 	return config, nil
 }
 func validateMieruOptions(options option.MieruOutboundOptions) error {

@@ -31,6 +31,7 @@ type Client struct {
 	headers             http.Header
 	maxEarlyData        uint32
 	earlyDataHeaderName string
+	heartbeatPeriod     time.Duration
 }
 
 func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayWebsocketOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error) {
@@ -70,6 +71,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		headers,
 		options.MaxEarlyData,
 		options.EarlyDataHeaderName,
+		time.Duration(options.HeartbeatPeriod),
 	}, nil
 }
 
@@ -103,7 +105,7 @@ func (c *Client) dialContext(ctx context.Context, requestURL *url.URL, headers h
 		}
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
-	return NewConn(conn, nil, ws.StateClientSide), nil
+	return NewConnWithHeartbeat(conn, nil, ws.StateClientSide, c.heartbeatPeriod), nil
 }
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {

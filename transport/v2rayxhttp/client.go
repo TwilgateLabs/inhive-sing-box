@@ -57,7 +57,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}
 	getRequestURL := func(sessionId string) url.URL {
 		requestURL := baseRequestURL
-		requestURL.Path += sessionId
+		applySessionPlacement(&requestURL, &options.V2RayXHTTPBaseOptions, sessionId)
 		return requestURL
 	}
 	var xmuxOptions option.V2RayXHTTPXmuxOptions
@@ -97,7 +97,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		}
 		getRequestURL2 = func(sessionId string) url.URL {
 			requestURL2 := baseRequestURL2
-			requestURL2.Path += sessionId
+			applySessionPlacement(&requestURL2, &options2.V2RayXHTTPBaseOptions, sessionId)
 			return requestURL2
 		}
 		var xmuxOptions2 option.V2RayXHTTPXmuxOptions
@@ -210,7 +210,7 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 			// this intentionally makes a shallow-copy of the struct so we
 			// can reassign Path (potentially concurrently)
 			url := requestURL
-			url.Path += "/" + strconv.FormatInt(seq, 10)
+			applySeqPlacement(&url, &options.V2RayXHTTPBaseOptions, seq)
 			seq += 1
 			if scMinPostsIntervalMs.From > 0 {
 				time.Sleep(time.Duration(scMinPostsIntervalMs.Rand())*time.Millisecond - time.Since(lastWrite))
@@ -253,6 +253,52 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 
 func (c *Client) Close() error {
 	return nil
+}
+
+// applySessionPlacement writes the session id into the request URL according to the
+// configured placement. Default ("" => path) is byte-identical to the original code
+// (requestURL.Path += sessionId). For query placement it is added as a query param; for
+// header/cookie placement it is stashed in the URL fragment (stripped from the wire by
+// net/http) and relocated to the real header/cookie by GetRequestHeader.
+func applySessionPlacement(u *url.URL, options *option.V2RayXHTTPBaseOptions, sessionId string) {
+	switch options.GetNormalizedSessionPlacement() {
+	case "query":
+		q := u.Query()
+		q.Set(options.GetNormalizedSessionKey(), sessionId)
+		u.RawQuery = q.Encode()
+	case "header", "cookie":
+		stashMetaFragment(u, option.XHTTPMetaSessionKey(), sessionId)
+	default: // "path"
+		u.Path += sessionId
+	}
+}
+
+// applySeqPlacement writes the per-request sequence integer into the request URL.
+// Default ("" => path) is byte-identical to the original code
+// (url.Path += "/" + strconv.FormatInt(seq, 10)).
+func applySeqPlacement(u *url.URL, options *option.V2RayXHTTPBaseOptions, seq int64) {
+	seqStr := strconv.FormatInt(seq, 10)
+	switch options.GetNormalizedSeqPlacement() {
+	case "query":
+		q := u.Query()
+		q.Set(options.GetNormalizedSeqKey(), seqStr)
+		u.RawQuery = q.Encode()
+	case "header", "cookie":
+		stashMetaFragment(u, option.XHTTPMetaSeqKey(), seqStr)
+	default: // "path"
+		u.Path += "/" + seqStr
+	}
+}
+
+// stashMetaFragment merges a key=value pair into the URL fragment without dropping any
+// pair already present (e.g. session id stashed before the seq).
+func stashMetaFragment(u *url.URL, key, value string) {
+	values, _ := url.ParseQuery(u.Fragment)
+	if values == nil {
+		values = url.Values{}
+	}
+	values.Set(key, value)
+	u.Fragment = values.Encode()
 }
 
 func decideHTTPVersion(tlsConfig tls.Config) string {

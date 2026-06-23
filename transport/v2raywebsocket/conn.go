@@ -28,11 +28,23 @@ type WebsocketConn struct {
 	reader         *wsutil.Reader
 	controlHandler wsutil.FrameHandlerFunc
 	remoteAddr     net.Addr
+	// InHive: heartbeat ping ticker. heartbeatStop is closed once on Close to
+	// stop the goroutine and prevent a leak. Both are nil when the period is 0.
+	heartbeatStop chan struct{}
+	heartbeatOnce sync.Once
 }
 
 func NewConn(conn net.Conn, remoteAddr net.Addr, state ws.State) *WebsocketConn {
+	return NewConnWithHeartbeat(conn, remoteAddr, state, 0)
+}
+
+// NewConnWithHeartbeat builds a WebsocketConn and, when heartbeatPeriod>0,
+// starts a goroutine writing a (masked, on the client side) ping control frame
+// every period. When heartbeatPeriod<=0 it behaves identically to NewConn —
+// no goroutine, no field set — so the default path is byte-identical.
+func NewConnWithHeartbeat(conn net.Conn, remoteAddr net.Addr, state ws.State, heartbeatPeriod time.Duration) *WebsocketConn {
 	controlHandler := wsutil.ControlFrameHandler(conn, state)
-	return &WebsocketConn{
+	wsConn := &WebsocketConn{
 		Conn:  conn,
 		state: state,
 		reader: &wsutil.Reader{
@@ -45,9 +57,37 @@ func NewConn(conn net.Conn, remoteAddr net.Addr, state ws.State) *WebsocketConn 
 		remoteAddr:     remoteAddr,
 		Writer:         NewWriter(conn, state),
 	}
+	if heartbeatPeriod > 0 {
+		wsConn.heartbeatStop = make(chan struct{})
+		go wsConn.heartbeatLoop(heartbeatPeriod)
+	}
+	return wsConn
+}
+
+// heartbeatLoop writes a ping control frame every period until Close stops it.
+func (c *WebsocketConn) heartbeatLoop(period time.Duration) {
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.heartbeatStop:
+			return
+		case <-ticker.C:
+			frame := ws.NewPingFrame(nil)
+			if c.state == ws.StateClientSide {
+				frame = ws.MaskFrameInPlace(frame)
+			}
+			if err := ws.WriteFrame(c.Conn, frame); err != nil {
+				return
+			}
+		}
+	}
 }
 
 func (c *WebsocketConn) Close() error {
+	if c.heartbeatStop != nil {
+		c.heartbeatOnce.Do(func() { close(c.heartbeatStop) })
+	}
 	c.Conn.SetWriteDeadline(time.Now().Add(C.TCPTimeout))
 	frame := ws.NewCloseFrame(ws.NewCloseFrameBody(
 		ws.StatusNormalClosure, "",

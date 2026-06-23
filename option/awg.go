@@ -28,7 +28,14 @@ type AwgEndpointOptions struct {
 	I3               string                           `json:"i3,omitempty"`
 	I4               string                           `json:"i4,omitempty"`
 	I5               string                           `json:"i5,omitempty"`
-	Peers            []AwgPeerOptions                 `json:"peers,omitempty"`
+	// AmneziaWG 1.5 "special junk" controlled-junk generators (j1/j2/j3) and the
+	// inter-handshake timeout (itime). Only accepted by amneziawg-go >= v1.0.4 —
+	// emission is gated in protocol/awg by awgRuntimeSupportsControlledJunk.
+	J1    string           `json:"j1,omitempty"`
+	J2    string           `json:"j2,omitempty"`
+	J3    string           `json:"j3,omitempty"`
+	Itime int              `json:"itime,omitempty"`
+	Peers []AwgPeerOptions `json:"peers,omitempty"`
 	DialerOptions
 }
 
@@ -39,4 +46,8 @@ type AwgPeerOptions struct {
 	PresharedKey                string                           `json:"preshared_key,omitempty"`
 	AllowedIPs                  badoption.Listable[netip.Prefix] `json:"allowed_ips,omitempty"`
 	PersistentKeepaliveInterval uint16                           `json:"persistent_keepalive_interval,omitempty"`
+	// Reserved are the 3 Cloudflare/WARP reserved bytes injected into the first
+	// UDP datagram. WireGuard's UAPI has no key for this, so it is applied in the
+	// bind (transport/awg) at send time, mirroring the plain-WG fork.
+	Reserved []uint8 `json:"reserved,omitempty"`
 }

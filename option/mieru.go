@@ -9,6 +9,7 @@ type MieruOutboundOptions struct {
 	Password      string             `json:"password,omitempty"`
 	Multiplexing  string             `json:"multiplexing,omitempty"`
 	HandshakeMode string             `json:"handshake_mode,omitempty"`
+	MTU           int32              `json:"mtu,omitempty"`
 }
 
 type MieruInboundOptions struct {
