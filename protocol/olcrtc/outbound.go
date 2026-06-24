@@ -385,6 +385,16 @@ func (o *Outbound) awaitReady(timeout time.Duration) error {
 			err = E.New("olcrtc client exited before ready")
 		}
 		return E.Cause(err, "olcrtc client start")
+	case <-o.runCtx.Done():
+		// Внешняя отмена connect: hcore.Stop → abortStart → cancelStart отменяет
+		// startCtx → box ctx (дериватив) → o.runCtx. Просыпаемся СРАЗУ, не ждём
+		// timeout (~30с). Это кроссплатформенная отмена (Android/Windows; на iOS
+		// тот же эффект даёт NE-abort). Срабатывает ТОЛЬКО при реальной отмене —
+		// при обычном connect runCtx никто не отменяет, blocking-ready инвариант
+		// (анти-phantom) цел. Идемпотентно: runCancel() безопасен повторно.
+		o.runCancel()
+		o.logger.Info("olcrtc client start cancelled")
+		return E.Cause(o.runCtx.Err(), "olcrtc client start cancelled")
 	case <-time.After(timeout):
 		o.logger.Warn("olcrtc client start timed out after ", timeout, " — cancelling")
 		o.runCancel()
