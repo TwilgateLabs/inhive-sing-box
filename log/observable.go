@@ -63,8 +63,21 @@ func NewDefaultFactory(
 	return factory
 }
 
+// logRotateMaxBytes — порог ротации box.log. При старте, если файл больше
+// этого размера, он переименовывается в <path>.1 (одна бэкап-копия,
+// перезаписывая старую), затем открывается заново через O_APPEND. Без этого
+// box.log рос бесконечно (в инциденте 2026-06-25 — 59MB накоплено с 11 мая) и
+// каждая запись в горячем пути дёргала всё более раздутый файл. Ротация
+// сделана вручную size-cap'ом, а НЕ через lumberjack: lumberjack не в
+// зависимостях, а тащить новую dependency ради одного файла — лишний риск.
+// Ротируем один раз при Start(): для VPN-туннеля сессия может жить часами, но
+// гранулярности «обрезать при каждом подключении» достаточно, чтобы файл не
+// уходил в десятки мегабайт.
+const logRotateMaxBytes = 5 * 1024 * 1024
+
 func (f *defaultFactory) Start() error {
 	if f.filePath != "" {
+		f.rotateIfOversized()
 		logFile, err := filemanager.OpenFile(f.ctx, f.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			return err
@@ -73,6 +86,22 @@ func (f *defaultFactory) Start() error {
 		f.file = logFile
 	}
 	return nil
+}
+
+// rotateIfOversized переименовывает текущий лог в <path>.1 если он перерос
+// logRotateMaxBytes. Все ошибки тут не фатальны — в худшем случае просто не
+// ротируем и продолжаем писать в существующий файл (лог не должен ронять
+// старт ядра). Пути резолвим через filemanager.BasePath, потому что filePath
+// относительный (например data/box.log).
+func (f *defaultFactory) rotateIfOversized() {
+	path := filemanager.BasePath(f.ctx, f.filePath)
+	info, err := os.Stat(path)
+	if err != nil || info.Size() <= logRotateMaxBytes {
+		return
+	}
+	backup := path + ".1"
+	// Rename атомарно перетирает старый .1 (одна бэкап-копия по дизайну).
+	_ = os.Rename(path, backup)
 }
 
 func (f *defaultFactory) Close() error {

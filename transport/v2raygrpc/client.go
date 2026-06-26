@@ -114,12 +114,40 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	}
 	client := NewGunServiceClient(clientConn).(GunServiceCustomNameClient)
 	ctx, cancel := common.ContextWithCancelCause(ctx)
-	stream, err := client.TunCustomName(ctx, c.serviceName)
+	// grpc.WaitForReady(false) — fail-fast: на не-Ready conn (например refused →
+	// TransientFailure) открытие стрима падает сразу с Unavailable, а не виснет
+	// в ожидании backoff-реконнекта. ctx НЕ оборачиваем таймаутом: он живёт со
+	// стримом, а дедлайн убил бы долгоживущий стрим; fail-fast решает задачу
+	// "не зависнуть на открытии" корректно.
+	stream, err := client.TunCustomName(ctx, c.serviceName, grpc.WaitForReady(false))
 	if err != nil {
 		cancel(err)
+		// Мягкая инвалидация ТОЛЬКО post-failure: если conn реально мёртв
+		// (Shutdown/TransientFailure), закрываем его и снимаем из кэша через
+		// CAS, чтобы следующий connect() передёрнул свежий. Превентивно НЕ
+		// трогаем — у здорового conn grpc-go сам реконнектится с backoff, и
+		// dial-storm устраивать нельзя. CAS гарантирует, что мы не закроем
+		// чужой свежий conn, подставленный параллельным connect().
+		c.invalidateConn(clientConn)
 		return nil, err
 	}
 	return NewGRPCConn(stream, cancel), nil
+}
+
+// invalidateConn закрывает залипший ClientConn и снимает его из кэша, но
+// только если он действительно в терминальном/сбойном состоянии. Вызывается
+// исключительно после фактического провала открытия стрима.
+func (c *Client) invalidateConn(conn *grpc.ClientConn) {
+	state := conn.GetState()
+	if state != connectivity.Shutdown && state != connectivity.TransientFailure {
+		return
+	}
+	c.connAccess.Lock()
+	defer c.connAccess.Unlock()
+	// CAS: закрываем и обнуляем только если в кэше всё ещё ровно этот conn.
+	if c.conn.CompareAndSwap(conn, nil) {
+		conn.Close()
+	}
 }
 
 func (c *Client) Close() error {
