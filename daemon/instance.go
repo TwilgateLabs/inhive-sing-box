@@ -130,7 +130,14 @@ func (s *StartedService) newInstanceOptions(options option.Options, overrideOpti
 	i.clashServer = service.FromContext[adapter.ClashServer](ctx)
 	i.pauseManager = service.FromContext[pause.Manager](ctx)
 	i.cacheFile = service.FromContext[adapter.CacheFile](ctx)
-	log.SetStdLogger(boxInstance.LogFactory().Logger())
+	// Only the main/foreground box owns the process-global std logger. Side-
+	// instances (NoPlatformLogWriter — ping probes, BootstrapFetch) used to clobber
+	// it on every bring-up; under pingAll's parallel fan-out that is a write/write
+	// data race on the unsynchronised `log.std` package global. Gate it the same way
+	// as platformLogWriter above so concurrent side-instances never touch it.
+	if !s.noPlatformLogWriter {
+		log.SetStdLogger(boxInstance.LogFactory().Logger())
+	}
 	return i, nil
 }
 
