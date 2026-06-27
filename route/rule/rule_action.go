@@ -47,6 +47,7 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSDisOOB:                 action.RouteOptions.TLSDisOOB,
 				TLSSplitPosition:          action.RouteOptions.TLSSplitPosition,
 				TLSSplitAnchor:            action.RouteOptions.TLSSplitAnchor,
+				TLSFake:                   action.RouteOptions.TLSFake,
 			},
 		}, nil
 	case C.RuleActionTypeRouteOptions:
@@ -66,6 +67,7 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 			TLSDisOOB:                 action.RouteOptionsOptions.TLSDisOOB,
 			TLSSplitPosition:          action.RouteOptionsOptions.TLSSplitPosition,
 			TLSSplitAnchor:            action.RouteOptionsOptions.TLSSplitAnchor,
+			TLSFake:                   action.RouteOptionsOptions.TLSFake,
 		}, nil
 	case C.RuleActionTypeBypass:
 		return &RuleActionBypass{
@@ -85,6 +87,7 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSDisOOB:                 action.BypassOptions.TLSDisOOB,
 				TLSSplitPosition:          action.BypassOptions.TLSSplitPosition,
 				TLSSplitAnchor:            action.BypassOptions.TLSSplitAnchor,
+				TLSFake:                   action.BypassOptions.TLSFake,
 			},
 		}, nil
 	case C.RuleActionTypeDirect:
@@ -228,6 +231,7 @@ type RuleActionRouteOptions struct {
 	TLSDisOOB                 bool
 	TLSSplitPosition          int
 	TLSSplitAnchor            string
+	TLSFake                   bool
 	BypassIfFailed            bool
 }
 
@@ -291,6 +295,9 @@ func (r *RuleActionRouteOptions) Descriptions() []string {
 	}
 	if r.TLSSplitAnchor != "" {
 		descriptions = append(descriptions, F.ToString("tls-split=", r.TLSSplitAnchor, "/", r.TLSSplitPosition))
+	}
+	if r.TLSFake {
+		descriptions = append(descriptions, "tls-fake")
 	}
 	return descriptions
 }

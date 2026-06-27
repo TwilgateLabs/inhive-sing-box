@@ -46,12 +46,13 @@ type Conn struct {
 	disorder           bool
 	oob                bool
 	disoob             bool
+	fake               bool
 	splitPosition      int
 	splitAnchor        string
 	fallbackDelay      time.Duration
 }
 
-func NewConn(conn net.Conn, ctx context.Context, splitPacket bool, splitRecord bool, disorder bool, oob bool, disoob bool, splitPosition int, splitAnchor string, fallbackDelay time.Duration) *Conn {
+func NewConn(conn net.Conn, ctx context.Context, splitPacket bool, splitRecord bool, disorder bool, oob bool, disoob bool, fake bool, splitPosition int, splitAnchor string, fallbackDelay time.Duration) *Conn {
 	if fallbackDelay == 0 {
 		fallbackDelay = C.TLSFragmentFallbackDelay
 	}
@@ -65,6 +66,7 @@ func NewConn(conn net.Conn, ctx context.Context, splitPacket bool, splitRecord b
 		disorder:      disorder,
 		oob:           oob,
 		disoob:        disoob,
+		fake:          fake,
 		splitPosition: splitPosition,
 		splitAnchor:   splitAnchor,
 		fallbackDelay: fallbackDelay,
@@ -97,11 +99,30 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 		}()
 		serverName := IndexTLSServerName(b)
 		if serverName != nil {
+			// fake: poison the on-path DPI with a benign-SNI ClientHello sent at
+			// TTL=1 (it dies before the server); the real ClientHello is delivered
+			// by the kernel retransmit. Windows-only for now — elsewhere sendFake
+			// returns ran=false and we fall through to the normal/segmented path.
+			if c.fake && c.tcpConn != nil {
+				if fakeCH := buildFakeClientHello(b, serverName); fakeCH != nil {
+					ran, ferr := sendFake(c.tcpConn, b, fakeCH, 1, c.fallbackDelay)
+					if ran {
+						return len(b), ferr
+					}
+				}
+			}
 			// "segmented" = we send the ClientHello as multiple TCP segments.
 			// splitPacket/disorder/oob/disoob all need this; disorder/disoob
 			// additionally send the first segment at TTL=1, and oob/disoob send
 			// each non-final segment with a trailing out-of-band (urgent) byte.
 			segmented := c.splitPacket || c.disorder || c.oob || c.disoob
+			if !segmented && !c.splitRecord {
+				// No active segmentation technique for this packet (e.g. a
+				// fake-only Conn that fell through on a platform without fake
+				// support) — send the ClientHello unmodified instead of running
+				// the segment loop that would otherwise send nothing.
+				return c.Conn.Write(b)
+			}
 			if segmented {
 				if c.tcpConn != nil {
 					err = c.tcpConn.SetNoDelay(true)

@@ -174,6 +174,7 @@ type RawRouteOptionsActionOptions struct {
 	TLSDisOOB                bool               `json:"tls_disoob,omitempty"`         // InHive accelerator: disorder (first segment TTL=1) + the OOB byte
 	TLSSplitPosition         int                `json:"tls_split_position,omitempty"` // InHive accelerator: byedpi-style split offset (used with tls_split_anchor)
 	TLSSplitAnchor           string             `json:"tls_split_anchor,omitempty"`   // "" (random per-label) | sni | sni_end | sni_mid | absolute
+	TLSFake                  bool               `json:"tls_fake,omitempty"`           // InHive accelerator: fake low-TTL benign-SNI ClientHello, real via retransmit (Win only)
 }
 
 type RouteOptionsActionOptions RawRouteOptionsActionOptions
@@ -208,6 +209,9 @@ func (r *RouteOptionsActionOptions) UnmarshalJSON(data []byte) error {
 	case "", "sni", "sni_end", "sni_mid", "absolute":
 	default:
 		return E.New("invalid `tls_split_anchor` (want sni|sni_end|sni_mid|absolute): " + r.TLSSplitAnchor)
+	}
+	if r.TLSFake && (r.TLSDisorder || r.TLSOOB || r.TLSDisOOB || r.TLSRecordFragment) {
+		return E.New("`tls_fake` is mutually exclusive with disorder/oob/disoob/record_fragment")
 	}
 	return nil
 }

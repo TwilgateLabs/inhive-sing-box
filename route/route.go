@@ -561,6 +561,9 @@ match:
 				metadata.TLSSplitPosition = routeOptions.TLSSplitPosition
 				metadata.TLSSplitAnchor = routeOptions.TLSSplitAnchor
 			}
+			if routeOptions.TLSFake {
+				metadata.TLSFake = true
+			}
 		}
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:

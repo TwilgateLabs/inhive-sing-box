@@ -28,6 +28,24 @@ type MyServerName struct {
 	ServerName string
 }
 
+// buildFakeClientHello returns a copy of the ClientHello with the SNI hostname
+// bytes overwritten by a same-length benign placeholder ('x'). Sent at a low
+// TTL it dies before the server, but an on-path DPI records the WRONG (benign)
+// SNI for this flow and won't throttle/RST it; the real ClientHello reaches the
+// server via the kernel retransmit. Same length keeps every TLS length field
+// valid (no recomputation). Returns nil if there's no SNI to mask.
+func buildFakeClientHello(b []byte, sn *MyServerName) []byte {
+	if sn == nil || sn.Length <= 0 || sn.Index < 0 || sn.Index+sn.Length > len(b) {
+		return nil
+	}
+	fake := make([]byte, len(b))
+	copy(fake, b)
+	for i := 0; i < sn.Length; i++ {
+		fake[sn.Index+i] = 'x'
+	}
+	return fake
+}
+
 func IndexTLSServerName(payload []byte) *MyServerName {
 	if len(payload) < recordLayerHeaderLen || payload[0] != contentType {
 		return nil
