@@ -43,6 +43,8 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSFragmentFallbackDelay:  time.Duration(action.RouteOptions.TLSFragmentFallbackDelay),
 				TLSRecordFragment:         action.RouteOptions.TLSRecordFragment,
 				TLSDisorder:               action.RouteOptions.TLSDisorder,
+				TLSOOB:                    action.RouteOptions.TLSOOB,
+				TLSDisOOB:                 action.RouteOptions.TLSDisOOB,
 			},
 		}, nil
 	case C.RuleActionTypeRouteOptions:
@@ -58,6 +60,8 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 			TLSFragmentFallbackDelay:  time.Duration(action.RouteOptionsOptions.TLSFragmentFallbackDelay),
 			TLSRecordFragment:         action.RouteOptionsOptions.TLSRecordFragment,
 			TLSDisorder:               action.RouteOptionsOptions.TLSDisorder,
+			TLSOOB:                    action.RouteOptionsOptions.TLSOOB,
+			TLSDisOOB:                 action.RouteOptionsOptions.TLSDisOOB,
 		}, nil
 	case C.RuleActionTypeBypass:
 		return &RuleActionBypass{
@@ -73,6 +77,8 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSFragmentFallbackDelay:  time.Duration(action.BypassOptions.TLSFragmentFallbackDelay),
 				TLSRecordFragment:         action.BypassOptions.TLSRecordFragment,
 				TLSDisorder:               action.BypassOptions.TLSDisorder,
+				TLSOOB:                    action.BypassOptions.TLSOOB,
+				TLSDisOOB:                 action.BypassOptions.TLSDisOOB,
 			},
 		}, nil
 	case C.RuleActionTypeDirect:
@@ -212,6 +218,8 @@ type RuleActionRouteOptions struct {
 	TLSFragmentFallbackDelay  time.Duration
 	TLSRecordFragment         bool
 	TLSDisorder               bool
+	TLSOOB                    bool
+	TLSDisOOB                 bool
 	BypassIfFailed            bool
 }
 
@@ -266,6 +274,12 @@ func (r *RuleActionRouteOptions) Descriptions() []string {
 	}
 	if r.TLSDisorder {
 		descriptions = append(descriptions, "tls-disorder")
+	}
+	if r.TLSOOB {
+		descriptions = append(descriptions, "tls-oob")
+	}
+	if r.TLSDisOOB {
+		descriptions = append(descriptions, "tls-disoob")
 	}
 	return descriptions
 }

@@ -170,6 +170,8 @@ type RawRouteOptionsActionOptions struct {
 	TLSFragmentFallbackDelay badoption.Duration `json:"tls_fragment_fallback_delay,omitempty"`
 	TLSRecordFragment        bool               `json:"tls_record_fragment,omitempty"`
 	TLSDisorder              bool               `json:"tls_disorder,omitempty"` // InHive accelerator: split ClientHello + send first segment at TTL=1
+	TLSOOB                   bool               `json:"tls_oob,omitempty"`      // InHive accelerator: split ClientHello + a trailing out-of-band (MSG_OOB) byte
+	TLSDisOOB                bool               `json:"tls_disoob,omitempty"`   // InHive accelerator: disorder (first segment TTL=1) + the OOB byte
 }
 
 type RouteOptionsActionOptions RawRouteOptionsActionOptions
@@ -187,6 +189,18 @@ func (r *RouteOptionsActionOptions) UnmarshalJSON(data []byte) error {
 	}
 	if r.TLSDisorder && r.TLSRecordFragment {
 		return E.New("`tls_disorder` and `tls_record_fragment` are mutually exclusive")
+	}
+	if (r.TLSOOB || r.TLSDisOOB) && r.TLSRecordFragment {
+		return E.New("`tls_oob`/`tls_disoob` and `tls_record_fragment` are mutually exclusive")
+	}
+	if r.TLSDisorder && r.TLSOOB {
+		return E.New("`tls_disorder` and `tls_oob` are mutually exclusive")
+	}
+	if r.TLSDisorder && r.TLSDisOOB {
+		return E.New("`tls_disorder` and `tls_disoob` are mutually exclusive")
+	}
+	if r.TLSOOB && r.TLSDisOOB {
+		return E.New("`tls_oob` and `tls_disoob` are mutually exclusive")
 	}
 	return nil
 }

@@ -129,8 +129,8 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		m.logger.ErrorContext(ctx, err)
 		return
 	}
-	if metadata.TLSFragment || metadata.TLSRecordFragment || metadata.TLSDisorder {
-		remoteConn = tf.NewConn(remoteConn, ctx, metadata.TLSFragment, metadata.TLSRecordFragment, metadata.TLSDisorder, metadata.TLSFragmentFallbackDelay)
+	if metadata.TLSFragment || metadata.TLSRecordFragment || metadata.TLSDisorder || metadata.TLSOOB || metadata.TLSDisOOB {
+		remoteConn = tf.NewConn(remoteConn, ctx, metadata.TLSFragment, metadata.TLSRecordFragment, metadata.TLSDisorder, metadata.TLSOOB, metadata.TLSDisOOB, metadata.TLSFragmentFallbackDelay)
 	}
 	var done atomic.Bool
 	m.preConnectionCopy(ctx, conn, remoteConn, false, &done, onClose)

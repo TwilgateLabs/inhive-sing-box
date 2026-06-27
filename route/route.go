@@ -551,6 +551,12 @@ match:
 			if routeOptions.TLSDisorder {
 				metadata.TLSDisorder = true
 			}
+			if routeOptions.TLSOOB {
+				metadata.TLSOOB = true
+			}
+			if routeOptions.TLSDisOOB {
+				metadata.TLSDisOOB = true
+			}
 		}
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:
