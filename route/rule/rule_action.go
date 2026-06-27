@@ -42,6 +42,7 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSFragment:               action.RouteOptions.TLSFragment,
 				TLSFragmentFallbackDelay:  time.Duration(action.RouteOptions.TLSFragmentFallbackDelay),
 				TLSRecordFragment:         action.RouteOptions.TLSRecordFragment,
+				TLSDisorder:               action.RouteOptions.TLSDisorder,
 			},
 		}, nil
 	case C.RuleActionTypeRouteOptions:
@@ -56,6 +57,7 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 			TLSFragment:               action.RouteOptionsOptions.TLSFragment,
 			TLSFragmentFallbackDelay:  time.Duration(action.RouteOptionsOptions.TLSFragmentFallbackDelay),
 			TLSRecordFragment:         action.RouteOptionsOptions.TLSRecordFragment,
+			TLSDisorder:               action.RouteOptionsOptions.TLSDisorder,
 		}, nil
 	case C.RuleActionTypeBypass:
 		return &RuleActionBypass{
@@ -70,6 +72,7 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSFragment:               action.BypassOptions.TLSFragment,
 				TLSFragmentFallbackDelay:  time.Duration(action.BypassOptions.TLSFragmentFallbackDelay),
 				TLSRecordFragment:         action.BypassOptions.TLSRecordFragment,
+				TLSDisorder:               action.BypassOptions.TLSDisorder,
 			},
 		}, nil
 	case C.RuleActionTypeDirect:
@@ -208,6 +211,7 @@ type RuleActionRouteOptions struct {
 	TLSFragment               bool
 	TLSFragmentFallbackDelay  time.Duration
 	TLSRecordFragment         bool
+	TLSDisorder               bool
 	BypassIfFailed            bool
 }
 
@@ -259,6 +263,9 @@ func (r *RuleActionRouteOptions) Descriptions() []string {
 	}
 	if r.TLSRecordFragment {
 		descriptions = append(descriptions, "tls-record-fragment")
+	}
+	if r.TLSDisorder {
+		descriptions = append(descriptions, "tls-disorder")
 	}
 	return descriptions
 }

@@ -169,6 +169,7 @@ type RawRouteOptionsActionOptions struct {
 	TLSFragment              bool               `json:"tls_fragment,omitempty"`
 	TLSFragmentFallbackDelay badoption.Duration `json:"tls_fragment_fallback_delay,omitempty"`
 	TLSRecordFragment        bool               `json:"tls_record_fragment,omitempty"`
+	TLSDisorder              bool               `json:"tls_disorder,omitempty"` // InHive accelerator: split ClientHello + send first segment at TTL=1
 }
 
 type RouteOptionsActionOptions RawRouteOptionsActionOptions
@@ -183,6 +184,9 @@ func (r *RouteOptionsActionOptions) UnmarshalJSON(data []byte) error {
 	}
 	if r.TLSFragment && r.TLSRecordFragment {
 		return E.New("`tls_fragment` and `tls_record_fragment` are mutually exclusive")
+	}
+	if r.TLSDisorder && r.TLSRecordFragment {
+		return E.New("`tls_disorder` and `tls_record_fragment` are mutually exclusive")
 	}
 	return nil
 }

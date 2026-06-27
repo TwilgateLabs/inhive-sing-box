@@ -22,10 +22,11 @@ type Conn struct {
 	firstPacketWritten bool
 	splitPacket        bool
 	splitRecord        bool
+	disorder           bool
 	fallbackDelay      time.Duration
 }
 
-func NewConn(conn net.Conn, ctx context.Context, splitPacket bool, splitRecord bool, fallbackDelay time.Duration) *Conn {
+func NewConn(conn net.Conn, ctx context.Context, splitPacket bool, splitRecord bool, disorder bool, fallbackDelay time.Duration) *Conn {
 	if fallbackDelay == 0 {
 		fallbackDelay = C.TLSFragmentFallbackDelay
 	}
@@ -36,6 +37,7 @@ func NewConn(conn net.Conn, ctx context.Context, splitPacket bool, splitRecord b
 		ctx:           ctx,
 		splitPacket:   splitPacket,
 		splitRecord:   splitRecord,
+		disorder:      disorder,
 		fallbackDelay: fallbackDelay,
 	}
 }
@@ -47,7 +49,11 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 		}()
 		serverName := IndexTLSServerName(b)
 		if serverName != nil {
-			if c.splitPacket {
+			// "segmented" = we send the ClientHello as multiple TCP segments.
+			// Both splitPacket and disorder need this; disorder additionally
+			// sends the first segment at TTL=1.
+			segmented := c.splitPacket || c.disorder
+			if segmented {
 				if c.tcpConn != nil {
 					err = c.tcpConn.SetNoDelay(true)
 					if err != nil {
@@ -87,24 +93,46 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 					payload = b[splitIndexes[i-1]:splitIndexes[i]]
 				}
 				if c.splitRecord {
-					if c.splitPacket {
+					if segmented {
 						buffer.Reset()
 					}
 					payloadLen := uint16(len(payload))
 					buffer.Write(b[:3])
 					binary.Write(&buffer, binary.BigEndian, payloadLen)
 					buffer.Write(payload)
-					if c.splitPacket {
+					if segmented {
 						payload = buffer.Bytes()
 					}
 				}
-				if c.splitPacket {
-					if c.tcpConn != nil && i != len(splitIndexes) {
+				if segmented {
+					switch {
+					case c.disorder && i == 0 && c.tcpConn != nil:
+						// disorder: first segment egresses at TTL=1 — it dies one
+						// hop out (DPI sees it, the server never does), then the
+						// kernel retransmits the same bytes at the restored TTL,
+						// so the server reassembles a stream the DPI saw out of
+						// order. NODELAY (set above) hands it to the stack at once;
+						// the sleep lets it leave before TTL is restored.
+						// NOTE: reusing writeAndWaitAck here would HANG on linux —
+						// that gate waits for an ACK (TCP_INFO.Unacked==0) which
+						// never comes for a TTL=1 segment. darwin sendto is async
+						// (Apple DTS 726398); a precise SO_NWRITE flush-gate is a
+						// planned hardening over this sleep.
+						origV4, origV6, _ := lowerTTL(c.tcpConn, 1)
+						_, err = c.Conn.Write(payload)
+						if err == nil {
+							time.Sleep(c.fallbackDelay)
+						}
+						_ = restoreTTL(c.tcpConn, origV4, origV6)
+						if err != nil {
+							return
+						}
+					case c.tcpConn != nil && i != len(splitIndexes):
 						err = writeAndWaitAck(c.ctx, c.tcpConn, payload, c.fallbackDelay)
 						if err != nil {
 							return
 						}
-					} else {
+					default:
 						_, err = c.Conn.Write(payload)
 						if err != nil {
 							return
@@ -115,7 +143,7 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 					}
 				}
 			}
-			if c.splitRecord && !c.splitPacket {
+			if c.splitRecord && !segmented {
 				_, err = c.Conn.Write(buffer.Bytes())
 				if err != nil {
 					return

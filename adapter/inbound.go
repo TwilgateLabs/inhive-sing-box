@@ -74,6 +74,7 @@ type InboundContext struct {
 	TLSFragment               bool
 	TLSFragmentFallbackDelay  time.Duration
 	TLSRecordFragment         bool
+	TLSDisorder               bool
 
 	NetworkStrategy     *C.NetworkStrategy
 	NetworkType         []C.InterfaceType

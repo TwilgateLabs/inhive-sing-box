@@ -548,6 +548,9 @@ match:
 			if routeOptions.TLSRecordFragment {
 				metadata.TLSRecordFragment = true
 			}
+			if routeOptions.TLSDisorder {
+				metadata.TLSDisorder = true
+			}
 		}
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:

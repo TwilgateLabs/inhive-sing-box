@@ -51,7 +51,7 @@ func (c *STDClientConfig) STDConfig() (*STDConfig, error) {
 
 func (c *STDClientConfig) Client(conn net.Conn) (Conn, error) {
 	if c.recordFragment {
-		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
+		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, false, c.fragmentFallbackDelay)
 	}
 	return tls.Client(conn, c.config), nil
 }

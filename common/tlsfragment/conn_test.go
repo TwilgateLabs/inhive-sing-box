@@ -15,7 +15,7 @@ func TestTLSFragment(t *testing.T) {
 	t.Parallel()
 	tcpConn, err := net.Dial("tcp", "1.1.1.1:443")
 	require.NoError(t, err)
-	tlsConn := tls.Client(tf.NewConn(tcpConn, context.Background(), true, false, 0), &tls.Config{
+	tlsConn := tls.Client(tf.NewConn(tcpConn, context.Background(), true, false, false, 0), &tls.Config{
 		ServerName: "www.cloudflare.com",
 	})
 	require.NoError(t, tlsConn.Handshake())
@@ -25,7 +25,7 @@ func TestTLSRecordFragment(t *testing.T) {
 	t.Parallel()
 	tcpConn, err := net.Dial("tcp", "1.1.1.1:443")
 	require.NoError(t, err)
-	tlsConn := tls.Client(tf.NewConn(tcpConn, context.Background(), false, true, 0), &tls.Config{
+	tlsConn := tls.Client(tf.NewConn(tcpConn, context.Background(), false, true, false, 0), &tls.Config{
 		ServerName: "www.cloudflare.com",
 	})
 	require.NoError(t, tlsConn.Handshake())
@@ -35,7 +35,17 @@ func TestTLS2Fragment(t *testing.T) {
 	t.Parallel()
 	tcpConn, err := net.Dial("tcp", "1.1.1.1:443")
 	require.NoError(t, err)
-	tlsConn := tls.Client(tf.NewConn(tcpConn, context.Background(), true, true, 0), &tls.Config{
+	tlsConn := tls.Client(tf.NewConn(tcpConn, context.Background(), true, true, false, 0), &tls.Config{
+		ServerName: "www.cloudflare.com",
+	})
+	require.NoError(t, tlsConn.Handshake())
+}
+
+func TestTLSDisorder(t *testing.T) {
+	t.Parallel()
+	tcpConn, err := net.Dial("tcp", "1.1.1.1:443")
+	require.NoError(t, err)
+	tlsConn := tls.Client(tf.NewConn(tcpConn, context.Background(), false, false, true, 0), &tls.Config{
 		ServerName: "www.cloudflare.com",
 	})
 	require.NoError(t, tlsConn.Handshake())
