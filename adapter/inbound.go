@@ -77,6 +77,8 @@ type InboundContext struct {
 	TLSDisorder               bool
 	TLSOOB                    bool
 	TLSDisOOB                 bool
+	TLSSplitPosition          int
+	TLSSplitAnchor            string
 
 	NetworkStrategy     *C.NetworkStrategy
 	NetworkType         []C.InterfaceType

@@ -169,9 +169,11 @@ type RawRouteOptionsActionOptions struct {
 	TLSFragment              bool               `json:"tls_fragment,omitempty"`
 	TLSFragmentFallbackDelay badoption.Duration `json:"tls_fragment_fallback_delay,omitempty"`
 	TLSRecordFragment        bool               `json:"tls_record_fragment,omitempty"`
-	TLSDisorder              bool               `json:"tls_disorder,omitempty"` // InHive accelerator: split ClientHello + send first segment at TTL=1
-	TLSOOB                   bool               `json:"tls_oob,omitempty"`      // InHive accelerator: split ClientHello + a trailing out-of-band (MSG_OOB) byte
-	TLSDisOOB                bool               `json:"tls_disoob,omitempty"`   // InHive accelerator: disorder (first segment TTL=1) + the OOB byte
+	TLSDisorder              bool               `json:"tls_disorder,omitempty"`       // InHive accelerator: split ClientHello + send first segment at TTL=1
+	TLSOOB                   bool               `json:"tls_oob,omitempty"`            // InHive accelerator: split ClientHello + a trailing out-of-band (MSG_OOB) byte
+	TLSDisOOB                bool               `json:"tls_disoob,omitempty"`         // InHive accelerator: disorder (first segment TTL=1) + the OOB byte
+	TLSSplitPosition         int                `json:"tls_split_position,omitempty"` // InHive accelerator: byedpi-style split offset (used with tls_split_anchor)
+	TLSSplitAnchor           string             `json:"tls_split_anchor,omitempty"`   // "" (random per-label) | sni | sni_end | sni_mid | absolute
 }
 
 type RouteOptionsActionOptions RawRouteOptionsActionOptions
@@ -201,6 +203,11 @@ func (r *RouteOptionsActionOptions) UnmarshalJSON(data []byte) error {
 	}
 	if r.TLSOOB && r.TLSDisOOB {
 		return E.New("`tls_oob` and `tls_disoob` are mutually exclusive")
+	}
+	switch r.TLSSplitAnchor {
+	case "", "sni", "sni_end", "sni_mid", "absolute":
+	default:
+		return E.New("invalid `tls_split_anchor` (want sni|sni_end|sni_mid|absolute): " + r.TLSSplitAnchor)
 	}
 	return nil
 }

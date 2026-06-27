@@ -557,6 +557,10 @@ match:
 			if routeOptions.TLSDisOOB {
 				metadata.TLSDisOOB = true
 			}
+			if routeOptions.TLSSplitAnchor != "" {
+				metadata.TLSSplitPosition = routeOptions.TLSSplitPosition
+				metadata.TLSSplitAnchor = routeOptions.TLSSplitAnchor
+			}
 		}
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:

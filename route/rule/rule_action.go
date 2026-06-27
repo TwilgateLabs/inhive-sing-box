@@ -45,6 +45,8 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSDisorder:               action.RouteOptions.TLSDisorder,
 				TLSOOB:                    action.RouteOptions.TLSOOB,
 				TLSDisOOB:                 action.RouteOptions.TLSDisOOB,
+				TLSSplitPosition:          action.RouteOptions.TLSSplitPosition,
+				TLSSplitAnchor:            action.RouteOptions.TLSSplitAnchor,
 			},
 		}, nil
 	case C.RuleActionTypeRouteOptions:
@@ -62,6 +64,8 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 			TLSDisorder:               action.RouteOptionsOptions.TLSDisorder,
 			TLSOOB:                    action.RouteOptionsOptions.TLSOOB,
 			TLSDisOOB:                 action.RouteOptionsOptions.TLSDisOOB,
+			TLSSplitPosition:          action.RouteOptionsOptions.TLSSplitPosition,
+			TLSSplitAnchor:            action.RouteOptionsOptions.TLSSplitAnchor,
 		}, nil
 	case C.RuleActionTypeBypass:
 		return &RuleActionBypass{
@@ -79,6 +83,8 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSDisorder:               action.BypassOptions.TLSDisorder,
 				TLSOOB:                    action.BypassOptions.TLSOOB,
 				TLSDisOOB:                 action.BypassOptions.TLSDisOOB,
+				TLSSplitPosition:          action.BypassOptions.TLSSplitPosition,
+				TLSSplitAnchor:            action.BypassOptions.TLSSplitAnchor,
 			},
 		}, nil
 	case C.RuleActionTypeDirect:
@@ -220,6 +226,8 @@ type RuleActionRouteOptions struct {
 	TLSDisorder               bool
 	TLSOOB                    bool
 	TLSDisOOB                 bool
+	TLSSplitPosition          int
+	TLSSplitAnchor            string
 	BypassIfFailed            bool
 }
 
@@ -280,6 +288,9 @@ func (r *RuleActionRouteOptions) Descriptions() []string {
 	}
 	if r.TLSDisOOB {
 		descriptions = append(descriptions, "tls-disoob")
+	}
+	if r.TLSSplitAnchor != "" {
+		descriptions = append(descriptions, F.ToString("tls-split=", r.TLSSplitAnchor, "/", r.TLSSplitPosition))
 	}
 	return descriptions
 }
