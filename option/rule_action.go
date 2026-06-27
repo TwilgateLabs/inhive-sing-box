@@ -175,6 +175,7 @@ type RawRouteOptionsActionOptions struct {
 	TLSSplitPosition         int                `json:"tls_split_position,omitempty"` // InHive accelerator: byedpi-style split offset (used with tls_split_anchor)
 	TLSSplitAnchor           string             `json:"tls_split_anchor,omitempty"`   // "" (random per-label) | sni | sni_end | sni_mid | absolute
 	TLSFake                  bool               `json:"tls_fake,omitempty"`           // InHive accelerator: fake low-TTL benign-SNI ClientHello, real via retransmit (Win only)
+	QUICFake                 bool               `json:"quic_fake,omitempty"`          // InHive accelerator: inject benign-SNI fake QUIC Initials before real (userspace, all platforms incl iOS)
 }
 
 type RouteOptionsActionOptions RawRouteOptionsActionOptions

@@ -48,6 +48,7 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSSplitPosition:          action.RouteOptions.TLSSplitPosition,
 				TLSSplitAnchor:            action.RouteOptions.TLSSplitAnchor,
 				TLSFake:                   action.RouteOptions.TLSFake,
+				QUICFake:                  action.RouteOptions.QUICFake,
 			},
 		}, nil
 	case C.RuleActionTypeRouteOptions:
@@ -68,6 +69,7 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 			TLSSplitPosition:          action.RouteOptionsOptions.TLSSplitPosition,
 			TLSSplitAnchor:            action.RouteOptionsOptions.TLSSplitAnchor,
 			TLSFake:                   action.RouteOptionsOptions.TLSFake,
+			QUICFake:                  action.RouteOptionsOptions.QUICFake,
 		}, nil
 	case C.RuleActionTypeBypass:
 		return &RuleActionBypass{
@@ -88,6 +90,7 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSSplitPosition:          action.BypassOptions.TLSSplitPosition,
 				TLSSplitAnchor:            action.BypassOptions.TLSSplitAnchor,
 				TLSFake:                   action.BypassOptions.TLSFake,
+				QUICFake:                  action.BypassOptions.QUICFake,
 			},
 		}, nil
 	case C.RuleActionTypeDirect:
@@ -232,6 +235,7 @@ type RuleActionRouteOptions struct {
 	TLSSplitPosition          int
 	TLSSplitAnchor            string
 	TLSFake                   bool
+	QUICFake                  bool
 	BypassIfFailed            bool
 }
 
@@ -298,6 +302,9 @@ func (r *RuleActionRouteOptions) Descriptions() []string {
 	}
 	if r.TLSFake {
 		descriptions = append(descriptions, "tls-fake")
+	}
+	if r.QUICFake {
+		descriptions = append(descriptions, "quic-fake")
 	}
 	return descriptions
 }

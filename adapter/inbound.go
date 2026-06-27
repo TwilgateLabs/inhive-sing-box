@@ -80,6 +80,7 @@ type InboundContext struct {
 	TLSSplitPosition          int
 	TLSSplitAnchor            string
 	TLSFake                   bool
+	QUICFake                  bool
 
 	NetworkStrategy     *C.NetworkStrategy
 	NetworkType         []C.InterfaceType

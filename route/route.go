@@ -564,6 +564,9 @@ match:
 			if routeOptions.TLSFake {
 				metadata.TLSFake = true
 			}
+			if routeOptions.QUICFake {
+				metadata.QUICFake = true
+			}
 		}
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:
