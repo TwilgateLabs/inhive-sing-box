@@ -169,13 +169,6 @@ type RawRouteOptionsActionOptions struct {
 	TLSFragment              bool               `json:"tls_fragment,omitempty"`
 	TLSFragmentFallbackDelay badoption.Duration `json:"tls_fragment_fallback_delay,omitempty"`
 	TLSRecordFragment        bool               `json:"tls_record_fragment,omitempty"`
-	TLSDisorder              bool               `json:"tls_disorder,omitempty"`       // InHive accelerator: split ClientHello + send first segment at TTL=1
-	TLSOOB                   bool               `json:"tls_oob,omitempty"`            // InHive accelerator: split ClientHello + a trailing out-of-band (MSG_OOB) byte
-	TLSDisOOB                bool               `json:"tls_disoob,omitempty"`         // InHive accelerator: disorder (first segment TTL=1) + the OOB byte
-	TLSSplitPosition         int                `json:"tls_split_position,omitempty"` // InHive accelerator: byedpi-style split offset (used with tls_split_anchor)
-	TLSSplitAnchor           string             `json:"tls_split_anchor,omitempty"`   // "" (random per-label) | sni | sni_end | sni_mid | absolute
-	TLSFake                  bool               `json:"tls_fake,omitempty"`           // InHive accelerator: fake low-TTL benign-SNI ClientHello, real via retransmit (Win only)
-	QUICFake                 bool               `json:"quic_fake,omitempty"`          // InHive accelerator: inject benign-SNI fake QUIC Initials before real (userspace, all platforms incl iOS)
 }
 
 type RouteOptionsActionOptions RawRouteOptionsActionOptions
@@ -190,29 +183,6 @@ func (r *RouteOptionsActionOptions) UnmarshalJSON(data []byte) error {
 	}
 	if r.TLSFragment && r.TLSRecordFragment {
 		return E.New("`tls_fragment` and `tls_record_fragment` are mutually exclusive")
-	}
-	if r.TLSDisorder && r.TLSRecordFragment {
-		return E.New("`tls_disorder` and `tls_record_fragment` are mutually exclusive")
-	}
-	if (r.TLSOOB || r.TLSDisOOB) && r.TLSRecordFragment {
-		return E.New("`tls_oob`/`tls_disoob` and `tls_record_fragment` are mutually exclusive")
-	}
-	if r.TLSDisorder && r.TLSOOB {
-		return E.New("`tls_disorder` and `tls_oob` are mutually exclusive")
-	}
-	if r.TLSDisorder && r.TLSDisOOB {
-		return E.New("`tls_disorder` and `tls_disoob` are mutually exclusive")
-	}
-	if r.TLSOOB && r.TLSDisOOB {
-		return E.New("`tls_oob` and `tls_disoob` are mutually exclusive")
-	}
-	switch r.TLSSplitAnchor {
-	case "", "sni", "sni_end", "sni_mid", "absolute":
-	default:
-		return E.New("invalid `tls_split_anchor` (want sni|sni_end|sni_mid|absolute): " + r.TLSSplitAnchor)
-	}
-	if r.TLSFake && (r.TLSDisorder || r.TLSOOB || r.TLSDisOOB || r.TLSRecordFragment) {
-		return E.New("`tls_fake` is mutually exclusive with disorder/oob/disoob/record_fragment")
 	}
 	return nil
 }

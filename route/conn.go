@@ -129,8 +129,8 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		m.logger.ErrorContext(ctx, err)
 		return
 	}
-	if metadata.TLSFragment || metadata.TLSRecordFragment || metadata.TLSDisorder || metadata.TLSOOB || metadata.TLSDisOOB || metadata.TLSFake {
-		remoteConn = tf.NewConn(remoteConn, ctx, metadata.TLSFragment, metadata.TLSRecordFragment, metadata.TLSDisorder, metadata.TLSOOB, metadata.TLSDisOOB, metadata.TLSFake, metadata.TLSSplitPosition, metadata.TLSSplitAnchor, metadata.TLSFragmentFallbackDelay)
+	if metadata.TLSFragment || metadata.TLSRecordFragment {
+		remoteConn = tf.NewConn(remoteConn, ctx, metadata.TLSFragment, metadata.TLSRecordFragment, metadata.TLSFragmentFallbackDelay)
 	}
 	var done atomic.Bool
 	m.preConnectionCopy(ctx, conn, remoteConn, false, &done, onClose)
@@ -255,12 +255,6 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	}
 	if udpTimeout > 0 {
 		ctx, conn = canceler.NewPacketConn(ctx, conn, udpTimeout)
-	}
-	if metadata.QUICFake {
-		// Accelerator fake-QUIC: inject benign-SNI fake QUIC Initials before the
-		// real one so the DPI mis-tags the flow. Userspace UDP sendto — works on
-		// every platform incl iOS (unlike raw TCP fake).
-		remotePacketConn = tf.NewQUICFakeConn(remotePacketConn, 0)
 	}
 	destination := bufio.NewPacketConn(remotePacketConn)
 	var done atomic.Bool

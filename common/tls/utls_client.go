@@ -59,7 +59,7 @@ func (c *UTLSClientConfig) STDConfig() (*STDConfig, error) {
 
 func (c *UTLSClientConfig) Client(conn net.Conn) (Conn, error) {
 	if c.recordFragment {
-		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, false, false, false, false, 0, "", c.fragmentFallbackDelay)
+		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
 	}
 	return &utlsALPNWrapper{utlsConnWrapper{utls.UClient(conn, c.config.Clone(), c.id)}, c.config.NextProtos}, nil
 }

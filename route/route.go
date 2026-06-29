@@ -548,25 +548,6 @@ match:
 			if routeOptions.TLSRecordFragment {
 				metadata.TLSRecordFragment = true
 			}
-			if routeOptions.TLSDisorder {
-				metadata.TLSDisorder = true
-			}
-			if routeOptions.TLSOOB {
-				metadata.TLSOOB = true
-			}
-			if routeOptions.TLSDisOOB {
-				metadata.TLSDisOOB = true
-			}
-			if routeOptions.TLSSplitAnchor != "" {
-				metadata.TLSSplitPosition = routeOptions.TLSSplitPosition
-				metadata.TLSSplitAnchor = routeOptions.TLSSplitAnchor
-			}
-			if routeOptions.TLSFake {
-				metadata.TLSFake = true
-			}
-			if routeOptions.QUICFake {
-				metadata.QUICFake = true
-			}
 		}
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:

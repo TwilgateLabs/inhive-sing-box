@@ -42,13 +42,6 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSFragment:               action.RouteOptions.TLSFragment,
 				TLSFragmentFallbackDelay:  time.Duration(action.RouteOptions.TLSFragmentFallbackDelay),
 				TLSRecordFragment:         action.RouteOptions.TLSRecordFragment,
-				TLSDisorder:               action.RouteOptions.TLSDisorder,
-				TLSOOB:                    action.RouteOptions.TLSOOB,
-				TLSDisOOB:                 action.RouteOptions.TLSDisOOB,
-				TLSSplitPosition:          action.RouteOptions.TLSSplitPosition,
-				TLSSplitAnchor:            action.RouteOptions.TLSSplitAnchor,
-				TLSFake:                   action.RouteOptions.TLSFake,
-				QUICFake:                  action.RouteOptions.QUICFake,
 			},
 		}, nil
 	case C.RuleActionTypeRouteOptions:
@@ -63,13 +56,6 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 			TLSFragment:               action.RouteOptionsOptions.TLSFragment,
 			TLSFragmentFallbackDelay:  time.Duration(action.RouteOptionsOptions.TLSFragmentFallbackDelay),
 			TLSRecordFragment:         action.RouteOptionsOptions.TLSRecordFragment,
-			TLSDisorder:               action.RouteOptionsOptions.TLSDisorder,
-			TLSOOB:                    action.RouteOptionsOptions.TLSOOB,
-			TLSDisOOB:                 action.RouteOptionsOptions.TLSDisOOB,
-			TLSSplitPosition:          action.RouteOptionsOptions.TLSSplitPosition,
-			TLSSplitAnchor:            action.RouteOptionsOptions.TLSSplitAnchor,
-			TLSFake:                   action.RouteOptionsOptions.TLSFake,
-			QUICFake:                  action.RouteOptionsOptions.QUICFake,
 		}, nil
 	case C.RuleActionTypeBypass:
 		return &RuleActionBypass{
@@ -84,13 +70,6 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 				TLSFragment:               action.BypassOptions.TLSFragment,
 				TLSFragmentFallbackDelay:  time.Duration(action.BypassOptions.TLSFragmentFallbackDelay),
 				TLSRecordFragment:         action.BypassOptions.TLSRecordFragment,
-				TLSDisorder:               action.BypassOptions.TLSDisorder,
-				TLSOOB:                    action.BypassOptions.TLSOOB,
-				TLSDisOOB:                 action.BypassOptions.TLSDisOOB,
-				TLSSplitPosition:          action.BypassOptions.TLSSplitPosition,
-				TLSSplitAnchor:            action.BypassOptions.TLSSplitAnchor,
-				TLSFake:                   action.BypassOptions.TLSFake,
-				QUICFake:                  action.BypassOptions.QUICFake,
 			},
 		}, nil
 	case C.RuleActionTypeDirect:
@@ -229,13 +208,6 @@ type RuleActionRouteOptions struct {
 	TLSFragment               bool
 	TLSFragmentFallbackDelay  time.Duration
 	TLSRecordFragment         bool
-	TLSDisorder               bool
-	TLSOOB                    bool
-	TLSDisOOB                 bool
-	TLSSplitPosition          int
-	TLSSplitAnchor            string
-	TLSFake                   bool
-	QUICFake                  bool
 	BypassIfFailed            bool
 }
 
@@ -287,24 +259,6 @@ func (r *RuleActionRouteOptions) Descriptions() []string {
 	}
 	if r.TLSRecordFragment {
 		descriptions = append(descriptions, "tls-record-fragment")
-	}
-	if r.TLSDisorder {
-		descriptions = append(descriptions, "tls-disorder")
-	}
-	if r.TLSOOB {
-		descriptions = append(descriptions, "tls-oob")
-	}
-	if r.TLSDisOOB {
-		descriptions = append(descriptions, "tls-disoob")
-	}
-	if r.TLSSplitAnchor != "" {
-		descriptions = append(descriptions, F.ToString("tls-split=", r.TLSSplitAnchor, "/", r.TLSSplitPosition))
-	}
-	if r.TLSFake {
-		descriptions = append(descriptions, "tls-fake")
-	}
-	if r.QUICFake {
-		descriptions = append(descriptions, "quic-fake")
 	}
 	return descriptions
 }
