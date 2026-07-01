@@ -29,6 +29,39 @@ import (
 
 var _ adapter.ConnectionManager = (*ConnectionManager)(nil)
 
+// maxConcurrentDials — backpressure-cap на число ОДНОВРЕМЕННО блокирующих
+// исходящих TCP-dial'ов (P1-a, 2026-07-02). Каждый app-сокет на TUN-пути идёт
+// через NewConnection → DialSerialNetwork, который блокируется до
+// TCPConnectTimeout (5s), когда upstream мёртв (NL null-route 2026-07-02). Под
+// штормом ретраев блокирующие dial'ы копятся, и каждый держит горутину-стек +
+// cached-буфер + gVisor-endpoint + (в cgo-резолве/ProtectFunc) OS-тред → это
+// phys_footprint ВНЕ Go-heap: SetMemoryLimit его не капит, а iOS jetsam меряет
+// именно его против ~50MB NE-бюджета. Слот занимается только на время самого
+// dial-вызова (не на всё соединение); на насыщении flow дропается — тем же
+// приёмом, что DNS-обмен выше своего cap (route/dns.go). 256 — щедрый потолок
+// на одного клиента, тюнится по on-device repro.
+const maxConcurrentDials = 256
+
+var (
+	dialSem        = make(chan struct{}, maxConcurrentDials)
+	dialsDropped   atomic.Uint64
+	dialLastLogSec atomic.Int64
+)
+
+// tryAcquireDial занимает слот без блокировки. true — слот занят (вызывающий
+// обязан вызвать releaseDial по завершении dial). false — насыщение, flow надо
+// дропнуть.
+func tryAcquireDial() bool {
+	select {
+	case dialSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseDial() { <-dialSem }
+
 type ConnectionManager struct {
 	logger      logger.ContextLogger
 	access      sync.Mutex
@@ -93,6 +126,19 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = adapter.WithContext(ctx, &metadata)
+	// P1-a (2026-07-02): cap на одновременные блокирующие исходящие dial'ы.
+	// На насыщении дропаем flow (не копим заблокированные горутины/треды/буферы),
+	// с rate-limited логом — тем же приёмом, что DNS-обмен на udpnat-пути.
+	if !tryAcquireDial() {
+		dropped := dialsDropped.Add(1)
+		now := time.Now().Unix()
+		last := dialLastLogSec.Load()
+		if now != last && dialLastLogSec.CompareAndSwap(last, now) {
+			m.logger.WarnContext(ctx, "outbound dials overloaded, dropped ", dropped, " connections")
+		}
+		N.CloseOnHandshakeFailure(conn, onClose, E.New("outbound dials overloaded"))
+		return
+	}
 	var (
 		remoteConn net.Conn
 		err        error
@@ -102,6 +148,9 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	} else {
 		remoteConn, err = this.DialContext(ctx, N.NetworkTCP, metadata.Destination)
 	}
+	// Слот держим только на время самого блокирующего dial — соединение уже
+	// установлено (или упало), дальше копи-горутины тред не держат.
+	releaseDial()
 	if err != nil {
 		var remoteString string
 		if len(metadata.DestinationAddresses) > 0 {

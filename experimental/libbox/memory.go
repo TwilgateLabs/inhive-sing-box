@@ -33,6 +33,17 @@ func SetMemoryLimit(enabled bool) {
 			// там RAM есть и пропускная способность важнее. Подход подсмотрен у
 			// Tailscale iOS NE (та же борьба за 15MB).
 			runtime.GOMAXPROCS(1)
+			// P1-b (2026-07-02): жёсткий потолок на число OS-тредов. Дефолт
+			// Go — 10000. При потере upstream каждый заблокированный в cgo
+			// dial (ProtectFunc / DNS-резолв в Swift) может держать свой тред,
+			// а TCP-путь до P1-a был вообще не капнут (в отличие от DNS-обмена).
+			// 10000 тредов = GB address space + phys_footprint по тред-стекам →
+			// на 50MB NE-бюджете это либо jetsam, либо неконтролируемый
+			// `fatal error: thread exhaustion` (SIGABRT без gopanic-фрейма —
+			// ровно почерк краша 4.6.0 b71 на маке 2026-07-02). 512 конвертит
+			// это в ранний, детерминированный, логируемый отказ; в паре с
+			// dial-cap (P1-a, maxConcurrentDials=256) практически недостижим.
+			runtimeDebug.SetMaxThreads(512)
 		}
 	} else {
 		runtimeDebug.SetGCPercent(100)
