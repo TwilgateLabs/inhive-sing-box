@@ -38,6 +38,7 @@ import (
 type Client struct {
 	ctx            context.Context
 	options        *option.V2RayXHTTPOptions
+	mode           string // resolved dial mode ("auto" is resolved at construction, per Xray semantics)
 	getRequestURL  func(sessionId string) url.URL
 	getRequestURL2 func(sessionId string) url.URL
 	getHTTPClient  func() (DialerClient, *XmuxClient)
@@ -45,9 +46,14 @@ type Client struct {
 }
 
 func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayXHTTPOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error) {
-	if options.Mode == "" {
-		return nil, E.New("mode is not set")
-	}
+	// Resolve the dial mode up front. Xray treats an empty mode and mode:"auto"
+	// identically (GetNormalizedMode), and our subscription parser (xray2sing)
+	// defaults xhttp mode to "auto" — so most real configs arrive as "auto".
+	// Our fork lacked GetNormalizedMode, so "auto"/"" fell through DialContext's
+	// stream-one/stream-up checks straight into the packet-up POST loop, while
+	// Xray's own auto picks stream-one for REALITY. That mismatch left every
+	// reality-xhttp config dead. Resolve here, once, using Xray's semantics.
+	resolvedMode := resolveXHTTPMode(options.Mode, tlsConfig, options.Download)
 	dest := serverAddr
 	baseRequestURL, err := getBaseRequestURL(
 		&options.V2RayXHTTPBaseOptions, dest, tlsConfig,
@@ -115,6 +121,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	return &Client{
 		ctx:            ctx,
 		options:        &options,
+		mode:           resolvedMode,
 		getHTTPClient:  getHTTPClient,
 		getHTTPClient2: getHTTPClient2,
 		getRequestURL:  getRequestURL,
@@ -122,9 +129,34 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}, nil
 }
 
+// resolveXHTTPMode maps the configured mode to a concrete dial mode, mirroring
+// Xray-core's dialer.go auto logic:
+//
+//	mode = "packet-up"
+//	if reality != nil { mode = "stream-one"; if downloadSettings != nil { mode = "stream-up" } }
+//
+// Only "auto" (and empty, which Xray treats as auto) is resolved; an explicitly
+// configured mode (stream-one / stream-up / packet-up / stream-down) is returned
+// unchanged so existing configs keep their exact behaviour. For a non-reality
+// auto config the result is "packet-up" — identical to today's fall-through, so
+// no regression for plain xhttp; the fix only changes reality-xhttp, which Xray
+// dials as stream-one and we previously (wrongly) dialed as packet-up.
+func resolveXHTTPMode(mode string, tlsConfig tls.Config, download *option.V2RayXHTTPDownloadOptions) string {
+	if mode != "" && mode != "auto" {
+		return mode
+	}
+	if tlsConfig != nil && tls.IsRealityClientConfig(tlsConfig) {
+		if download != nil {
+			return "stream-up"
+		}
+		return "stream-one"
+	}
+	return "packet-up"
+}
+
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	options := c.options
-	mode := c.options.Mode
+	mode := c.mode // resolved at construction ("auto"/"" already mapped to a concrete mode)
 	sessionIdUuid := uuid.New()
 	requestURL := c.getRequestURL(sessionIdUuid.String())
 	requestURL2 := c.getRequestURL2(sessionIdUuid.String())
