@@ -93,6 +93,16 @@ func (m *Transport) Exchange(ctx context.Context, msg *mDNS.Msg) (*mDNS.Msg, err
 
 	return m.exchangeParallel(ctx, msg)
 }
+// perServerTimeout bounds how long ONE serial member may take before we move
+// on to the next. On a hostile network a blocked resolver often BLACKHOLES the
+// query (drops the packet, never RSTs) instead of failing fast — the underlying
+// UDP/DoH transport has no timeout of its own and would block on the shared
+// context, letting a single dead member consume the entire serial budget so the
+// fallback member never gets a turn. A tight per-member deadline is what makes
+// serial fallback actually work under packet-drop censorship. Kept short so a
+// 3-4 member fan still fits inside the outer 10s budget with room to spare.
+const perServerTimeout = 2500 * time.Millisecond
+
 func (m *Transport) exchangeSerial(parent context.Context, msg *mDNS.Msg) (*mDNS.Msg, error) {
 	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	defer cancel()
@@ -103,11 +113,23 @@ func (m *Transport) exchangeSerial(parent context.Context, msg *mDNS.Msg) (*mDNS
 		case <-m.done:
 			return nil, E.New("transport closed")
 		case <-ctx.Done():
+			// Overall budget exhausted. Return best-effort rather than the raw
+			// ctx error so a late-but-non-empty cached lastResp still surfaces.
+			if lastResp != nil {
+				return lastResp, nil
+			}
+			if lastErr != nil {
+				return nil, lastErr
+			}
 			return nil, ctx.Err()
 		default:
 		}
 
-		resp, err := tr.Exchange(ctx, msg)
+		// Per-member deadline: a blackholed member yields to the next in
+		// perServerTimeout instead of eating the whole budget.
+		queryCtx, queryCancel := context.WithTimeout(ctx, perServerTimeout)
+		resp, err := tr.Exchange(queryCtx, msg)
+		queryCancel()
 		if err != nil {
 			lastErr = err
 			continue
