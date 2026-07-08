@@ -469,6 +469,23 @@ func (m *ConnectionManager) connectionCopyEarlyWrite(source net.Conn, destinatio
 }
 
 func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
+	// inhive: containment for a racy/nil select fault observed inside
+	// sing@v0.8.4 udpnat2.(*natConn).WaitReadPacket (sigpanic 0xc0000005 via
+	// runtime.selectgo). A UDP-NAT fault must drop this single packet conn, not
+	// crash the whole process + VPN service. Recover converts the fault into a
+	// normal closed-conn teardown. Follow-up: confirm the nil channel in
+	// udpnat2/conn.go:68 upstream (a sing bump 0.8.4->0.8.9 is WIP/risky).
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.ErrorContext(ctx, "packet connection copy panic recovered: ", r)
+			if !done.Swap(true) {
+				if onClose != nil {
+					onClose(E.New("packet connection copy panic: ", r))
+				}
+			}
+			common.Close(source, destination)
+		}
+	}()
 	_, err := bufio.CopyPacket(destination, source)
 	if !direction {
 		if err == nil {

@@ -217,7 +217,10 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	scMaxEachPostBytes := options.GetNormalizedScMaxEachPostBytes()
 	scMinPostsIntervalMs := options.GetNormalizedScMinPostsIntervalMs()
 	if scMaxEachPostBytes.From <= buf.Size {
-		panic("`scMaxEachPostBytes` should be bigger than " + strconv.Itoa(buf.Size))
+		// inhive: malformed server config (sc_max_each_post_bytes <= 8192) must
+		// never panic the whole process. Return an error so the bad outbound
+		// degrades to a failed dial instead of aborting the VPN service.
+		return nil, E.New("`scMaxEachPostBytes` should be bigger than ", buf.Size)
 	}
 	maxUploadSize := scMaxEachPostBytes.Rand()
 	// WithSizeLimit(0) will still allow single bytes to pass, and a lot of

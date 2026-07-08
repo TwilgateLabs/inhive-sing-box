@@ -563,7 +563,23 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		delay, err := m.tester(m.ctx, task.outboundTag)
+		var (
+			delay adapter.URLTestHistory
+			err   error
+		)
+		// inhive: keystone safety net. ANY panic in ANY outbound's dial path
+		// (e.g. a malformed xhttp server config, or a future regression) must
+		// degrade to a failed probe, not abort the whole process + VPN service.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = E.New("outbound ", task.outboundTag, " test panicked: ", r)
+					delay = adapter.URLTestHistory{Delay: TimeoutDelay}
+					m.logger.Error("outbound ", task.outboundTag, " test panic recovered: ", r)
+				}
+			}()
+			delay, err = m.tester(m.ctx, task.outboundTag)
+		}()
 
 		outcome := testOutcome{
 			outboundTag: task.outboundTag,
