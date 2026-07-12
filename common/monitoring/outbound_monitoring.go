@@ -106,6 +106,9 @@ func (m *OutboundMonitoring) Name() string {
 }
 
 func (m *OutboundMonitoring) OutboundsHistory(groupTag string) map[string]*adapter.URLTestHistory {
+	if m == nil {
+		return map[string]*adapter.URLTestHistory{} // InHive P0: monitoring выключен
+	}
 	// inhive: Touch здесь — UI (Flutter через gRPC AllProxiesInfoStream) спрашивает
 	// пинги, значит активен → бустрапим ticker.
 	m.Touch()
@@ -358,6 +361,9 @@ func (m *OutboundMonitoring) stopTimerWorkers() {
 }
 
 func (m *OutboundMonitoring) SignalChange(outboundTag string) error {
+	if m == nil {
+		return nil // InHive P0: monitoring выключен (probe/pingOnly) → no-op
+	}
 	if grp, ok := m.groups[outboundTag]; ok {
 		grp.notifyCh <- struct{}{}
 		return nil
@@ -375,6 +381,9 @@ func (m *OutboundMonitoring) SignalChange(outboundTag string) error {
 
 }
 func (m *OutboundMonitoring) TestNow(outboundTag string) error {
+	if m == nil {
+		return nil // InHive P0: monitoring выключен (probe/pingOnly) → no-op
+	}
 	// inhive: ручной пинг (selector change / Clash API /delay) → бустрапим тикер.
 	m.Touch()
 	m.testParents(outboundTag, true)
@@ -426,6 +435,9 @@ func (m *OutboundMonitoring) testParents(outboundTag string, first bool) {
 
 // InvalidateTest marks the cached test result as invalid so it will be retested.
 func (m *OutboundMonitoring) InvalidateTest(outboundTag string) error {
+	if m == nil {
+		return nil // InHive P0: monitoring выключен
+	}
 	state := m.getState(outboundTag)
 	if state == nil {
 		return errors.New("outbound not registered")
@@ -444,6 +456,9 @@ func (m *OutboundMonitoring) InvalidateTest(outboundTag string) error {
 }
 
 func (m *OutboundMonitoring) SubscribeGroup(groupTag string) (observer <-chan GroupEvent, err error) {
+	if m == nil {
+		return nil, E.New("monitoring disabled") // InHive P0
+	}
 	// inhive: подписка = UI открыл стрим пингов, бустрапим тикер пока он активен.
 	m.Touch()
 	if g, ok := m.groups[groupTag]; ok {
@@ -452,6 +467,9 @@ func (m *OutboundMonitoring) SubscribeGroup(groupTag string) (observer <-chan Gr
 	return nil, E.New("group not found ", groupTag)
 }
 func (m *OutboundMonitoring) UnsubscribeGroup(groupTag string, observer <-chan GroupEvent) (err error) {
+	if m == nil {
+		return nil // InHive P0: monitoring выключен
+	}
 	if g, ok := m.groups[groupTag]; ok {
 		g.observer.Unsubscribe(observer)
 		return nil

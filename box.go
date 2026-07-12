@@ -388,14 +388,23 @@ func New(options Options) (*Box, error) {
 			service.MustRegister[adapter.V2RayServer](ctx, v2rayServer)
 		}
 	}
-	monitor, err := monitoring.NewOutboundMonitoring(ctx, logFactory.NewLogger("monitoring"), common.PtrValueOrDefault(experimentalOptions.Monitoring))
-	if err != nil {
-		return nil, E.Cause(err, "create outbound monitoring")
-	}
-	internalServices = append(internalServices, monitor)
-	service.MustRegisterPtr[monitoring.OutboundMonitoring](ctx, monitor)
+	// InHive P0 (2026-07-12): OutboundMonitoring создаётся ТОЛЬКО если явно не
+	// выключен. probe/pingOnly-конфиги ставят experimental.monitoring.disabled=true
+	// (Dart-билдер для pingOnly-хоста + sanitizeSideInstance для side-instance проб),
+	// чтобы паразитный monitoring-контур не гонял конкурирующие URL-тесты через
+	// общий xmux h2-клиент пробы (xhttp → io.ErrClosedPipe → false-×). Боевой
+	// туннель монитор сохраняет (mode-watcher). См. project_ping_arch_redesign.
+	monitoringOptions := common.PtrValueOrDefault(experimentalOptions.Monitoring)
+	if !monitoringOptions.Disabled {
+		monitor, err := monitoring.NewOutboundMonitoring(ctx, logFactory.NewLogger("monitoring"), monitoringOptions)
+		if err != nil {
+			return nil, E.Cause(err, "create outbound monitoring")
+		}
+		internalServices = append(internalServices, monitor)
+		service.MustRegisterPtr[monitoring.OutboundMonitoring](ctx, monitor)
 
-	router.AppendTracker(monitor)
+		router.AppendTracker(monitor)
+	}
 
 	if ntpOptions.Enabled {
 		ntpDialer, err := dialer.New(ctx, ntpOptions.DialerOptions, ntpOptions.ServerIsDomain())
