@@ -178,4 +178,13 @@ func registerStubForRemovedOutbounds(registry *outbound.Registry) {
 	outbound.Register[option.StubOptions](registry, C.TypeWireGuard, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Outbound, error) {
 		return nil, E.New("WireGuard outbound is deprecated in sing-box 1.11.0 and removed in sing-box 1.13.0, use WireGuard endpoint instead")
 	})
+	// psiphon.RegisterOutbound снят (breaks Go 1.26 TLS, см. :105), но ray2sing и
+	// клиентский парсер по-прежнему эмитят type:psiphon. Без стаба такой конфиг
+	// падал на UnmarshalJSONContext («unknown outbound type: psiphon») — парс-ошибка
+	// всего конфига, у пинга вечный blank, у туннеля невнятный отказ. Со стабом
+	// парс проходит, а create отдаёт детерминированную ошибку — пинг-классификатор
+	// мапит её в честный × (config_rejected), туннель — в понятный лог.
+	outbound.Register[option.StubOptions](registry, C.TypePsiphon, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Outbound, error) {
+		return nil, E.New("psiphon outbound is not available in this build")
+	})
 }
