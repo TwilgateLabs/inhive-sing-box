@@ -16,6 +16,7 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/xray/buf"
 	"github.com/sagernet/sing-box/common/xray/net"
@@ -33,6 +34,7 @@ import (
 	sHTTP "github.com/sagernet/sing/protocol/http"
 	"github.com/sagernet/sing/service"
 	"golang.org/x/net/http2"
+	"golang.org/x/sync/semaphore"
 )
 
 type Client struct {
@@ -43,6 +45,17 @@ type Client struct {
 	getRequestURL2 func(sessionId string) url.URL
 	getHTTPClient  func() (DialerClient, *XmuxClient)
 	getHTTPClient2 func() (DialerClient, *XmuxClient)
+
+	// uploadBudget ограничивает СУММАРНЫЕ байты upload-POST'ов в полёте по ВСЕМ
+	// соединениям этого сервера. Без него каждое проксируемое TCP-соединение
+	// шлёт аплинк своей goroutine'ой без cross-connection лимита — под нагрузкой
+	// (лента = десятки соединений) в полёте копятся десятки `http2.writeRequestBody`
+	// по ~sc_max_each_post_bytes каждый (24MB в device-heap-профиле iOS, 56% всей
+	// памяти → jetsam при 50MB-лимите NE). Вес = байты чанка → мелкие посты идут
+	// параллельно (throughput не режется), блокируется только спайк крупных.
+	// nil = без лимита (не-iOS: RAM есть, важнее пропускная).
+	uploadBudget     *semaphore.Weighted
+	uploadBudgetSize int64
 }
 
 func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayXHTTPOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error) {
@@ -118,7 +131,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 			return xmuxClient2.XmuxConn.(DialerClient), xmuxClient2
 		}
 	}
-	return &Client{
+	client := &Client{
 		ctx:            ctx,
 		options:        &options,
 		mode:           resolvedMode,
@@ -126,7 +139,20 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		getHTTPClient2: getHTTPClient2,
 		getRequestURL:  getRequestURL,
 		getRequestURL2: getRequestURL2,
-	}, nil
+	}
+	// Байтовый бюджет upload-POST'ов — только на iOS (жёсткий 50MB NE-лимит).
+	// Потолок = max(8MB, 2×maxPost): гарантирует, что один чанк (≤ maxPost)
+	// всегда влезает в бюджет — иначе semaphore.Acquire(n>size) виснет навсегда.
+	if C.IsIos {
+		maxPost := int64(options.GetNormalizedScMaxEachPostBytes().To)
+		budget := int64(8 * 1024 * 1024)
+		if 2*maxPost > budget {
+			budget = 2 * maxPost
+		}
+		client.uploadBudget = semaphore.NewWeighted(budget)
+		client.uploadBudgetSize = budget
+	}
+	return client, nil
 }
 
 // resolveXHTTPMode maps the configured mode to a concrete dial mode, mirroring
@@ -262,6 +288,23 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 				(xmuxClient.UnreusableAt != time.Time{} && lastWrite.After(xmuxClient.UnreusableAt))) {
 				httpClient, xmuxClient = c.getHTTPClient()
 			}
+			// Байтовый бюджет upload-байт в полёте (iOS). Acquire ЗДЕСЬ (в цикле,
+			// не в goroutine) = backpressure на pipe→TUN, а не дроп: при упоре в
+			// бюджет цикл ждёт, TUN притормаживает отправителя. Вес клампим к
+			// потолку (страховка от Acquire(n>size)-вечной блокировки). Release —
+			// в goroutine после возврата PostPacket (chunk + h2-стрим живут до
+			// ответа сервера).
+			var acquired int64
+			if c.uploadBudget != nil {
+				acquired = int64(chunk.Len())
+				if acquired > c.uploadBudgetSize {
+					acquired = c.uploadBudgetSize
+				}
+				if err := c.uploadBudget.Acquire(ctx, acquired); err != nil {
+					buf.ReleaseMulti(chunk)
+					break
+				}
+			}
 			go func() {
 				err := httpClient.PostPacket(
 					ctx,
@@ -269,6 +312,9 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 					&buf.MultiBufferContainer{MultiBuffer: chunk},
 					int64(chunk.Len()),
 				)
+				if c.uploadBudget != nil {
+					c.uploadBudget.Release(acquired)
+				}
 				wroteRequest.Close()
 				if err != nil {
 					uploadPipeReader.Interrupt()

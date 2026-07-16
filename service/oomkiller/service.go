@@ -80,6 +80,18 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		}
 	}
 
+	// Без явного memory_limit, но с поддержкой os_proc_available_memory (darwin) —
+	// включаем таймер в useAvailable-режиме. Иначе (inhive-фикс 2026-07-16) на iOS
+	// oomkiller работал ТОЛЬКО через DISPATCH_SOURCE_MEMORYPRESSURE — системно-
+	// широкий сигнал, который МОЛЧИТ при per-process jetsam (iOS убивает NE по
+	// личному ~50MB-лимиту при гигабайтах свободной RAM устройства). useAvailable
+	// поллит реальный остаток бюджета процесса и при <safety_margin (5MB) делает
+	// ResetNetwork()+FreeOSMemory() — управляемый сброс вместо внезапной смерти.
+	if s.memoryLimit == 0 && memory.AvailableSupported() {
+		s.useAvailable = true
+		s.hasTimerMode = true
+	}
+
 	config, err := buildTimerConfig(options, s.memoryLimit, s.useAvailable)
 	if err != nil {
 		return nil, err
