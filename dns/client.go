@@ -44,7 +44,17 @@ type Client struct {
 	cacheLock          compatible.Map[dns.Question, chan struct{}]
 	transportCache     freelru.Cache[transportCacheKey, *dns.Msg]
 	transportCacheLock compatible.Map[dns.Question, chan struct{}]
+	// negFail — короткоживущий negative-cache на СЕТЕВЫЕ фейлы (timeout/reset),
+	// а не Rcode-ответы. Когда активный сервер сдох, DNS-через-туннель отваливается
+	// и каждый повтор идентичного запроса жёг полные c.timeout (10s) + держал слот
+	// из cap-96 → флуд `context deadline exceeded` (инцидент 2026-07-17). Свежая
+	// запись здесь → мгновенный fast-fail повтора вместо 10s. TTL короткий, чтобы
+	// после оживления сервера DNS быстро восстановился. Ключ per-transport.
+	negFail freelru.Cache[transportCacheKey, struct{}]
 }
+
+// negFailTTL — как долго идентичный DNS-запрос fast-fail'ит после сетевого фейла.
+const negFailTTL = 5 * time.Second
 
 type ClientOptions struct {
 	Timeout          time.Duration
@@ -81,6 +91,10 @@ func NewClient(options ClientOptions) *Client {
 			client.transportCache = common.Must1(freelru.NewSharded[transportCacheKey, *dns.Msg](cacheCapacity, maphash.NewHasher[transportCacheKey]().Hash32))
 		}
 	}
+	// negFail всегда — защита от DNS-шторма при мёртвом сервере не зависит от
+	// того, кэшируем ли мы положительные ответы. Маленький (256 записей хватает
+	// на пул одновременно фейлящих доменов).
+	client.negFail = common.Must1(freelru.NewSharded[transportCacheKey, struct{}](256, maphash.NewHasher[transportCacheKey]().Hash32))
 	return client
 }
 
@@ -194,6 +208,13 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 			return nil, ErrResponseRejectedCached
 		}
 	}
+	// Negative-cache сетевых фейлов: если недавно этот запрос упал по timeout/
+	// reset на этом transport'е — fast-fail мгновенно, не жжём c.timeout (10s) и
+	// не держим exchange-слот, пока сервер мёртв. См. поле negFail.
+	negFailKey := transportCacheKey{Question: question, transportTag: transport.Tag()}
+	if _, failed := c.negFail.Get(negFailKey); failed {
+		return nil, E.New("dns: recent network failure cached for ", question.Name)
+	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	response, err := transport.Exchange(ctx, message)
 	cancel()
@@ -202,6 +223,9 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 		if errors.As(err, &rcodeError) {
 			response = FixedResponseStatus(message, int(rcodeError))
 		} else {
+			// Сетевой фейл (timeout/reset), НЕ Rcode-ответ → кладём короткую
+			// negative-запись, чтобы погасить флуд идентичных повторов.
+			c.negFail.AddWithLifetime(negFailKey, struct{}{}, negFailTTL)
 			return nil, err
 		}
 	}

@@ -62,16 +62,52 @@ func tryAcquireDial() bool {
 
 func releaseDial() { <-dialSem }
 
+// Circuit-breaker per-outbound (2026-07-17). Когда активный сервер сдох (NL
+// null-route хостера — рецидивирующий blackhole play2go), приложения штормят
+// TCP-ретраями: без брейкера КАЖДЫЙ дайл честно висит до TCPConnectTimeout (5s),
+// пиня горутину-стек + cached-буфер + gVisor-endpoint + (в cgo ProtectFunc-
+// резолве) OS-тред. Под iOS-лимитом SetMaxThreads(512) это → `fatal error:
+// thread exhaustion` = SIGABRT (краш мака 2026-07-02/17), а footprint вне
+// Go-heap → jetsam на телефоне. dial-cap 256 ограничивает ОДНОВРЕМЕННОСТЬ, но
+// шторм не гасит (256 висящих × 5s бесконечно). Брейкер помечает outbound down
+// после N подряд-фейлов и fast-fail'ит его дайлы МГНОВЕННО (0ms, слот/тред не
+// занимаются), пропуская 1 probe/с для детекта оживления. Туннель НЕ
+// переключается и НЕ реконнектится (решение Никиты: остаёмся на выбранном
+// сервере — юзер сам пингует и меняет конфиг, авто-подмена врёт о сервере).
+// Сервер self-heal (15-20 мин) → probe ловит → трафик идёт на ТОМ ЖЕ сервере.
+type outboundHealth struct {
+	consecFails atomic.Int64 // подряд-фейлов дайла (сброс на успех)
+	downUntil   atomic.Int64 // unixNano до когда fast-fail; 0 = здоров
+	lastProbe   atomic.Int64 // unixNano последнего probe-дайла в down-режиме
+}
+
+const (
+	cbFailThreshold = 8                // подряд-фейлов → пометить down
+	cbCooldown      = 30 * time.Second // макс время в fast-fail без полного ре-теста (backstop; recovery ловит probe раньше)
+	cbProbeInterval = time.Second      // ≤1 полный probe-дайл в секунду в down-режиме
+)
+
 type ConnectionManager struct {
 	logger      logger.ContextLogger
 	access      sync.Mutex
 	connections list.List[io.Closer]
+	health      sync.Map // outboundTag(string) -> *outboundHealth
 }
 
 func NewConnectionManager(logger logger.ContextLogger) *ConnectionManager {
 	return &ConnectionManager{
 		logger: logger,
 	}
+}
+
+// outboundHealthFor возвращает (создавая при первом обращении) health-состояние
+// брейкера для outbound'а по тегу.
+func (m *ConnectionManager) outboundHealthFor(tag string) *outboundHealth {
+	if v, ok := m.health.Load(tag); ok {
+		return v.(*outboundHealth)
+	}
+	v, _ := m.health.LoadOrStore(tag, &outboundHealth{})
+	return v.(*outboundHealth)
 }
 
 func (m *ConnectionManager) Start(stage adapter.StartStage) error {
@@ -126,6 +162,28 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = adapter.WithContext(ctx, &metadata)
+	// Circuit-breaker (2026-07-17): достаём health активного outbound'а и, если
+	// он помечен down, fast-fail'им дайл МГНОВЕННО (кроме ≤1 probe/с). Проверка
+	// ДО dial-cap — fast-fail'ные дайлы не касаются семафора, слоты остаются
+	// свободны для probe и дайлов на живые серверы. См. outboundHealth.
+	var health *outboundHealth
+	if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
+		health = m.outboundHealthFor(outbound.Tag())
+		if down := health.downUntil.Load(); down != 0 {
+			nowNano := time.Now().UnixNano()
+			if nowNano < down {
+				last := health.lastProbe.Load()
+				isProbe := nowNano-last >= int64(cbProbeInterval) && health.lastProbe.CompareAndSwap(last, nowNano)
+				if !isProbe {
+					N.CloseOnHandshakeFailure(conn, onClose, E.New("outbound [", outbound.Tag(), "] circuit-open (server unreachable)"))
+					return
+				}
+				// probe: идём полным путём — если сервер ожил, успех снимет down.
+			} else {
+				health.downUntil.Store(0) // cooldown истёк — полный ре-тест
+			}
+		}
+	}
 	// P1-a (2026-07-02): cap на одновременные блокирующие исходящие dial'ы.
 	// На насыщении дропаем flow (не копим заблокированные горутины/треды/буферы),
 	// с rate-limited логом — тем же приёмом, что DNS-обмен на udpnat-пути.
@@ -151,6 +209,20 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	// Слот держим только на время самого блокирующего dial — соединение уже
 	// установлено (или упало), дальше копи-горутины тред не держат.
 	releaseDial()
+	// Circuit-breaker: обновляем здоровье outbound'а по исходу дайла. Успех →
+	// сброс (сервер жив/ожил). Dial-фейл (timeout/refused, НЕ отмена юзером) →
+	// счётчик; порог → пометить down на cooldown. Отмена по ctx (юзер закрыл
+	// сокет) здоровьем не считается.
+	if health != nil {
+		if err == nil {
+			health.consecFails.Store(0)
+			health.downUntil.Store(0)
+		} else if !errors.Is(err, context.Canceled) {
+			if health.consecFails.Add(1) >= cbFailThreshold {
+				health.downUntil.Store(time.Now().Add(cbCooldown).UnixNano())
+			}
+		}
+	}
 	if err != nil {
 		var remoteString string
 		if len(metadata.DestinationAddresses) > 0 {
