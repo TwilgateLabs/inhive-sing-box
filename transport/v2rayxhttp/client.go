@@ -56,6 +56,20 @@ type Client struct {
 	// nil = без лимита (не-iOS: RAM есть, важнее пропускная).
 	uploadBudget     *semaphore.Weighted
 	uploadBudgetSize int64
+
+	// streamSlots ограничивает ЧИСЛО одновременных xhttp-стримов (соединений)
+	// на iOS. Каждый открытый стрим держит http2 write scratch-буфер размера
+	// min(серверный SETTINGS_MAX_FRAME_SIZE, 512KB) ВСЁ время жизни (для
+	// stream-one/stream-up — до закрытия соединения). Сервер, объявляющий
+	// большой frame size (дефолт xray xhttp = 1MB → 512KB/стрим), × десятки
+	// параллельных соединений под лентой = 40MB внутри ~50MB NE-бюджета →
+	// jetsam (device-подтверждено 2026-07-17: 512KB×77 стримов = 39.7MB).
+	// Размер буфера диктует СЕРВЕР и клиент его не уменьшает без форка x/net —
+	// поэтому единственный клиентский рычаг против ЛЮБОГО (в т.ч. чужого кривого)
+	// сервера = лимит ЧИСЛА буферов. Буферизованный канал = counting-семафор;
+	// nil на не-iOS (без лимита). Acquire в DialContext = backpressure на новые
+	// соединения, Release в onClose.
+	streamSlots chan struct{}
 }
 
 func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayXHTTPOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error) {
@@ -151,6 +165,11 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		}
 		client.uploadBudget = semaphore.NewWeighted(budget)
 		client.uploadBudgetSize = budget
+		// Лимит одновременных стримов: 24 × ≤512KB scratch = ≤12MB под лентой,
+		// с запасом под ~50MB NE-бюджет. 24 параллельных соединений хватает для
+		// плавной ленты (браузеры держат ~6/host); 25-е ждёт освобождения слота
+		// доли секунды. Число — компромисс память↔параллелизм, при нужде тюним.
+		client.streamSlots = make(chan struct{}, 24)
 	}
 	return client, nil
 }
@@ -180,9 +199,31 @@ func resolveXHTTPMode(mode string, tlsConfig tls.Config, download *option.V2RayX
 	return "packet-up"
 }
 
-func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
+func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr error) {
 	options := c.options
 	mode := c.mode // resolved at construction ("auto"/"" already mapped to a concrete mode)
+	// iOS: занять слот стрима ДО открытия соединения. Блокировка здесь =
+	// backpressure на роутер (новое соединение ждёт, а не плодит буфер). Слот
+	// освобождается в onClose (успех) или дефером ниже (любой ошибочный
+	// return — retConn остаётся nil). См. поле streamSlots.
+	if c.streamSlots != nil {
+		select {
+		case c.streamSlots <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	var slotOnce sync.Once
+	releaseSlot := func() {
+		if c.streamSlots != nil {
+			slotOnce.Do(func() { <-c.streamSlots })
+		}
+	}
+	defer func() {
+		if retConn == nil {
+			releaseSlot()
+		}
+	}()
 	sessionIdUuid := uuid.New()
 	requestURL := c.getRequestURL(sessionIdUuid.String())
 	requestURL2 := c.getRequestURL2(sessionIdUuid.String())
@@ -202,6 +243,7 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 			if closed.Add(1) > 1 {
 				return
 			}
+			releaseSlot()
 			if xmuxClient != nil {
 				xmuxClient.OpenUsage.Add(-1)
 			}
