@@ -76,15 +76,16 @@ func releaseDial() { <-dialSem }
 // сервере — юзер сам пингует и меняет конфиг, авто-подмена врёт о сервере).
 // Сервер self-heal (15-20 мин) → probe ловит → трафик идёт на ТОМ ЖЕ сервере.
 type outboundHealth struct {
-	consecFails atomic.Int64 // подряд-фейлов дайла (сброс на успех)
-	downUntil   atomic.Int64 // unixNano до когда fast-fail; 0 = здоров
-	lastProbe   atomic.Int64 // unixNano последнего probe-дайла в down-режиме
+	consecFails   atomic.Int64 // подряд-фейлов дайла до trip (сброс на успех)
+	down          atomic.Bool  // true = outbound помечен мёртвым
+	lastProbe     atomic.Int64 // unixNano последнего probe-дайла
+	probeInterval atomic.Int64 // текущий backoff-интервал probe (наносек)
 }
 
 const (
-	cbFailThreshold = 8                // подряд-фейлов → пометить down
-	cbCooldown      = 30 * time.Second // макс время в fast-fail без полного ре-теста (backstop; recovery ловит probe раньше)
-	cbProbeInterval = time.Second      // ≤1 полный probe-дайл в секунду в down-режиме
+	cbFailThreshold = 8                // подряд-фейлов → trip (пометить down)
+	cbProbeBase     = time.Second      // стартовый интервал probe после trip
+	cbProbeMax      = 30 * time.Second // потолок backoff'а (=макс время между проверками recovery)
 )
 
 type ConnectionManager struct {
@@ -167,20 +168,24 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	// ДО dial-cap — fast-fail'ные дайлы не касаются семафора, слоты остаются
 	// свободны для probe и дайлов на живые серверы. См. outboundHealth.
 	var health *outboundHealth
+	var isProbe bool
 	if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
 		health = m.outboundHealthFor(outbound.Tag())
-		if down := health.downUntil.Load(); down != 0 {
+		if health.down.Load() {
 			nowNano := time.Now().UnixNano()
-			if nowNano < down {
-				last := health.lastProbe.Load()
-				isProbe := nowNano-last >= int64(cbProbeInterval) && health.lastProbe.CompareAndSwap(last, nowNano)
-				if !isProbe {
-					N.CloseOnHandshakeFailure(conn, onClose, E.New("outbound [", outbound.Tag(), "] circuit-open (server unreachable)"))
-					return
-				}
-				// probe: идём полным путём — если сервер ожил, успех снимет down.
+			last := health.lastProbe.Load()
+			interval := health.probeInterval.Load()
+			if interval == 0 {
+				interval = int64(cbProbeBase)
+			}
+			// Recovery ловится ТОЛЬКО пропущенным probe: пропускаем 1 дайл раз в
+			// interval (растёт с backoff'ом), остальные fast-fail (0ms). Никакого
+			// синтетического трафика — это одна из уже идущих попыток приложений.
+			if nowNano-last >= interval && health.lastProbe.CompareAndSwap(last, nowNano) {
+				isProbe = true // идёт полным путём; успех снимет down, фейл увеличит backoff
 			} else {
-				health.downUntil.Store(0) // cooldown истёк — полный ре-тест
+				N.CloseOnHandshakeFailure(conn, onClose, E.New("outbound [", outbound.Tag(), "] circuit-open (server unreachable)"))
+				return
 			}
 		}
 	}
@@ -209,17 +214,34 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	// Слот держим только на время самого блокирующего dial — соединение уже
 	// установлено (или упало), дальше копи-горутины тред не держат.
 	releaseDial()
-	// Circuit-breaker: обновляем здоровье outbound'а по исходу дайла. Успех →
-	// сброс (сервер жив/ожил). Dial-фейл (timeout/refused, НЕ отмена юзером) →
-	// счётчик; порог → пометить down на cooldown. Отмена по ctx (юзер закрыл
-	// сокет) здоровьем не считается.
+	// Circuit-breaker: обновляем здоровье outbound'а по исходу дайла. Отмена по
+	// ctx (юзер закрыл сокет) здоровьем не считается.
 	if health != nil {
-		if err == nil {
+		switch {
+		case err == nil:
+			// Успех (обычный дайл или probe) → сервер жив/ожил, полный сброс.
 			health.consecFails.Store(0)
-			health.downUntil.Store(0)
-		} else if !errors.Is(err, context.Canceled) {
-			if health.consecFails.Add(1) >= cbFailThreshold {
-				health.downUntil.Store(time.Now().Add(cbCooldown).UnixNano())
+			health.probeInterval.Store(0)
+			health.down.Store(false)
+		case errors.Is(err, context.Canceled):
+			// отмена юзером — не сигнал здоровья, игнор
+		case isProbe:
+			// probe упал — сервер всё ещё мёртв, backoff (×2, потолок cbProbeMax).
+			next := health.probeInterval.Load() * 2
+			if next < int64(cbProbeBase) {
+				next = int64(cbProbeBase)
+			}
+			if next > int64(cbProbeMax) {
+				next = int64(cbProbeMax)
+			}
+			health.probeInterval.Store(next)
+		default:
+			// обычный dial-фейл (timeout/refused) на живом-считающемся outbound →
+			// счётчик; порог → trip: пометить down, стартовать probe-часы.
+			if health.consecFails.Add(1) >= cbFailThreshold && !health.down.Load() {
+				health.probeInterval.Store(int64(cbProbeBase))
+				health.lastProbe.Store(time.Now().UnixNano())
+				health.down.Store(true)
 			}
 		}
 	}
