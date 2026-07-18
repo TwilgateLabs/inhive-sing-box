@@ -20,6 +20,7 @@ type splitConn struct {
 }
 
 func (c *splitConn) Write(b []byte) (int, error) {
+	recordWriteChunk(len(b)) // inhive build-129 instrumentation (chunkhist.go); remove when buffer finalized
 	return c.writer.Write(b)
 }
 

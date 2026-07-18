@@ -98,8 +98,19 @@ func (c *Client) connect() (*grpc.ClientConn, error) {
 	if conn != nil && conn.GetState() != connectivity.Shutdown {
 		return conn, nil
 	}
+	// InHive: bound the blocking dial. WithReturnConnectionError (NewClient) implies
+	// WithBlock → grpc.DialContext blocks until the conn is Ready. Passing the
+	// box-lifetime c.ctx (no deadline) means a blackholed server hangs this dial
+	// FOREVER — holding connAccess and leaking the caller's route dialSem slot,
+	// invisible to the circuit-breaker (health updates only AFTER DialContext
+	// returns, and this one never does → 256 zombies wedge the whole tunnel). The
+	// bounded ctx makes a dead server fail fast, freeing the slot and letting the
+	// breaker trip. It bounds only connection SETUP; the established ClientConn
+	// outlives dialCtx (grpc keeps what it needs), so long-lived streams are unaffected.
+	dialCtx, cancel := context.WithTimeout(c.ctx, 15*time.Second)
+	defer cancel()
 	//nolint:staticcheck
-	conn, err := grpc.DialContext(c.ctx, c.serverAddr, c.dialOptions...)
+	conn, err := grpc.DialContext(dialCtx, c.serverAddr, c.dialOptions...)
 	if err != nil {
 		return nil, err
 	}

@@ -16,7 +16,6 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/adapter"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/xray/buf"
 	"github.com/sagernet/sing-box/common/xray/net"
@@ -154,31 +153,30 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		getRequestURL:  getRequestURL,
 		getRequestURL2: getRequestURL2,
 	}
-	// Байтовый бюджет upload-POST'ов — только на iOS (жёсткий 50MB NE-лимит).
-	// Потолок = max(8MB, 2×maxPost): гарантирует, что один чанк (≤ maxPost)
-	// всегда влезает в бюджет — иначе semaphore.Acquire(n>size) виснет навсегда.
-	if C.IsIos {
-		maxPost := int64(options.GetNormalizedScMaxEachPostBytes().To)
-		budget := int64(8 * 1024 * 1024)
-		if 2*maxPost > budget {
-			budget = 2 * maxPost
-		}
-		client.uploadBudget = semaphore.NewWeighted(budget)
-		client.uploadBudgetSize = budget
-		// Stream-cap ОТКЛЮЧЁН (2026-07-18). Семафор был ГЛОБАЛЬНЫЙ на сервер и
-		// душил трафик: приложения держат десятки keep-alive соединений → все
-		// слоты заняты → новые дайлы (В ТОМ ЧИСЛЕ DNS-в-туннеле) блокируются →
-		// DNS timeout 10s → «обрыв» (лог Никиты 2026-07-18: работает, полистал
-		// инст+тг, обрыв; свитч конфига лечит; в Happ того же конфига проблемы
-		// нет — у него cap'а нет). Cap ставился против jetsam листания (билд 121)
-		// КОГДА ещё не было oomkiller (120) и circuit-breaker (123); теперь
-		// настоящие причины закрыты ими (память-спайк → мягкий ResetNetwork,
-		// шторм мёртвого сервера → route/conn.go breaker), а cap стал вредным
-		// рудиментом. Поле streamSlots и acquire/release в DialContext оставлены
-		// (nil = no-op), чтобы вернуть лимит вместе с серверным frame-size фиксом,
-		// если oomkiller начнёт часто моргать под тяжёлой лентой. Пока — как Happ.
-		// client.streamSlots = make(chan struct{}, N) // не инициализируем
-	}
+	// uploadBudget И streamSlots — ОБА ОТКЛЮЧЕНЫ (2026-07-18). Поля + nil-guarded
+	// Acquire/Release в DialContext оставлены (no-op), чтобы вернуть с
+	// НЕ-throttling редизайном, если понадобится.
+	//
+	// uploadBudget (8MB byte-семафор upload-POST'ов, был только iOS) снят по
+	// device-замеру на packet-up CDN-конфиге (Никита, LTE, build 126): отдача
+	// 1.3 Мбит/с у нас против 91 у Happ на ТОМ ЖЕ конфиге (пинг 644 против 191).
+	// Это ЕДИНСТВЕННЫЙ поведенческий дифф нашего packet-up-пути от Happ. Механизм:
+	// бюджет ГЛОБАЛЬНЫЙ на сервер (per-Client), а Release стоит в горутине ПОСЛЕ
+	// возврата PostPacket, который на CDN-пути строится с context.WithoutCancel и
+	// без таймаута (dialer.go:92) → зависший POST не возвращает свой ≤1MB в пул →
+	// накопление → пул к нулю → все новые Acquire (в т.ч. DNS-в-туннеле и h2
+	// WINDOW_UPDATE проксируемой сессии) блокируются → отдача душится, скачивание
+	// встаёт «на половине», спидтест 00, «свитч конфига лечит» (свежий Client =
+	// свежий пул) — классическая утечка. Happ бюджета не имеет → N параллельных
+	// packet-up-аплоадов летят свободно (xmux у CDN-конфигов не задан, параллель
+	// даёт сам спидтест N соединениями). Память, ради которой ставился бюджет:
+	// (1) реальный хог — stream-mode writeRequestBody (512KB×N), НЕ packet-up
+	// (бюджет стоял не там); (2) per-connection upload-pipe уже кэпит packet-up
+	// (~1MB, pipe.WithSizeLimit ниже в DialContext); (3) спайки ловит oomkiller
+	// (120) + circuit-breaker (123) + mixed-стек (126). Тот же разбор снял
+	// streamSlots в 125 — это его близнец, оставленный тогда живым по недосмотру.
+	// client.uploadBudget = semaphore.NewWeighted(budget) // НЕ инициализируем
+	// client.streamSlots  = make(chan struct{}, N)        // НЕ инициализируем
 	return client, nil
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
+	"github.com/sagernet/sing/common/bufio/deadline"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -103,6 +104,21 @@ func (c *Client) dialContext(ctx context.Context, requestURL *url.URL, headers h
 	if err != nil {
 		return nil, err
 	}
+	// InHive: bound the upgrade handshake with a deadline (mirrors the ws client,
+	// v2raywebsocket/client.go:83-96). Without it, request.Write / http.ReadResponse
+	// have no deadline and don't observe ctx — a server that accepts the TCP/TLS
+	// connection then goes silent (host blackhole, our play2go recidive) hangs the
+	// dial FOREVER, leaking the caller's route dialSem slot (invisible to the
+	// circuit-breaker, which never sees a returned dial) and wedging the whole
+	// tunnel once the global cap fills. Also close conn on every handshake-error
+	// path so a dead server can't leak an fd per attempt.
+	var deadlineConn net.Conn
+	if deadline.NeedAdditionalReadDeadline(conn) {
+		deadlineConn = deadline.NewConn(conn)
+	} else {
+		deadlineConn = conn
+	}
+	deadlineConn.SetDeadline(time.Now().Add(C.TCPTimeout))
 	request := &http.Request{
 		Method: http.MethodGet,
 		URL:    requestURL,
@@ -111,24 +127,30 @@ func (c *Client) dialContext(ctx context.Context, requestURL *url.URL, headers h
 	}
 	request.Header.Set("Connection", "Upgrade")
 	request.Header.Set("Upgrade", "websocket")
-	err = request.Write(conn)
+	err = request.Write(deadlineConn)
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
-	bufReader := std_bufio.NewReader(conn)
+	bufReader := std_bufio.NewReader(deadlineConn)
 	response, err := http.ReadResponse(bufReader, request)
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 	if response.StatusCode != 101 ||
 		!strings.EqualFold(response.Header.Get("Connection"), "upgrade") ||
 		!strings.EqualFold(response.Header.Get("Upgrade"), "websocket") {
+		conn.Close()
 		return nil, E.New("v2ray-http-upgrade: unexpected status: ", response.Status)
 	}
+	// Clear the handshake deadline before handing the conn to the caller for streaming.
+	deadlineConn.SetDeadline(time.Time{})
 	if bufReader.Buffered() > 0 {
 		buffer := buf.NewSize(bufReader.Buffered())
 		_, err = buffer.ReadFullFrom(bufReader, buffer.Len())
 		if err != nil {
+			conn.Close()
 			return nil, err
 		}
 		conn = bufio.NewCachedConn(conn, buffer)

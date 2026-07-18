@@ -248,3 +248,6 @@ replace github.com/zarazaex69/j => github.com/TwilgateLabs/inhive-j-deps v0.0.2-
 // этого `go vet/build` ВНУТРИ submodule с with_olcrtc падает "no required
 // module provides package .../warpobf". Путь относительный к submodule root.
 replace github.com/sagernet/wireguard-go => ./replace/wireguard-go
+
+// inhive fork: h2 write-scratch cap 512KB→64KB (iOS NE jetsam). See core/go.mod.
+replace golang.org/x/net => ./replace/x-net
