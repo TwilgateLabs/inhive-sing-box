@@ -165,11 +165,17 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		}
 		client.uploadBudget = semaphore.NewWeighted(budget)
 		client.uploadBudgetSize = budget
-		// Лимит одновременных стримов: 24 × ≤512KB scratch = ≤12MB под лентой,
-		// с запасом под ~50MB NE-бюджет. 24 параллельных соединений хватает для
-		// плавной ленты (браузеры держат ~6/host); 25-е ждёт освобождения слота
-		// доли секунды. Число — компромисс память↔параллелизм, при нужде тюним.
-		client.streamSlots = make(chan struct{}, 24)
+		// Лимит одновременных стримов. Семафор ГЛОБАЛЬНЫЙ на сервер, поэтому
+		// свёрнутое приложение, ещё качающее, держит слоты и переднее ждёт
+		// (head-of-line, репорт Никиты 2026-07-17 при cap=24). Подняли 24→48:
+		// device-данные показали пик ~32MB при cap=24 (половина 50MB-бюджета
+		// простаивала), 48 даёт пик ~44MB (под oomkiller-порогом, шторм-кейс
+		// теперь ловит circuit-breaker в route/conn.go). Буфер на стрим диктует
+		// СЕРВЕР (наш xray splithttp объявляет 1MB frame → min(1MB,512KB)=512KB);
+		// сервер трогать не стали (решение Никиты) → 48 = безопасный потолок на
+		// 1MB-frame сервере. На сервере с нормальным frame size (16-64KB) буфер
+		// в разы меньше и cap не задевается. Компромисс память↔параллелизм.
+		client.streamSlots = make(chan struct{}, 48)
 	}
 	return client, nil
 }
