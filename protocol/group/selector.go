@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -33,10 +34,16 @@ var (
 
 type Selector struct {
 	outbound.Adapter
-	ctx                          context.Context
-	outbound                     adapter.OutboundManager
-	connection                   adapter.ConnectionManager
-	logger                       logger.ContextLogger
+	ctx        context.Context
+	outbound   adapter.OutboundManager
+	connection adapter.ConnectionManager
+	logger     logger.ContextLogger
+	// InHive hot-add (2026-07-19): membership мутируется в рантайме
+	// (AddMember/RemoveMember из hcore AddOutbound/RemoveOutbound RPC), поэтому
+	// tags/outbounds под RWMutex. Upstream снапшотил их один раз в Start() и
+	// читал без лока. Горячий путь (DialContext/NewConnectionEx) не страдает —
+	// он ходит только в атомарный selected.
+	access                       sync.RWMutex
 	tags                         []string
 	defaultTag                   string
 	outbounds                    map[string]adapter.Outbound
@@ -73,6 +80,8 @@ func (s *Selector) Network() []string {
 }
 
 func (s *Selector) Start() error {
+	s.access.Lock()
+	defer s.access.Unlock()
 	for i, tag := range s.tags {
 		detour, loaded := s.outbound.Outbound(tag)
 		if !loaded {
@@ -115,18 +124,73 @@ func (s *Selector) PostStart() error {
 func (s *Selector) Now() string {
 	selected := s.selected.Load()
 	if selected == nil {
+		s.access.RLock()
+		defer s.access.RUnlock()
 		return s.tags[0]
 	}
 	return selected.Tag()
 }
 
 func (s *Selector) All() []string {
-	return s.tags
+	s.access.RLock()
+	defer s.access.RUnlock()
+	// Копия: caller'ы (clash API getProxies) итерируют вне лока.
+	return append([]string(nil), s.tags...)
+}
+
+// AddMember добавляет outbound в живой селектор (InHive hot-add). Outbound
+// обязан быть УЖЕ создан и запущен в OutboundManager (Create с started=true) —
+// селектор здесь только регистрирует членство. Повторное добавление тега
+// обновляет резолв (семантика replace — как у manager.Create).
+func (s *Selector) AddMember(tag string, detour adapter.Outbound) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if _, exists := s.outbounds[tag]; !exists {
+		s.tags = append(s.tags, tag)
+	}
+	s.outbounds[tag] = detour
+}
+
+// RemoveMember убирает outbound из членов селектора. Если удаляемый был
+// выбран — выбор переводится на defaultTag (или первый член), активные
+// соединения interrupt'ятся. Сам outbound из OutboundManager НЕ удаляется —
+// это ответственность вызывающего (hcore RemoveOutbound: сначала членства,
+// потом manager.Remove, иначе dangling-указатель из selected).
+func (s *Selector) RemoveMember(tag string) bool {
+	s.access.Lock()
+	removed, exists := s.outbounds[tag]
+	if !exists {
+		s.access.Unlock()
+		return false
+	}
+	delete(s.outbounds, tag)
+	for i, t := range s.tags {
+		if t == tag {
+			s.tags = append(s.tags[:i], s.tags[i+1:]...)
+			break
+		}
+	}
+	var fallback adapter.Outbound
+	if s.selected.Load() == removed {
+		if d, ok := s.outbounds[s.defaultTag]; ok {
+			fallback = d
+		} else if len(s.tags) > 0 {
+			fallback = s.outbounds[s.tags[0]]
+		}
+	}
+	s.access.Unlock()
+	if fallback != nil {
+		s.selected.Store(fallback)
+		s.interruptGroup.Interrupt(true)
+	}
+	return true
 }
 
 func (s *Selector) SelectOutbound(tag string) bool {
 	defer s.pingSelected()
+	s.access.RLock()
 	detour, loaded := s.outbounds[tag]
+	s.access.RUnlock()
 	if !loaded {
 		return false
 	}
