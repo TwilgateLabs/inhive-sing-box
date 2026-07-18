@@ -33,7 +33,18 @@ type ConnectionEvent struct {
 	ClosedAt      time.Time
 }
 
-const closedConnectionsLimit = 1000
+// closedConnectionsLimit — размер кольца ИСТОРИИ ЗАКРЫТЫХ соединений (только
+// для UI-вкладки «Соединения»; активные трекаются отдельно в `connections`).
+// InHive NE-quiescence (2026-07-19): на iOS 1000×TrackerMetadata (~1.5KB, с
+// InboundContext/Chain/Rule) ≈ 1.35MB резидента в NE (жёсткий ~50MB бюджет),
+// а вкладка на iOS всё равно показывает в основном активные — глубокая
+// история закрытых там не нужна. Desktop оставляем 1000.
+var closedConnectionsLimit = func() int {
+	if C.IsIos {
+		return 50
+	}
+	return 1000
+}()
 
 type Manager struct {
 	uploadTotal             atomic.Int64
