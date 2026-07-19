@@ -99,7 +99,18 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if flusher, isFlusher := writer.(httpFlusher); isFlusher {
 		err := flusher.FlushError()
 		if err != nil {
-			s.invalidRequest(writer, request, http.StatusInternalServerError, E.New("flush response"))
+			// Два дефекта разом. (1) E.New вместо E.Cause — причина (broken
+			// pipe / connection reset / h2 stream error) выбрасывалась, в лог
+			// уходила голая строка «flush response», по которой нельзя понять
+			// НИЧЕГО: шумный silent-fail. Все соседние точки в этом файле
+			// используют E.Cause (см. «hijack failed» ниже) — расхождение
+			// одиночное. (2) Не было return: после провалившегося flush
+			// хендлер шёл дальше и хайджекал соединение, чей ответ 101 так и
+			// не доехал, отдавая заведомо мёртвый conn в NewConnectionEx.
+			// Наблюдатель видел падение СЛОЕМ НИЖЕ, без причинной связи с
+			// flush'ем.
+			s.invalidRequest(writer, request, http.StatusInternalServerError, E.Cause(err, "flush response"))
+			return
 		}
 	}
 	hijacker, canHijack := writer.(http.Hijacker)

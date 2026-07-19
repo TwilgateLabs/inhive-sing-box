@@ -1,6 +1,7 @@
 package option
 
 import (
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -134,7 +135,7 @@ func TestXPaddingDefaultRangeMatchesUpstream(t *testing.T) {
 // кэшируемым объектом и применять к нему свои лимиты.
 func TestXHTTPRequestHeadersCarryCoherentBrowserFingerprint(t *testing.T) {
 	var o V2RayXHTTPBaseOptions
-	h := o.GetRequestHeader("https://cdn.example.com/api-test/abc")
+	h, _ := o.GetRequestHeader("https://cdn.example.com/api-test/abc")
 
 	// Client Hints пишутся прямым присваиванием в map (парити с апстримом: так на
 	// HTTP/1.1 сохраняется ровно то написание, которое шлёт Chrome — "Sec-CH-UA", а
@@ -172,11 +173,109 @@ func TestXHTTPRequestHeadersCarryCoherentBrowserFingerprint(t *testing.T) {
 // маскировку поверх него не навязываем (апстримная семантика).
 func TestXHTTPCustomUserAgentIsLeftAlone(t *testing.T) {
 	o := V2RayXHTTPBaseOptions{Headers: map[string]string{"User-Agent": "MyCustomAgent/1.0"}}
-	h := o.GetRequestHeader("https://cdn.example.com/x")
+	h, _ := o.GetRequestHeader("https://cdn.example.com/x")
 	if h.Get("User-Agent") != "MyCustomAgent/1.0" {
 		t.Fatalf("custom UA overwritten: %q", h.Get("User-Agent"))
 	}
 	if h.Get("Sec-CH-UA") != "" {
 		t.Errorf("custom UA must not gain Chrome client hints, got %q", h.Get("Sec-CH-UA"))
+	}
+}
+
+// Регрессия 2026-07-19: padding при xPaddingPlacement="query" обязан оказаться В САМОМ
+// URL запроса, а не только в локальной копии внутри GetRequestHeader.
+//
+// Баг был silent-fail чистой воды: функция аккуратно дописывала padding в распарсенный
+// `*url.URL`, но наружу отдавала только http.Header — вызывающий строил запрос по
+// ИСХОДНОЙ строке, и padding не уходил на провод НИКОГДА. Сервер (Xray splithttp) при
+// обязательном padding отвергал 100% таких запросов, а в клиентском логе не было ни
+// ошибки, ни предупреждения: `err == nil`, «padding применён» — в выброшенный объект.
+//
+// Тест проверяет именно ВОЗВРАЩЁННЫЙ URL, потому что только он доезжает до http.Request.
+func TestXHTTPQueryPlacementPaddingReachesTheURL(t *testing.T) {
+	o := V2RayXHTTPBaseOptions{
+		XPaddingObfsMode:  true,
+		XPaddingPlacement: "query",
+		XPaddingKey:       "pad",
+	}
+	_, effectiveURL := o.GetRequestHeader("https://cdn.example.com/api/abc")
+
+	u, err := url.Parse(effectiveURL)
+	if err != nil {
+		t.Fatalf("returned URL does not parse: %v", err)
+	}
+	padding := u.Query().Get("pad")
+	if padding == "" {
+		t.Fatalf("padding absent from the returned URL %q — it would never reach the wire", effectiveURL)
+	}
+	if r := o.GetNormalizedXPaddingBytes(); len(padding) < int(r.From) || len(padding) > int(r.To) {
+		t.Errorf("padding length %d outside configured range %d..%d", len(padding), r.From, r.To)
+	}
+	// Существующие параметры запроса padding затирать не должен.
+	_, withQuery := o.GetRequestHeader("https://cdn.example.com/api/abc?keep=1")
+	u2, err := url.Parse(withQuery)
+	if err != nil {
+		t.Fatalf("returned URL does not parse: %v", err)
+	}
+	if u2.Query().Get("keep") != "1" {
+		t.Errorf("padding clobbered an existing query parameter: %q", withQuery)
+	}
+}
+
+// Сиблинг к тесту выше: для ВСЕХ остальных placement'ов URL обязан остаться прежним.
+// Это защита от противоположной ошибки — «починили query, заодно сломали дефолт»:
+// в дефолтной ветке (queryInHeader) в URL пишется ФЕЙКОВЫЙ query для заголовка Referer,
+// и он не должен утечь в реальный запрос.
+func TestXHTTPNonQueryPlacementsLeaveTheURLIntact(t *testing.T) {
+	const raw = "https://cdn.example.com/api/abc"
+	for _, tc := range []struct {
+		name      string
+		obfs      bool
+		placement string
+	}{
+		{"default obfs off (queryInHeader)", false, ""},
+		{"obfs on, queryInHeader", true, "queryInHeader"},
+		{"obfs on, header", true, "header"},
+		{"obfs on, cookie", true, "cookie"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o := V2RayXHTTPBaseOptions{XPaddingObfsMode: tc.obfs, XPaddingPlacement: tc.placement}
+			_, effectiveURL := o.GetRequestHeader(raw)
+			if effectiveURL != raw {
+				t.Errorf("URL mutated to %q, want %q — padding meant for a header leaked into the request line", effectiveURL, raw)
+			}
+		})
+	}
+}
+
+// Взаимодействие, которое ломается легче всего: session/seq И padding одновременно
+// размещены в query. `applySessionPlacement`/`applySeqPlacement` (client.go) пишут свои
+// значения в URL ДО того, как padding допишет своё, — и все трое обязаны доехать.
+//
+// Ставим тест здесь, потому что именно эта комбинация ловит регрессию вида «взяли
+// u.Query(), перезаписали RawQuery целиком и потеряли чужие параметры».
+func TestXHTTPQueryPaddingCoexistsWithSessionAndSeq(t *testing.T) {
+	o := V2RayXHTTPBaseOptions{
+		XPaddingObfsMode:  true,
+		XPaddingPlacement: "query",
+		XPaddingKey:       "pad",
+	}
+	// URL в том виде, в каком его отдаёт client.go после applySessionPlacement +
+	// applySeqPlacement с query-размещением.
+	_, effectiveURL := o.GetRequestHeader("https://cdn.example.com/api?session=abc-123&seq=7")
+
+	u, err := url.Parse(effectiveURL)
+	if err != nil {
+		t.Fatalf("returned URL does not parse: %v", err)
+	}
+	q := u.Query()
+	if got := q.Get("session"); got != "abc-123" {
+		t.Errorf("session lost or corrupted: %q (URL %q)", got, effectiveURL)
+	}
+	if got := q.Get("seq"); got != "7" {
+		t.Errorf("seq lost or corrupted: %q (URL %q)", got, effectiveURL)
+	}
+	if q.Get("pad") == "" {
+		t.Errorf("padding absent (URL %q)", effectiveURL)
 	}
 }

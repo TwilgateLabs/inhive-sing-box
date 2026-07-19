@@ -65,6 +65,20 @@ func NewConnWithHeartbeat(conn net.Conn, remoteAddr net.Addr, state ws.State, he
 }
 
 // heartbeatLoop writes a ping control frame every period until Close stops it.
+//
+// Отказ записи пинга РВЁТ соединение (c.Conn.Close), а не просто выходит из
+// горутины. Почему: у WebsocketConn нет логгера, а раньше ошибка умирала
+// вместе с горутиной — keepalive молча переставал работать, и дальше юзер
+// получал ровно тот симптом, ради которого heartbeat и включают: сессия
+// встаёт на простое (CDN/эдж прибивает idle-соединение). Со стороны
+// наблюдателя это выглядело максимально обманчиво: «heartbeat_period задан,
+// в логах чисто → keepalive работает, причина где-то ещё».
+// Ошибка записи в TCP терминальна (дедлайна на этом пути нет, так что
+// ложных срабатываний по таймауту быть не может), поэтому соединение
+// действительно мертво. Закрывая его, мы разблокируем read-сторону, и
+// ошибка всплывает по ШТАТНОМУ пути протокола, который уже логируется —
+// это лучше нового лог-синка: сигнал появляется там, где есть контекст
+// (тег outbound, адрес), а не в безымянной горутине транспорта.
 func (c *WebsocketConn) heartbeatLoop(period time.Duration) {
 	ticker := time.NewTicker(period)
 	defer ticker.Stop()
@@ -78,6 +92,7 @@ func (c *WebsocketConn) heartbeatLoop(period time.Duration) {
 				frame = ws.MaskFrameInPlace(frame)
 			}
 			if err := ws.WriteFrame(c.Conn, frame); err != nil {
+				c.Conn.Close()
 				return
 			}
 		}

@@ -371,10 +371,18 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			includeAllNetworks = t.platformInterface.NetworkExtensionIncludeAllNetworks()
 		}
 		tunStack, err := tun.NewStack(t.stack, tun.StackOptions{
-			Context:                t.ctx,
-			Tun:                    tunInterface,
-			TunOptions:             t.tunOptions,
-			UDPTimeout:             t.udpTimeout,
+			Context:    t.ctx,
+			Tun:        tunInterface,
+			TunOptions: t.tunOptions,
+			UDPTimeout: t.udpTimeout,
+			// InHive 2026-07-19: ОБЯЗАТЕЛЬНО к заполнению начиная с sing-tun 0.8.11.
+			// Там `NewDirectRouteMapping` перестал брать udpTimeout и берёт это новое
+			// поле. Оставить его незаполненным — тихо передать НОЛЬ: записи маппинга
+			// перестают истекать по времени (вытесняются только по ёмкости LRU), а сам
+			// ноль ещё и протекает в конструктор назначения. Ошибки при этом нет ни
+			// одной — ровно тот класс, который мы этой волной и вычищаем.
+			// Значение — апстримная константа sing-box 1.13.14 (inbound.go:383).
+			ICMPTimeout:            C.ICMPTimeout,
 			Handler:                t,
 			Logger:                 t.logger,
 			ForwarderBindInterface: forwarderBindInterface,

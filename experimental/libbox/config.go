@@ -199,8 +199,10 @@ func (s *interfaceMonitorStub) UnregisterCallback(element *list.Element[tun.Defa
 func (s *interfaceMonitorStub) RegisterMyInterface(interfaceName string) {
 }
 
-func (s *interfaceMonitorStub) MyInterface() string {
-	return ""
+// InHive 2026-07-19: контракт sing-tun 0.8.11 — `MyInterfaces() []string`. Заглушка,
+// используется при разборе конфига вне рантайма (интерфейсов там нет по определению).
+func (s *interfaceMonitorStub) MyInterfaces() []string {
+	return nil
 }
 
 func FormatConfig(configContent string) (*StringBox, error) {

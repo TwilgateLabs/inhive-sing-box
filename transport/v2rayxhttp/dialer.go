@@ -73,8 +73,14 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 	// запроса появляется корректный владелец. Это и есть замена снятой правки с
 	// ctx-проверками в WaitReadCloser.Read: та рвала стрим по dial-контексту
 	// (слишком рано), эта — по закрытию соединения (ровно тогда, когда надо).
-	req, _ := http.NewRequestWithContext(ctx, method, url, body)
-	req.Header = c.options.GetRequestHeader(url)
+	// InHive 2026-07-19: заголовки считаем ДО построения запроса, потому что
+	// GetRequestHeader может изменить сам URL (placement "query" дописывает в него
+	// padding). Раньше запрос строился первым, а изменённый URL выбрасывался — padding
+	// не уезжал на провод, сервер отвергал каждый такой запрос, и в нашем логе не было
+	// ни строчки.
+	header, effectiveURL := c.options.GetRequestHeader(url)
+	req, _ := http.NewRequestWithContext(ctx, method, effectiveURL, body)
+	req.Header = header
 	if body != nil && !c.options.NoGRPCHeader {
 		req.Header.Set("Content-Type", "application/grpc")
 	}
@@ -113,12 +119,15 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 	// POST'ы), а зависший POST всё равно не отменял. Теперь зависший POST живёт
 	// ровно до закрытия проксируемого conn и умирает вместе с ним, не утекая
 	// горутиной и не удерживая свой чанк.
-	req, err := http.NewRequestWithContext(ctx, c.options.GetNormalizedUplinkHTTPMethod(), url, body)
+	// InHive 2026-07-19: см. OpenStream выше — URL берём из GetRequestHeader, иначе
+	// padding при placement "query" не попадает в запрос.
+	header, effectiveURL := c.options.GetRequestHeader(url)
+	req, err := http.NewRequestWithContext(ctx, c.options.GetNormalizedUplinkHTTPMethod(), effectiveURL, body)
 	if err != nil {
 		return err
 	}
 	req.ContentLength = contentLength
-	req.Header = c.options.GetRequestHeader(url)
+	req.Header = header
 	if c.httpVersion != "1.1" {
 		resp, err := c.client.Do(req)
 		if err != nil {

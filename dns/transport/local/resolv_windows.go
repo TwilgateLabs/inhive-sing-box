@@ -11,6 +11,7 @@ import (
 	"unsafe"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/service"
 
 	"golang.org/x/sys/windows"
@@ -77,12 +78,18 @@ func dnsReadConfig(ctx context.Context, _ string) *dnsConfig {
 			}{ifName: windows.UTF16PtrToString(address.FriendlyName), Addr: dnsServerAddr})
 		}
 	}
-	var myInterface string
+	// InHive 2026-07-19: sing-tun 0.8.11 сменил `MyInterface() string` на
+	// `MyInterfaces() []string` — монитор теперь помнит ВСЕ зарегистрированные нами
+	// интерфейсы, а не только последний. Порт дословно повторяет апстрим sing-box
+	// 1.13.14 (dns/transport/local/resolv_windows.go:81-89). Смысл прежний: не брать
+	// в резолверы DNS-серверы, объявленные НАШИМ ЖЕ tun-интерфейсом, иначе резолвер
+	// спрашивает сам себя.
+	var myInterfaces []string
 	if networkManager := service.FromContext[adapter.NetworkManager](ctx); networkManager != nil {
-		myInterface = networkManager.InterfaceMonitor().MyInterface()
+		myInterfaces = networkManager.InterfaceMonitor().MyInterfaces()
 	}
 	for _, address := range dnsAddresses {
-		if address.ifName == myInterface {
+		if common.Contains(myInterfaces, address.ifName) {
 			continue
 		}
 		conf.servers = append(conf.servers, net.JoinHostPort(address.String(), "53"))

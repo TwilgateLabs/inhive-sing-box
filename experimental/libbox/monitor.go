@@ -15,10 +15,9 @@ var (
 
 type platformDefaultInterfaceMonitor struct {
 	*platformInterfaceWrapper
-	logger      logger.Logger
-	element     *list.Element[tun.NetworkUpdateCallback]
-	callbacks   list.List[tun.DefaultInterfaceUpdateCallback]
-	myInterface string
+	logger       logger.Logger
+	callbacks    list.List[tun.DefaultInterfaceUpdateCallback]
+	myInterfaces []string
 }
 
 func (m *platformDefaultInterfaceMonitor) Start() error {
@@ -104,14 +103,20 @@ func (m *platformDefaultInterfaceMonitor) updateDefaultInterface(interfaceName s
 	}
 }
 
+// InHive 2026-07-19: sing-tun 0.8.11 сменил контракт `MyInterface() string` на
+// `MyInterfaces() []string`. Порт дословно повторяет апстрим sing-box 1.13.14
+// (experimental/libbox/monitor.go:106-116): регистрация НАКАПЛИВАЕТ интерфейсы, а не
+// перетирает последний. Прежнее поведение теряло все интерфейсы кроме последнего
+// зарегистрированного — а потребитель (resolv_windows) по этому списку исключает
+// собственные интерфейсы из списка DNS-резолверов.
 func (m *platformDefaultInterfaceMonitor) RegisterMyInterface(interfaceName string) {
 	m.defaultInterfaceAccess.Lock()
 	defer m.defaultInterfaceAccess.Unlock()
-	m.myInterface = interfaceName
+	m.myInterfaces = append(m.myInterfaces, interfaceName)
 }
 
-func (m *platformDefaultInterfaceMonitor) MyInterface() string {
+func (m *platformDefaultInterfaceMonitor) MyInterfaces() []string {
 	m.defaultInterfaceAccess.Lock()
 	defer m.defaultInterfaceAccess.Unlock()
-	return m.myInterface
+	return m.myInterfaces
 }

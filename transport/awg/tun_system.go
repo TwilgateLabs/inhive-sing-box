@@ -125,9 +125,19 @@ func (t *systemTun) Events() <-chan awgTun.Event {
 	return t.events
 }
 
+// Close закрывает и канал событий, И сам sing-tun девайс.
+//
+// Было: `close(t.events); return nil` — реальный TUN (t.singtun, создаётся в
+// newSystemTun) не закрывался никогда, а Close при этом рапортовал успех.
+// Порт-источник, transport/wireguard/device_system.go:179, делает
+// `return w.device.Close()` — обе половины потерялись при копировании.
+// Со стороны наблюдателя: стоп/рестарт AWG-эндпоинта логируется как чистый
+// teardown, а интерфейс и его маршруты остаются в системе; следующий
+// tun.New упирается в них, и падение выглядит как проблема СТАРТА, хотя
+// сломался предыдущий СТОП — расследование уходит не в ту сторону.
 func (t *systemTun) Close() error {
 	close(t.events)
-	return nil
+	return t.singtun.Close()
 }
 
 func (t *systemTun) BatchSize() int {

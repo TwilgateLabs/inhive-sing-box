@@ -273,21 +273,48 @@ func (c *V2RayXHTTPBaseOptions) GetNormalizedQuery() string {
 	return query
 }
 
-func (c *V2RayXHTTPBaseOptions) GetRequestHeader(rawURL string) http.Header {
+// GetRequestHeader строит заголовки запроса и возвращает ФАКТИЧЕСКИЙ URL, который
+// надо отправить.
+//
+// ⚠️ InHive 2026-07-19 — ИСПРАВЛЕН SILENT-FAIL, дававший 100% отказов на конфигах
+// с `xPaddingPlacement: "query"`.
+//
+// Функция раньше возвращала только http.Header. Для placement'ов header/cookie/
+// queryInHeader этого достаточно — padding живёт в заголовке. Но для placement
+// "query" padding по определению обязан попасть в СТРОКУ ЗАПРОСА, а записывался он
+// в `u` — ЛОКАЛЬНУЮ КОПИЮ, распарсенную из rawURL внутри этой функции. Наружу она не
+// отдавалась, вызывающий уже построил `req` из исходной строки ⇒ **padding не уходил
+// на провод НИКОГДА**. Сервер (Xray splithttp) при обязательном padding отвергал
+// каждый такой запрос, а у нас в логах не было ни ошибки, ни намёка: код отработал
+// без err, «padding применён» — просто в объект, который выбрасывался.
+//
+// Это ровно тот класс, на котором мы горели весь день: err == nil, конфиг валиден,
+// трафик не идёт.
+//
+// Поэтому сигнатура теперь отдаёт (header, effectiveURL), и вызывающий ОБЯЗАН строить
+// запрос по возвращённому URL. Для всех остальных placement'ов возвращается тот же
+// URL (минус fragment, который net/http всё равно не шлёт) — поведение побайтово
+// прежнее.
+func (c *V2RayXHTTPBaseOptions) GetRequestHeader(rawURL string) (http.Header, string) {
 	header := http.Header{}
 	for k, v := range c.Headers {
 		header.Add(k, v)
 	}
 	applyMasqueradedHeaders(header)
 
-	u, _ := url.Parse(rawURL)
+	u, err := url.Parse(rawURL)
+	if err != nil || u == nil {
+		// URL не разобрался — отдаём исходную строку нетронутой. Ронять запрос здесь
+		// нельзя: разбор URL не наша ответственность, его уже проверил вызывающий.
+		return header, rawURL
+	}
 
 	// InHive: when session/seq use header- or cookie-placement, the client.go dialer
 	// stashes them in the URL fragment (xhttpMetaSeq / xhttpMetaSession) — fragments are
 	// stripped from the request line by net/http, so they never leak on the wire. Apply
 	// that placement here, where we hold the per-request http.Header. When unset (path/
 	// query placement) the fragment is empty and nothing happens.
-	if u != nil && u.Fragment != "" {
+	if u.Fragment != "" {
 		c.applyHeaderCookieMeta(header, u.Fragment)
 		u.Fragment = ""
 		u.RawFragment = ""
@@ -302,16 +329,17 @@ func (c *V2RayXHTTPBaseOptions) GetRequestHeader(rawURL string) http.Header {
 		// 'X' is assigned an 8 bit code, so HPACK compression won't change actual padding length on the wire.
 		// https://www.rfc-editor.org/rfc/rfc9204.html#section-4.1.2-2
 		// h3's similar QPACK feature uses the same huffman table.
-		if u != nil {
-			u.RawQuery = "x_padding=" + strings.Repeat("X", paddingLen)
-			header.Set("Referer", u.String())
-		}
-		return header
+		//
+		// Referer несёт ФЕЙКОВЫЙ query — поэтому строим его на копии, чтобы подмена
+		// RawQuery не утекла в реальный URL запроса.
+		refererURL := *u
+		refererURL.RawQuery = "x_padding=" + strings.Repeat("X", paddingLen)
+		header.Set("Referer", refererURL.String())
+		return header, u.String()
 	}
 
 	// obfs ON: user-controlled padding key/header/method/placement.
-	c.applyXPadding(header, u, paddingLen)
-	return header
+	return header, c.applyXPadding(header, u, paddingLen)
 }
 
 // applyHeaderCookieMeta places session/seq values (carried in the URL fragment as a
@@ -349,7 +377,9 @@ func (c *V2RayXHTTPBaseOptions) applyHeaderCookieMeta(header http.Header, fragme
 }
 
 // applyXPadding generates padding per XPaddingMethod and places it per XPaddingPlacement.
-func (c *V2RayXHTTPBaseOptions) applyXPadding(header http.Header, u *url.URL, paddingLen int) {
+// Возвращает URL, который надо реально отправить: для placement "query" он ОТЛИЧАЕТСЯ
+// от входного (padding дописан в строку запроса), для остальных совпадает.
+func (c *V2RayXHTTPBaseOptions) applyXPadding(header http.Header, u *url.URL, paddingLen int) string {
 	key := c.XPaddingKey
 	if key == "" {
 		key = "x_padding"
@@ -364,11 +394,13 @@ func (c *V2RayXHTTPBaseOptions) applyXPadding(header http.Header, u *url.URL, pa
 	case xhttpPlacementHeader:
 		header.Set(headerName, padding)
 	case xhttpPlacementQuery:
-		if u != nil {
-			q := u.Query()
-			q.Set(key, padding)
-			u.RawQuery = q.Encode()
-		}
+		// Единственная ветка, где padding обязан оказаться в САМОМ запросе, а не в
+		// заголовке. Возвращаем изменённый URL наружу — раньше он молча терялся
+		// вместе с padding'ом (см. развёрнутое обоснование над GetRequestHeader).
+		q := u.Query()
+		q.Set(key, padding)
+		u.RawQuery = q.Encode()
+		return u.String()
 	case xhttpPlacementCookie:
 		existing := header.Get("Cookie")
 		cookie := key + "=" + padding
@@ -377,11 +409,13 @@ func (c *V2RayXHTTPBaseOptions) applyXPadding(header http.Header, u *url.URL, pa
 		}
 		header.Set("Cookie", cookie)
 	default: // "" or "queryInHeader": embed key=padding as the query of a fake URL inside the header.
-		if u != nil {
-			u.RawQuery = key + "=" + padding
-			header.Set(headerName, u.String())
-		}
+		// Фейковый query строим на КОПИИ: он предназначен заголовку и не должен
+		// оказаться в реальном URL запроса.
+		fakeURL := *u
+		fakeURL.RawQuery = key + "=" + padding
+		header.Set(headerName, fakeURL.String())
 	}
+	return u.String()
 }
 
 // generateXPadding mirrors upstream Xray (splithttp/xpadding.go GeneratePadding):

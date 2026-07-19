@@ -3,13 +3,18 @@ package constant
 import "time"
 
 const (
-	TCPKeepAliveInitial        = 5 * time.Minute
-	TCPKeepAliveInterval       = 75 * time.Second
-	TCPConnectTimeout          = 5 * time.Second
-	TCPTimeout                 = 15 * time.Second
-	ReadPayloadTimeout         = 300 * time.Millisecond
-	DNSTimeout                 = 10 * time.Second
-	UDPTimeout                 = 5 * time.Minute
+	TCPKeepAliveInitial  = 5 * time.Minute
+	TCPKeepAliveInterval = 75 * time.Second
+	TCPConnectTimeout    = 5 * time.Second
+	TCPTimeout           = 15 * time.Second
+	ReadPayloadTimeout   = 300 * time.Millisecond
+	DNSTimeout           = 10 * time.Second
+	UDPTimeout           = 5 * time.Minute
+	// ICMPTimeout — время жизни записи direct-route маппинга для ICMP.
+	// Заведено вместе с бампом sing-tun 0.8.9→0.8.11 (там появилось
+	// StackOptions.ICMPTimeout). Значение — апстримное, sing-box 1.13.14
+	// constant/timeout.go.
+	ICMPTimeout                = 10 * time.Second
 	DefaultURLTestInterval     = 3 * time.Minute
 	DefaultURLTestIdleTimeout  = 30 * time.Minute
 	StartTimeout               = 10 * time.Second
