@@ -93,6 +93,12 @@ type OutboundMonitoring struct {
 	workerWG    sync.WaitGroup
 	schedulerWG sync.WaitGroup
 	closerOnce  sync.Once
+	// InHive NE-quiescence: воркеры карусели стартуют ЛЕНИВО (первый Touch),
+	// а не безусловно в PostStart. Отдельный guard от workersRunning: тот
+	// тогглится start/stopTimerWorkers по idleTimeout, а воркеры поднимаются
+	// один раз и живут до ctx.Done (перезапускать их на каждый idle-цикл
+	// незачем — они просто парковались бы заново).
+	workersOnce sync.Once
 }
 
 // InterfaceUpdated implements [adapter.InterfaceUpdateListener].
@@ -318,10 +324,14 @@ func (m *OutboundMonitoring) Start(stage adapter.StartStage) error {
 		m.logger.Info("registered ", len(m.groups), " outbound groups for monitoring")
 		m.loadHistory()
 	case adapter.StartStatePostStart:
-		for i := 0; i < m.workersCount; i++ {
-			m.workerWG.Add(1)
-			go m.workerLoop()
-		}
+		// InHive NE-quiescence (2026-07-19): workerLoop'ы больше НЕ стартуют
+		// здесь. Раньше 10 горутин поднимались безусловно при подъёме туннеля
+		// и парковались на очередях, даже если карусель за всю сессию ни разу
+		// не понадобилась (юзер не открывал список серверов). Теперь их
+		// поднимает startTimerWorkers по первому Touch — а Touch зовётся из
+		// всех путей, которые кладут задачи в очередь (TestNow:388,
+		// OutboundsHistory:114, SubscribeGroup:463), ДО постановки задачи,
+		// так что исполнитель всегда готов раньше работы.
 		for groupTag := range m.groups {
 			m.schedulerWG.Add(1)
 			go m.groupNotifierLoop(m.groups[groupTag])
@@ -338,6 +348,16 @@ func (m *OutboundMonitoring) Start(stage adapter.StartStage) error {
 }
 
 func (m *OutboundMonitoring) startTimerWorkers() {
+	// Ленивый подъём исполнителей (см. workersOnce). Делаем ДО CAS-гейта
+	// ниже: stopTimerWorkers по idleTimeout сбрасывает workersRunning, и на
+	// следующем Touch мы сюда вернёмся — воркеры при этом уже живы, Once
+	// гарантирует ровно один старт за жизнь монитора.
+	m.workersOnce.Do(func() {
+		for i := 0; i < m.workersCount; i++ {
+			m.workerWG.Add(1)
+			go m.workerLoop()
+		}
+	})
 	if !m.workersRunning.CompareAndSwap(false, true) {
 		return
 	}
