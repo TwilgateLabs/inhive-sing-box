@@ -3,7 +3,6 @@ package pipe
 import (
 	"errors"
 	"io"
-	"runtime"
 	"sync"
 	"time"
 
@@ -41,10 +40,7 @@ type pipe struct {
 	state       state
 }
 
-var (
-	errBufferFull = errors.New("buffer full")
-	errSlowDown   = errors.New("slow down")
-)
+var errBufferFull = errors.New("buffer full")
 
 func (p *pipe) Len() int32 {
 	data := p.data
@@ -134,13 +130,21 @@ func (p *pipe) writeMultiBufferInternal(mb buf.MultiBuffer) error {
 		return err
 	}
 
+	// InHive 2026-07-19: приведено к апстриму Xray (transport/pipe/impl.go).
+	// Раньше при НЕПУСТОМ p.data возвращался errSlowDown, а WriteMultiBuffer на
+	// него делал readSignal.Signal() + runtime.Gosched(). uploadWriter бьёт тело
+	// на 8KB-буферы и зовёт WriteMultiBuffer на каждый → отправщик пинался на
+	// КАЖДЫЕ 8KB и забирал крохи вместо накопленного чанка. В packet-up, где
+	// throughput = chunk / RTT, это прямой обвал отдачи: device-verified
+	// 2026-07-19 (Windows, CDN, RTT 141мс) отдача 0.75 Мбит/с ⇒ чанк ~13KB при
+	// разрешённом 1MB; 13KB/0.141с = 0.74 Мбит/с — сходится точно.
+	// Xray накапливает до лимита пайпа и отдаёт полный чанк.
 	if p.data == nil {
 		p.data = mb
-		return nil
+	} else {
+		p.data, _ = buf.MergeMulti(p.data, mb)
 	}
-
-	p.data, _ = buf.MergeMulti(p.data, mb)
-	return errSlowDown
+	return nil
 }
 
 func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
@@ -152,14 +156,6 @@ func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		err := p.writeMultiBufferInternal(mb)
 		if err == nil {
 			p.readSignal.Signal()
-			return nil
-		}
-
-		if err == errSlowDown {
-			p.readSignal.Signal()
-
-			// Yield current goroutine. Hopefully the reading counterpart can pick up the payload.
-			runtime.Gosched()
 			return nil
 		}
 
@@ -177,6 +173,9 @@ func (p *pipe) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		select {
 		case <-p.writeSignal.Wait():
 		case <-p.done.Wait():
+			// InHive 2026-07-19: апстрим Xray освобождает буферы на этом пути;
+			// у нас они текли при закрытии пайпа во время ожидания места.
+			buf.ReleaseMulti(mb)
 			return io.ErrClosedPipe
 		}
 	}

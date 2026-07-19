@@ -57,12 +57,28 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 	if body != nil {
 		method = c.options.GetNormalizedUplinkHTTPMethod() // stream-up/one (default POST)
 	}
-	req, _ := http.NewRequestWithContext(context.WithoutCancel(ctx), method, url, body)
+	// InHive 2026-07-19: НЕ оборачиваем в context.WithoutCancel.
+	//
+	// Апстрим (Xray splithttp/client.go) вынужден это делать, потому что ему сюда
+	// передают DIAL-контекст, который отменяется сразу после возврата из Dial —
+	// без отвязки каждый стрим умирал бы мгновенно. Цена отвязки: у запроса вообще
+	// не остаётся владельца, он не отменяется НИКОГДА (единственное, что его в
+	// итоге убивает — h2 health-check через ReadIdleTimeout 45с + pingTimeout 15с,
+	// отсюда обрывы ровно на «1m0s» в наших логах).
+	//
+	// Мы вместо этого передаём сюда контекст ЖИЗНИ СОЕДИНЕНИЯ (client.go
+	// DialContext: WithoutCancel(dial-ctx) + WithCancel, cancel в conn.onClose).
+	// Он не отменяется по завершении дозвона (то самое, ради чего апстрим ставил
+	// WithoutCancel), но отменяется при закрытии проксируемого conn — то есть у
+	// запроса появляется корректный владелец. Это и есть замена снятой правки с
+	// ctx-проверками в WaitReadCloser.Read: та рвала стрим по dial-контексту
+	// (слишком рано), эта — по закрытию соединения (ровно тогда, когда надо).
+	req, _ := http.NewRequestWithContext(ctx, method, url, body)
 	req.Header = c.options.GetRequestHeader(url)
 	if body != nil && !c.options.NoGRPCHeader {
 		req.Header.Set("Content-Type", "application/grpc")
 	}
-	wrc = &WaitReadCloser{ctx: ctx, Wait: make(chan struct{})}
+	wrc = &WaitReadCloser{Wait: make(chan struct{})}
 	go func() {
 		resp, err := c.client.Do(req)
 		if err != nil {
@@ -89,7 +105,15 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 }
 
 func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body io.Reader, contentLength int64) error {
-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), c.options.GetNormalizedUplinkHTTPMethod(), url, body)
+	// InHive 2026-07-19: ctx здесь — контекст ЖИЗНИ СОЕДИНЕНИЯ (см. развёрнутое
+	// обоснование в OpenStream выше), поэтому context.WithoutCancel снят.
+	//
+	// Это и есть «правильная защита» вместо снятого `select { <-ctx.Done() }` в
+	// цикле отправки: тот ломал упорядоченность seq (цикл переставал сериализовать
+	// POST'ы), а зависший POST всё равно не отменял. Теперь зависший POST живёт
+	// ровно до закрытия проксируемого conn и умирает вместе с ним, не утекая
+	// горутиной и не удерживая свой чанк.
+	req, err := http.NewRequestWithContext(ctx, c.options.GetNormalizedUplinkHTTPMethod(), url, body)
 	if err != nil {
 		return err
 	}
@@ -103,6 +127,17 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 		}
 		io.Copy(io.Discard, resp.Body)
 		defer resp.Body.Close()
+		// InHive 2026-07-19: parity с Xray (splithttp/client.go — там проверка есть
+		// на ОБОИХ путях; у нас была только на h1-ветке ниже). Без неё отказ сервера
+		// (405/400/5xx) возвращался как err == nil ⇒ POST считался доставленным, а его
+		// `seq` терялся НАВСЕГДА. Приёмная сторона (upload_queue) собирает пакеты
+		// строго по порядку и держит все последующие, ожидая пропавший — то есть одна
+		// проглоченная ошибка встаёт головой очереди и душит сессию, маскируясь под
+		// «медленную сеть». Device-verified 2026-07-19: клиент рапортовал 46 Мбит/с
+		// отправки при 0.75 Мбит/с реально доехавших.
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("got non-200 error response code: %d", resp.StatusCode)
+		}
 	} else {
 		// stringify the entire HTTP/1.1 request so it can be
 		// safely retried. if instead req.Write is called multiple
@@ -157,8 +192,14 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 	return nil
 }
 
+// InHive 2026-07-19: поле ctx и его проверки в Read убраны — parity с Xray
+// (splithttp/client.go WaitReadCloser). Наша правка рвала download-стрим по
+// dial-контексту, тогда как апстрим СОЗНАТЕЛЬНО отвязывает стрим от него
+// (запросы строятся с context.WithoutCancel). Получалась асимметричная смерть
+// сессии: приём падал с `context canceled` / `read/write on closed pipe`, а
+// upload-горутина продолжала жить — сессия наполовину мертва, порядок seq
+// нарушен, сервер встаёт головой очереди.
 type WaitReadCloser struct {
-	ctx  context.Context
 	Wait chan struct{}
 	io.ReadCloser
 }
@@ -174,19 +215,8 @@ func (w *WaitReadCloser) Set(rc io.ReadCloser) {
 }
 
 func (w *WaitReadCloser) Read(b []byte) (int, error) {
-	select {
-	case <-w.ctx.Done():
-		return 0, w.ctx.Err()
-	default:
-	}
-
 	if w.ReadCloser == nil {
-		select {
-		case <-w.ctx.Done():
-			return 0, w.ctx.Err()
-		case <-w.Wait:
-		}
-		if w.ReadCloser == nil {
+		if <-w.Wait; w.ReadCloser == nil {
 			return 0, io.ErrClosedPipe
 		}
 	}

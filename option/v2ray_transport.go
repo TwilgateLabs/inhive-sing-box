@@ -2,9 +2,13 @@ package option
 
 import (
 	cryptorand "crypto/rand"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+
+	"golang.org/x/net/http2/hpack"
 
 	Xbadoption "github.com/sagernet/sing-box/common/xray/json/badoption"
 	C "github.com/sagernet/sing-box/constant"
@@ -240,8 +244,22 @@ func (c *V2RayXHTTPBaseOptions) GetNormalizedPath() string {
 	if path == "" || path[0] != '/' {
 		path = "/" + path
 	}
-	if path[len(path)-1] != '/' {
-		path = path + "/"
+	// Замыкающий слэш нужен ТОЛЬКО когда в путь дописывается session и/или seq —
+	// он служит разделителем сегментов (`/base/` + `<uuid>` + `/` + `<seq>`).
+	//
+	// InHive 2026-07-19: parity с Xray 26.7.11 (splithttp/config.go
+	// GetNormalizedPath). Раньше слэш клеился БЕЗУСЛОВНО — это код Xray 26.1.13,
+	// апстрим уточнил его позже. Для дефолтного placement ("path") поведение
+	// побайтово прежнее, поэтому все наши текущие конфиги не затронуты. Ломалось
+	// только при obfs-размещении (session/seq в header/cookie/query): туда
+	// дописывать нечего, и лишний `/` менял путь запроса (`/x/` вместо `/x`) —
+	// сервер матчит путь строго, получаем 404 на КАЖДЫЙ запрос без единой ошибки
+	// в логе клиента.
+	if c.GetNormalizedSessionPlacement() == xhttpPlacementPath ||
+		c.GetNormalizedSeqPlacement() == xhttpPlacementPath {
+		if path[len(path)-1] != '/' {
+			path = path + "/"
+		}
 	}
 	return path
 }
@@ -260,9 +278,7 @@ func (c *V2RayXHTTPBaseOptions) GetRequestHeader(rawURL string) http.Header {
 	for k, v := range c.Headers {
 		header.Add(k, v)
 	}
-	if header.Get("User-Agent") == "" {
-		header.Set("User-Agent", C.DefaultBrowserAgent) //H
-	}
+	applyMasqueradedHeaders(header)
 
 	u, _ := url.Parse(rawURL)
 
@@ -368,18 +384,48 @@ func (c *V2RayXHTTPBaseOptions) applyXPadding(header http.Header, u *url.URL, pa
 	}
 }
 
-// generateXPadding mirrors upstream: "repeat-x" (default) => N copies of 'X';
-// "tokenish" => a random base62 token of N bytes (opaque, alphanumeric). Upstream's
-// tokenish additionally length-tunes against the HPACK/QPACK Huffman-encoded size; we
-// emit a plain base62 token of the requested length, which the server validates only by
-// (loose) length range. See the implementation report for this honest simplification.
+// generateXPadding mirrors upstream Xray (splithttp/xpadding.go GeneratePadding):
+// "repeat-x" (default) => N copies of 'X'; "tokenish" => base62 token tuned so its
+// HPACK/QPACK **Huffman-encoded** size is N.
+//
+// ⚠️ InHive 2026-07-19 — ИСПРАВЛЕН БАГ, дававший ~2.5% отказов 400 на КАЖДЫЙ запрос.
+//
+// Прежняя реализация отдавала N случайных base62-символов и опиралась на записанное
+// здесь допущение «сервер валидирует только по (нестрогому) диапазону длины». Оно
+// НЕВЕРНО. Сервер (Xray splithttp/xpadding.go IsPaddingValid, ветка tokenish) меряет
+// именно Huffman-длину:
+//
+//	n := hpack.HuffmanEncodeLength(paddingValue)
+//	valid ⟺ n ∈ [from-2, to+2]
+//
+// А Huffman-длина случайной base62-строки ≈ 0.8 символа (замерено: 0.7982 — ровно
+// апстримная константа). При дефолтном диапазоне 100..1000 (конфиг без xPaddingBytes)
+// это значит: любая случайно выбранная длина N < 126 даёт n < 98 и ОТВЕРГАЕТСЯ.
+// N берётся равномерно из [100,1000] на КАЖДЫЙ запрос → 2.48% запросов получали 400.
+//
+// Почему это било так больно: padding уходит в каждом upload-POST, а приёмная
+// сторона (upload_queue) собирает пакеты строго по порядку — один отвергнутый POST
+// встаёт головой очереди и убивает сессию. При 2.5% на запрос сессия аплоада
+// доживает до ~100 пакетов с вероятностью 0.975^100 ≈ 8%, то есть ~3 секунды при
+// 33 POST/с. Download-стрим шлёт padding ОДИН раз при открытии GET, поэтому терял
+// лишь 2.5% сессий — отсюда наблюдавшаяся асимметрия (приём 62-133 против отдачи
+// 1.8-5 Мбит/с) и «стартует 300, потом падает в несколько раз».
+//
+// До добавления проверки resp.StatusCode != 200 (2026-07-19) эти 400 глотались
+// молча и выглядели как «медленная сеть».
+//
+// repeat-x этим не затронут: сервер валидирует его по обычной len(), а мы отдаём
+// ровно N символов 'X'.
 func generateXPadding(method string, length int) string {
 	if length <= 0 {
 		return ""
 	}
 	switch method {
 	case xhttpPaddingTokenish:
-		return randTokenish(length)
+		if v := generateTokenishPaddingBase62(length); v != "" {
+			return v
+		}
+		return strings.Repeat("X", length)
 	case xhttpPaddingRepeatX, "":
 		return strings.Repeat("X", length)
 	default:
@@ -387,17 +433,210 @@ func generateXPadding(method string, length int) string {
 	}
 }
 
+// applyMasqueradedHeaders приводит набор заголовков xhttp-запроса к СОГЛАСОВАННОМУ
+// браузерному отпечатку — порт upstream Xray 26.7.11
+// (common/utils/browser.go TryDefaultHeadersWith(header, "fetch") →
+// applyMasqueradedHeaders, вызывается из splithttp/config.go FillStreamRequest и
+// FillPacketRequest, т.е. на КАЖДОМ запросе, включая download-GET).
+//
+// InHive 2026-07-19. Раньше мы ставили ровно один заголовок — User-Agent Chrome 144 —
+// и больше ничего. На проводе это выглядело как Chrome, у которого НЕТ ни одного
+// заголовка, обязательного для Chrome: ни Client Hints (Sec-CH-UA*), ни Sec-Fetch-*,
+// ни Accept/Accept-Language. Настоящий Chrome 144 шлёт их всегда, поэтому такой
+// запрос — не «похожий на браузер», а наоборот: самоочевидная подделка, которую
+// bot/abuse-слой CDN отличает тривиально. Референсный клиент (Happ = Xray 26.7.x)
+// шлёт полный набор и на том же эдже держит поток ровно.
+//
+// Практически важнее прочего здесь Cache-Control/Pragma: no-cache. Download-половина
+// packet-up — это ОДИН очень длинный streaming-GET. Без явного no-cache эдж вправе
+// считать такой ответ кэшируемым объектом и применять к нему свои буферные/временные
+// лимиты; наблюдаемая картина (эдж сам присылает RST_STREAM с INTERNAL_ERROR примерно
+// через 1m0s-1m22s, «received from peer») с этим согласуется.
+//
+// Семантика выбора браузера — апстримная: пустой User-Agent → полный набор Chrome;
+// UA-ключевое слово ("chrome"/"firefox"/"safari"/"edge"/"curl"/"golang") → набор
+// соответствующего браузера; ЛЮБОЙ иной пользовательский UA из config.headers не
+// трогаем вообще (пользователь знает, что делает).
+//
+// ⚠️ ОСОЗНАННОЕ УПРОЩЕНИЕ относительно апстрима: у Xray мажорная версия Chrome
+// «дрейфует» во времени (ChromeVersion() считает её от даты + рандом), а Sec-CH-UA
+// собирается под эту версию. Мы держим версию прибитой к C.DefaultBrowserAgent
+// (Chrome 144) и генерируем бренды под неё же — главное, что UA и Sec-CH-UA
+// СОГЛАСОВАНЫ между собой; дрейф версии — отдельная задача, требующая порта
+// генератора версии целиком.
+func applyMasqueradedHeaders(header http.Header) {
+	switch header.Get("User-Agent") {
+	case "":
+		// нет UA → выдаём себя за Chrome (апстримный дефолт)
+	case "chrome", "edge":
+		// поддерживаем те же ключевые слова, что апстрим; набор ниже — Chromium-семейство
+	case "firefox":
+		header.Set("User-Agent", xhttpFirefoxUA)
+		header["DNT"] = []string{"1"}
+		header.Set("Accept-Language", "en-US,en;q=0.5")
+		applyFetchVariantHeaders(header, "u=4")
+		return
+	case "safari":
+		header.Set("User-Agent", xhttpSafariUA)
+		header.Set("Accept-Language", "en-US,en;q=0.9")
+		applyFetchVariantHeaders(header, "u=3, i")
+		return
+	case "golang":
+		header.Del("User-Agent") // штатный net/http UA
+		return
+	case "curl":
+		header.Set("User-Agent", xhttpCurlUA)
+		return
+	default:
+		// пользовательский UA из config.headers — не трогаем ничего
+		return
+	}
+	header["Sec-CH-UA"] = []string{xhttpChromeUACH}
+	header["Sec-CH-UA-Mobile"] = []string{"?0"}
+	header["Sec-CH-UA-Platform"] = []string{"\"Windows\""}
+	header["DNT"] = []string{"1"}
+	header.Set("User-Agent", C.DefaultBrowserAgent)
+	header.Set("Accept-Language", "en-US,en;q=0.9")
+	applyFetchVariantHeaders(header, "u=1, i")
+}
+
+// applyFetchVariantHeaders — апстримный variant "fetch" (запрос, инициированный
+// скриптом через fetch/XHR, а не навигацией). Именно он подходит xhttp: это не
+// переход по ссылке, а фоновый обмен данными.
+func applyFetchVariantHeaders(header http.Header, priority string) {
+	header.Set("Sec-Fetch-Mode", "cors")
+	header.Set("Sec-Fetch-Dest", "empty")
+	header.Set("Sec-Fetch-Site", "same-origin")
+	if header.Get("Priority") == "" {
+		header.Set("Priority", priority)
+	}
+	if header.Get("Cache-Control") == "" {
+		header.Set("Cache-Control", "no-cache")
+	}
+	if header.Get("Pragma") == "" {
+		header.Set("Pragma", "no-cache")
+	}
+	if header.Get("Accept") == "" {
+		header.Set("Accept", "*/*")
+	}
+}
+
+const (
+	xhttpFirefoxUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:145.0) Gecko/20100101 Firefox/145.0"
+	xhttpSafariUA  = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15"
+	xhttpCurlUA    = "curl/8.7.1"
+)
+
+// xhttpChromeUACH — значение Sec-CH-UA под ту же мажорную версию, что в
+// C.DefaultBrowserAgent. Формат и GREASE-таблицы взяты у апстрима
+// (getGreasedChInvalidBrand / getUngreasedChUa / getGreasedChOrder): один
+// «невалидный» GREASE-бренд + Chromium + Google Chrome, порядок перемешан
+// детерминированно по версии-сиду.
+var xhttpChromeUACH = buildChromeUACH(xhttpChromeMajorVersion)
+
+// Держим в согласии с C.DefaultBrowserAgent (Chrome 144). Меняя UA — меняй и это.
+const xhttpChromeMajorVersion = 144
+
+func buildChromeUACH(major int) string {
+	greaseNA := []string{" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"}
+	versionNA := []string{"8", "99", "24"}
+	v := strconv.Itoa(major)
+	brands := []string{
+		"\"Not" + greaseNA[major%len(greaseNA)] + "A" + greaseNA[(major+1)%len(greaseNA)] + "Brand\";v=\"" + versionNA[major%len(versionNA)] + "\"",
+		"\"Chromium\";v=\"" + v + "\"",
+		"\"Google Chrome\";v=\"" + v + "\"",
+	}
+	shuffle3 := [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	order := shuffle3[major%len(shuffle3)]
+	out := make([]string, 3)
+	for i, e := range order {
+		out[e] = brands[i]
+	}
+	return strings.Join(out, ", ")
+}
+
 const xhttpBase62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-func randTokenish(length int) string {
-	buf := make([]byte, length)
-	if _, err := cryptorand.Read(buf); err != nil {
-		return strings.Repeat("X", length)
+// Huffman-кодирование даёт ~20% сжатия для base62-последовательностей.
+const xhttpAvgHuffmanBytesPerCharBase62 = 0.8
+
+// Допуск серверной проверки (upstream validationTolerance).
+const xhttpPaddingValidationTolerance = 2
+
+// generateTokenishPaddingBase62 — построчный порт upstream
+// GenerateTokenishPaddingBase62: подобрать base62-строку, Huffman-длина которой
+// попадает в targetHuffmanBytes ± tolerance. 'X' и 'Z' используются для подгонки,
+// т.к. у них 8-битный код в статической таблице HPACK (добавление такого символа
+// меняет длину на проводе ровно на 1 байт).
+func generateTokenishPaddingBase62(targetHuffmanBytes int) string {
+	n := int(math.Ceil(float64(targetHuffmanBytes) / xhttpAvgHuffmanBytesPerCharBase62))
+	if n < 1 {
+		n = 1
 	}
-	for i := range buf {
-		buf[i] = xhttpBase62[int(buf[i])%len(xhttpBase62)]
+	s, ok := randStringFromCharset(n, xhttpBase62)
+	if !ok {
+		return ""
 	}
-	return string(buf)
+	const maxIter = 150
+	adjustChar := byte('X')
+	for iter := 0; iter < maxIter; iter++ {
+		diff := int(hpack.HuffmanEncodeLength(s)) - targetHuffmanBytes
+		if diff < 0 {
+			diff = -diff
+			if diff <= xhttpPaddingValidationTolerance {
+				return s
+			}
+			// Слишком коротко — дописываем символ подгонки, чередуя X/Z, чтобы не
+			// получить длинную серию одинаковых символов.
+			s += string(adjustChar)
+			if adjustChar == 'X' {
+				adjustChar = 'Z'
+			} else {
+				adjustChar = 'X'
+			}
+			continue
+		}
+		if diff <= xhttpPaddingValidationTolerance {
+			return s
+		}
+		// Слишком длинно — укорачиваем с конца.
+		if len(s) <= 1 {
+			return s
+		}
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// randStringFromCharset — порт upstream randStringFromCharset. Использует
+// rejection sampling (limit), а не `% len(charset)`: 256 % 62 = 8, поэтому наивный
+// остаток делал первые 8 символов алфавита заметно вероятнее остальных — лишний
+// статистический признак в том самом поле, которое существует ради маскировки.
+func randStringFromCharset(n int, charset string) (string, bool) {
+	if n <= 0 || len(charset) == 0 {
+		return "", false
+	}
+	m := len(charset)
+	limit := byte(256 - (256 % m))
+	result := make([]byte, n)
+	i := 0
+	buf := make([]byte, 256)
+	for i < n {
+		if _, err := cryptorand.Read(buf); err != nil {
+			return "", false
+		}
+		for _, rb := range buf {
+			if rb >= limit {
+				continue
+			}
+			result[i] = charset[int(rb)%m]
+			i++
+			if i == n {
+				break
+			}
+		}
+	}
+	return string(result), true
 }
 
 func (c *V2RayXHTTPBaseOptions) GetNormalizedXPaddingBytes() Xbadoption.Range {

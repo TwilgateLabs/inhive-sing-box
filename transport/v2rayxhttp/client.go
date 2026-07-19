@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/xray/buf"
+	Xbadoption "github.com/sagernet/sing-box/common/xray/json/badoption"
 	"github.com/sagernet/sing-box/common/xray/net"
 	"github.com/sagernet/sing-box/common/xray/pipe"
 	"github.com/sagernet/sing-box/common/xray/signal/done"
@@ -96,6 +97,9 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	if options.Xmux != nil {
 		xmuxOptions = *options.Xmux
 	}
+	if xmuxOptions == (option.V2RayXHTTPXmuxOptions{}) {
+		applyXmuxDefaults(&xmuxOptions)
+	}
 	xmuxManager := NewXmuxManager(xmuxOptions, func() XmuxConn {
 		return createHTTPClient(dest, dialer, &options.V2RayXHTTPBaseOptions, tlsConfig)
 	})
@@ -135,6 +139,15 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		var xmuxOptions2 option.V2RayXHTTPXmuxOptions
 		if options2.Xmux != nil {
 			xmuxOptions2 = *options2.Xmux
+		}
+		// InHive 2026-07-19: тот же дефолтинг, что и для аплинка выше. У Xray он
+		// применяется автоматически, т.к. downloadSettings собирается тем же
+		// Build() рекурсивно (infra/conf/transport_method.go — `c.DownloadSettings.Build()`),
+		// а у нас блок был продублирован только для upload-ветки. Без этого
+		// stream-down половина сессии (весь ПРИЁМ) ехала на Go-нулях с той же
+		// патологией «безлимит стримов в одно неротируемое соединение».
+		if xmuxOptions2 == (option.V2RayXHTTPXmuxOptions{}) {
+			applyXmuxDefaults(&xmuxOptions2)
 		}
 		xmuxManager2 := NewXmuxManager(xmuxOptions2, func() XmuxConn {
 			return createHTTPClient(dest2, dialer2, &options2.V2RayXHTTPBaseOptions, tlsConfig2)
@@ -178,6 +191,42 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	// client.uploadBudget = semaphore.NewWeighted(budget) // НЕ инициализируем
 	// client.streamSlots  = make(chan struct{}, N)        // НЕ инициализируем
 	return client, nil
+}
+
+// applyXmuxDefaults подставляет дефолты Xray для ОТСУТСТВУЮЩЕГО блока `xmux`.
+//
+// Xray делает это в конфиг-парсере (infra/conf/transport_method.go,
+// `if c.Xmux == (XmuxConfig{})`), который мы не портировали — рантайм перенесли,
+// дефолтинг нет. Без него конфиг без `xmux` (все наши CDN-бэкенды: рендерер
+// отдаёт xhttp_extra дословно и блок теряется) ехал на Go-нулях
+// concurrency=0/connections=0/hMaxRequestTimes=0, что в GetXmuxClient означает
+// «безлимит стримов в ОДНО никогда не ротируемое соединение». Против эджа,
+// анонсирующего MAX_CONCURRENT_STREAMS=128, это соединение насыщается и эдж
+// начинает рубить стримы (INTERNAL_ERROR) — отдача стартует сотнями Мбит/с и
+// схлопывается до ~0.5 в пределах одного спидтеста.
+//
+// ⚠️ Значения сверены с Xray 26.7.11 (актуальный апстрим, из которого собран
+// референсный клиент Happ), а НЕ с 26.1.13, по которому делалась первая версия
+// этой правки. Апстрим сменил дефолт между этими версиями:
+//
+//	26.1.13: MaxConcurrency = 1..1     ← было у нас; соединение НА КАЖДЫЙ стрим
+//	26.7.11: MaxConnections = 6..6     ← сейчас; пул из 6 соединений, стримы
+//	                                     распределяются по ним (concurrency=0)
+//
+// Разница принципиальная для стабильности: при concurrency=1 каждое проксируемое
+// TCP-соединение тянет СВОЙ TLS-хендшейк через CDN (спидтест открывает их
+// десятками → шторм хендшейков, каждое соединение стартует с холодного
+// congestion window), при connections=6 работает тёплый пул фиксированного
+// размера в устоявшемся режиме. Именно это отличает ровный Happ от нашей
+// «метастабильности» (приём гулял 222→47 при отдаче 0.5-0.75).
+//
+// maxConnections и maxConcurrency у Xray взаимоисключающие
+// (infra/conf/transport_method.go:449 — конфиг с обоими отвергается), поэтому
+// здесь выставляется РОВНО одно из них.
+func applyXmuxDefaults(x *option.V2RayXHTTPXmuxOptions) {
+	x.MaxConnections = Xbadoption.Range{From: 6, To: 6}
+	x.HMaxRequestTimes = Xbadoption.Range{From: 600, To: 900}
+	x.HMaxReusableSecs = Xbadoption.Range{From: 1800, To: 3000}
 }
 
 // resolveXHTTPMode maps the configured mode to a concrete dial mode, mirroring
@@ -242,6 +291,22 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 		xmuxClient2.OpenUsage.Add(1)
 	}
 	var closed atomic.Int32
+	// InHive 2026-07-19: контекст ЖИЗНИ СОЕДИНЕНИЯ.
+	//
+	// WithoutCancel отвязывает от dial-контекста (он отменяется сразу после
+	// возврата из DialContext — ровно поэтому апстрим Xray оборачивает каждый
+	// запрос в context.WithoutCancel), WithCancel возвращает нам владение: cancel
+	// стоит в onClose. Итог — запросы переживают завершение дозвона, но умирают
+	// при закрытии проксируемого conn.
+	//
+	// Это замена снятых сегодня ctx-костылей (`select { <-ctx.Done() }` в цикле
+	// отправки и ctx-проверки в WaitReadCloser.Read). Те привязывались к
+	// DIAL-контексту, то есть срабатывали почти сразу и не по делу: ломали
+	// упорядоченность seq в аплинке и рвали download-стрим, оставляя
+	// upload-горутину жить — сессия наполовину мертва. Здесь же lifetime привязан
+	// к тому единственному событию, которое действительно делает запрос
+	// бессмысленным.
+	uploadCtx, uploadCancel := context.WithCancel(context.WithoutCancel(ctx))
 	reader, writer := io.Pipe()
 	conn := splitConn{
 		writer: writer,
@@ -249,6 +314,7 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 			if closed.Add(1) > 1 {
 				return
 			}
+			uploadCancel()
 			releaseSlot()
 			if xmuxClient != nil {
 				xmuxClient.OpenUsage.Add(-1)
@@ -258,13 +324,20 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 			}
 		},
 	}
+	// Ошибочный возврат ниже означает, что conn.onClose уже никогда не вызовется —
+	// отменяем conn-контекст здесь, иначе он (и его горутины) утекут.
+	defer func() {
+		if retConn == nil {
+			uploadCancel()
+		}
+	}()
 	var err error
 	if mode == "stream-one" {
 		requestURL.Path = options.GetNormalizedPath()
 		if xmuxClient != nil {
 			xmuxClient.LeftRequests.Add(-1)
 		}
-		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(ctx, requestURL.String(), reader, false)
+		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient.OpenStream(uploadCtx, requestURL.String(), reader, false)
 		if err != nil { // browser dialer only
 			return nil, err
 		}
@@ -273,7 +346,7 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 		if xmuxClient2 != nil {
 			xmuxClient2.LeftRequests.Add(-1)
 		}
-		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient2.OpenStream(ctx, requestURL2.String(), nil, false)
+		conn.reader, conn.remoteAddr, conn.localAddr, err = httpClient2.OpenStream(uploadCtx, requestURL2.String(), nil, false)
 		if err != nil { // browser dialer only
 			return nil, err
 		}
@@ -282,7 +355,7 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 		if xmuxClient != nil {
 			xmuxClient.LeftRequests.Add(-1)
 		}
-		_, _, _, err = httpClient.OpenStream(ctx, requestURL.String(), reader, true)
+		_, _, _, err = httpClient.OpenStream(uploadCtx, requestURL.String(), reader, true)
 		if err != nil { // browser dialer only
 			return nil, err
 		}
@@ -309,9 +382,20 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 	go func() {
 		var seq int64
 		var lastWrite time.Time
+		// InHive 2026-07-19: локальные копии клиента вместо переиспользования
+		// переменных внешней функции — фикс ГОНКИ ДАННЫХ, сделанный в апстриме
+		// Xray 26.7.11 (splithttp/dialer.go: dynamicHTTPClient/dynamicXmuxClient
+		// + передача hClient ПАРАМЕТРОМ в горутину). До него (и у нас) ротация
+		// `httpClient, xmuxClient = c.getHTTPClient()` писала в те же переменные,
+		// которые ПАРАЛЛЕЛЬНО читают уже запущенные POST-горутины: незащищённая
+		// запись/чтение interface-значения. Практический эффект — POST мог уехать
+		// не в то соединение, которое ему выдал менеджер (а с hMaxRequestTimes
+		// 600-900 при ~33 POST/с ротация приходится ровно на середину спидтеста).
+		dynamicHTTPClient := httpClient
+		dynamicXmuxClient := xmuxClient
 		for {
 			wroteRequest := done.New()
-			ctx := httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+			ctx := httptrace.WithClientTrace(uploadCtx, &httptrace.ClientTrace{
 				WroteRequest: func(httptrace.WroteRequestInfo) {
 					wroteRequest.Close()
 				},
@@ -331,10 +415,13 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 			if err != nil {
 				break
 			}
+			// InHive instrumentation (TEMPORARY, see chunkhist.go): the size handed to
+			// each POST is what caps packet-up throughput (chunk * ~33 POSTs/s).
+			recordPostChunk(int(chunk.Len()))
 			lastWrite = time.Now()
-			if xmuxClient != nil && (xmuxClient.LeftRequests.Add(-1) <= 0 ||
-				(xmuxClient.UnreusableAt != time.Time{} && lastWrite.After(xmuxClient.UnreusableAt))) {
-				httpClient, xmuxClient = c.getHTTPClient()
+			if dynamicXmuxClient != nil && (dynamicXmuxClient.LeftRequests.Add(-1) <= 0 ||
+				(dynamicXmuxClient.UnreusableAt != time.Time{} && lastWrite.After(dynamicXmuxClient.UnreusableAt))) {
+				dynamicHTTPClient, dynamicXmuxClient = c.getHTTPClient()
 			}
 			// Байтовый бюджет upload-байт в полёте (iOS). Acquire ЗДЕСЬ (в цикле,
 			// не в goroutine) = backpressure на pipe→TUN, а не дроп: при упоре в
@@ -353,8 +440,11 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 					break
 				}
 			}
-			go func() {
-				err := httpClient.PostPacket(
+			// hClient передаётся ПАРАМЕТРОМ (parity с Xray 26.7.11): горутина обязана
+			// работать с тем клиентом, который был актуален на момент её запуска, а
+			// не с тем, на который переменную успела перезаписать ротация.
+			go func(hClient DialerClient) {
+				err := hClient.PostPacket(
 					ctx,
 					url.String(),
 					&buf.MultiBufferContainer{MultiBuffer: chunk},
@@ -365,15 +455,41 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 				}
 				wroteRequest.Close()
 				if err != nil {
+					// InHive 2026-07-19: до этой строки отказ POST'а НИГДЕ не
+					// фиксировался — Interrupt() молча убивал upload-половину, а
+					// апстрим Xray в этом месте пишет
+					// errors.LogInfoInner(ctx, err, "failed to send upload").
+					// Из-за пропажи этого лога отсутствие строк про non-200 в
+					// box.log ошибочно читалось как «отказов нет», хотя
+					// access-лог origin их показывал. Logger'а в конструкторе
+					// транспорта нет, поэтому считаем счётчиками (chunkhist.go),
+					// которые сэмплер выводит и в box.log.
+					recordUploadError(err)
 					uploadPipeReader.Interrupt()
 				}
-			}()
-			if _, ok := httpClient.(*DefaultDialerClient); ok {
-				select {
-				case <-ctx.Done():
-				case <-wroteRequest.Wait():
-				}
-
+			}(dynamicHTTPClient)
+			if _, ok := dynamicHTTPClient.(*DefaultDialerClient); ok {
+				// InHive 2026-07-19: возвращена безусловная семантика Xray
+				// (splithttp/dialer.go — `<-wroteRequest.Wait()`).
+				//
+				// Был `select { <-ctx.Done(); <-wroteRequest.Wait() }` — правка без
+				// обоснования, и она ЛОМАЕТ ПРОТОКОЛ: packet-up нумерует POST'ы `seq`,
+				// а приёмная сторона (upload_queue) собирает их СТРОГО ПО ПОРЯДКУ,
+				// буферизуя не более scMaxBufferedPosts. Ожидание здесь — единственное,
+				// что сериализует отправку. При отменённом ctx оно переставало ждать, и
+				// цикл начинал выстреливать POST'ы внахлёст на каждый ReadMultiBuffer →
+				// порядок на проводе рушился → сервер вставал головой очереди → отдача
+				// умирала, а следом и ПРИЁМ (ACK'и проксируемого TCP едут теми же
+				// POST'ами) — отсюда наблюдаемая метастабильность: приём гулял 222→47
+				// при отдаче 0.5-0.75, тогда как Happ на идентичном конфиге ровно
+				// держит 316/279.
+				//
+				// Защита от зависшего PostPacket сделана там, где ей место — в
+				// lifetime самого запроса: он строится на uploadCtx (контекст жизни
+				// conn, отменяется в onClose), см. комментарий у uploadCtx выше и в
+				// dialer.go. Цена прежней «защиты» здесь была — поломка
+				// упорядоченности, то есть лечили симптом ценой протокола.
+				<-wroteRequest.Wait()
 			}
 		}
 	}()
@@ -430,8 +546,33 @@ func stashMetaFragment(u *url.URL, key, value string) {
 	u.Fragment = values.Encode()
 }
 
+// decideHTTPVersion — parity с Xray (splithttp/dialer.go decideHTTPVersion,
+// идентичен в 26.1.13 и 26.7.11).
+//
+// InHive 2026-07-19: наш порт расходился с апстримом в двух местах, оба роняли
+// соединение в HTTP/1.1 там, где Xray идёт по HTTP/2:
+//
+//  1. Пустой ALPN. Было `len(NextProtos()) == 0 → "1.1"`; у Xray пустой список
+//     не является особым случаем — под правило "1.1" попадает ТОЛЬКО список
+//     ровно из одного элемента "http/1.1", всё остальное (в т.ч. пустое) → "2".
+//     Конфиг без `alpn` (а такие у нас живые — напр. миграция 042) уезжал на
+//     h1-путь, где POST'ы строго последовательны, а ответы на них вообще не
+//     вычитываются (H1Conn.UnreadedResponsesCount нигде не инкрементится).
+//  2. REALITY. У Xray это первая же проверка: reality → всегда "2", независимо
+//     от ALPN. У нас ветки не было вовсе.
+//
+// Порядок проверок сохранён апстримный: reality → nil → len != 1 → значение.
 func decideHTTPVersion(tlsConfig tls.Config) string {
-	if tlsConfig == nil || len(tlsConfig.NextProtos()) == 0 || tlsConfig.NextProtos()[0] == "http/1.1" {
+	if tlsConfig != nil && tls.IsRealityClientConfig(tlsConfig) {
+		return "2"
+	}
+	if tlsConfig == nil {
+		return "1.1"
+	}
+	if len(tlsConfig.NextProtos()) != 1 {
+		return "2"
+	}
+	if tlsConfig.NextProtos()[0] == "http/1.1" {
 		return "1.1"
 	}
 	if tlsConfig.NextProtos()[0] == "h3" {

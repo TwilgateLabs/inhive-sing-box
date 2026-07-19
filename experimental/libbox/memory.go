@@ -19,10 +19,22 @@ func SetMemoryLimit(enabled bool) {
 	// возвращает ~30MB эффективного headroom.
 	const memoryLimitGo = 32 * 1024 * 1024
 	if enabled {
-		// 10% был hair-trigger у самого лимита (GC дёргался непрерывно);
-		// 30% даёт рантайму дышать, не упираясь в стенку.
-		runtimeDebug.SetGCPercent(30)
 		if C.IsIos {
+			// GOGC=30 — ТОЛЬКО iOS. 10% был hair-trigger у самого лимита (GC
+			// дёргался непрерывно); 30% даёт рантайму дышать, не упираясь в стенку.
+			//
+			// Почему именно iOS: смысл у этого числа появляется исключительно в
+			// паре с SetMemoryLimit(32MB) ниже — удержать RSS под ~45MB, чтобы
+			// jetsam не убил packet-tunnel с бюджетом 50MB.
+			//
+			// InHive 2026-07-19: строка стояла ВЫШЕ этого гейта и втихую била по
+			// Android/Windows — при том, что комментарий ниже прямо гласит
+			// «Android/Windows НЕ трогаем: там RAM есть и пропускная важнее».
+			// Намерение было записано, код ему противоречил. На десктопе, где
+			// лимита памяти нет, GOGC=30 означает просто в ~3.3 раза более частый
+			// GC: лишние STW-паузы и джиттер pacing'а на 200+ Мбит/с, ноль пользы.
+			// Референсный клиент (Happ/Xray) живёт на стоковом GOGC=100.
+			runtimeDebug.SetGCPercent(30)
 			runtimeDebug.SetMemoryLimit(memoryLimitGo)
 			// GOMAXPROCS=1 только на iOS NE. Каждый рантайм-P держит OS-тред,
 			// а каждый тред-стек жрёт phys_footprint (по которому jetsam решает
@@ -46,6 +58,9 @@ func SetMemoryLimit(enabled bool) {
 			runtimeDebug.SetMaxThreads(512)
 		}
 	} else {
+		// 100 = сток Go. На не-iOS это no-op (мы там GOGC и не трогали, см. гейт
+		// выше), на iOS — возврат к дефолту. Гейт здесь не нужен: восстановление
+		// стокового значения безопасно на любой платформе.
 		runtimeDebug.SetGCPercent(100)
 		if C.IsIos {
 			runtimeDebug.SetMemoryLimit(math.MaxInt64)

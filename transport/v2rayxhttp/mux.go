@@ -34,13 +34,16 @@ type XmuxManager struct {
 }
 
 func NewXmuxManager(options option.V2RayXHTTPXmuxOptions, newConnFunc func() XmuxConn) *XmuxManager {
-	return &XmuxManager{
+	m := &XmuxManager{
 		options:     options,
 		concurrency: options.GetNormalizedMaxConcurrency().Rand(),
 		connections: options.GetNormalizedMaxConnections().Rand(),
 		newConnFunc: newConnFunc,
 		xmuxClients: make([]*XmuxClient, 0),
 	}
+	// InHive instrumentation (TEMPORARY, see chunkhist.go).
+	recordXmuxConfig(m.concurrency, m.connections)
+	return m
 }
 
 func (m *XmuxManager) newXmuxClient() *XmuxClient {
@@ -59,6 +62,8 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
 		xmuxClient.UnreusableAt = time.Now().Add(time.Duration(x) * time.Second)
 	}
 	m.xmuxClients = append(m.xmuxClients, xmuxClient)
+	// InHive instrumentation (TEMPORARY, see chunkhist.go).
+	recordXmuxNewConn(len(m.xmuxClients))
 	return xmuxClient
 }
 
@@ -76,6 +81,9 @@ func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient {
 			i++
 		}
 	}
+	// InHive instrumentation (TEMPORARY, see chunkhist.go): pool size AFTER the
+	// prune above, i.e. how many live connections we actually keep around.
+	recordXmuxPool(len(m.xmuxClients))
 	if len(m.xmuxClients) == 0 {
 		return m.newXmuxClient()
 	}

@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/textproto"
+	"runtime" // inhive: платформенный гейт в frameScratchBufferLen
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1449,21 +1450,40 @@ var (
 // It returns max(1, min(peer's advertised max frame size,
 // Request.ContentLength+1, 512KB)).
 func (cs *clientStream) frameScratchBufferLen(maxFrameSize int) int {
-	// inhive fork (iOS NE jetsam fix, 2026-07-18): upstream caps the per-stream
-	// h2 write scratch at min(peer SETTINGS_MAX_FRAME_SIZE, ContentLength+1, 512KB).
-	// A Go-h2 xhttp server advertises 1MB → 512KB/stream, HELD FOR THE WHOLE STREAM
-	// LIFE on stream-up/stream-one (blocked in body.Read) → ~60 conns ≈ 30MB = 68%
-	// of the iOS NE ~50MB budget (device heap profile 2026-07-18 → jetsam). Our real
-	// upstream chunks are ~8KB (xray buf.Size). 64KB keeps 1 read = 1 frame for real
-	// traffic; h2 throughput is gated by flow-control WINDOWS, not DATA-frame size,
-	// so this is memory-only (bigger writes just split into more 64KB frames).
-	// See memory: ios-uploadbudget-packetup-cdn-throttle-removed-2026-07-18 + the
-	// jetsam heap profile. Empirical read-size histogram is emitted alongside (build
-	// 129) to finalize this number from device data rather than a static guess.
-	const max = 64 << 10 // inhive: was 512 << 10 upstream
+	// inhive fork (iOS NE jetsam fix, 2026-07-18; ГЕЙТ ДОБАВЛЕН 2026-07-19).
+	//
+	// Upstream капит per-stream h2 write scratch на
+	// min(peer SETTINGS_MAX_FRAME_SIZE, ContentLength+1, 512KB). Go-h2 xhttp-сервер
+	// анонсирует 1MB → 512KB на стрим, и этот буфер УДЕРЖИВАЕТСЯ ВСЮ ЖИЗНЬ СТРИМА
+	// на stream-up/stream-one (горутина висит в body.Read) → ~60 соединений ≈ 30MB
+	// = 68% от ~50MB бюджета iOS NE (device heap profile 2026-07-18 → jetsam).
+	//
+	// ПОЧЕМУ ГЕЙТ ИМЕННО ПО iOS (правило ревью: платформенная правка обязана
+	// объяснить выбор платформ). Единственная причина капа — 50MB-бюджет
+	// packet-tunnel extension и jetsam за его превышение. Такого бюджета нет ни на
+	// одной другой платформе. Профили размеров тоже расходятся на порядок
+	// (device-замеры):
+	//
+	//	iOS:     пик ~63KB          → кап 64KB не режет НИЧЕГО, он ровно по профилю
+	//	Windows: avg 339KB, max 976KB (2026-07-19, xhttp_post[avg=339282B maxK=969])
+	//
+	// То есть на Windows кап дробил одно тело на ~8 проходов, каждый под
+	// cc.wmu.Lock() + Flush(), вместо одной записи — чистые накладные расходы без
+	// какой-либо выгоды по памяти, которой там и не требовалось.
+	//
+	// ⚠️ Ранее здесь стояло обоснование «наши реальные куски ~8KB (xray buf.Size)».
+	// Это ФАКТИЧЕСКИ НЕВЕРНО и вводило в заблуждение: 8KB — размер элемента
+	// MultiBuffer, а в h2 уезжает склеенный чанк (замер выше). Число 64KB
+	// оказалось правильным для iOS по другой причине, чем было записано.
+	//
+	// iOS не трогаем сознательно: возврат 512KB там вернёт jetsam-вылеты NE.
+	max := 512 << 10 // upstream default
+	if runtime.GOOS == "ios" {
+		max = 64 << 10
+	}
 	n := int64(maxFrameSize)
-	if n > max {
-		n = max
+	if n > int64(max) {
+		n = int64(max)
 	}
 	if cl := cs.reqBodyContentLength; cl != -1 && cl+1 < n {
 		// Add an extra byte past the declared content-length to
