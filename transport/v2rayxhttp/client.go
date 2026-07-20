@@ -46,6 +46,13 @@ type Client struct {
 	getHTTPClient  func() (DialerClient, *XmuxClient)
 	getHTTPClient2 func() (DialerClient, *XmuxClient)
 
+	// xmuxManager/xmuxManager2 — те же менеджеры, что захвачены замыканиями
+	// getHTTPClient/getHTTPClient2; храним ссылки, чтобы Close() мог сбросить
+	// пулы. xmuxManager2 == nil, когда downloadSettings нет (тогда обе стороны
+	// сессии живут на первом менеджере).
+	xmuxManager  *XmuxManager
+	xmuxManager2 *XmuxManager
+
 	// uploadBudget ограничивает СУММАРНЫЕ байты upload-POST'ов в полёте по ВСЕМ
 	// соединениям этого сервера. Без него каждое проксируемое TCP-соединение
 	// шлёт аплинк своей goroutine'ой без cross-connection лимита — под нагрузкой
@@ -109,6 +116,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}
 	getRequestURL2 := getRequestURL
 	getHTTPClient2 := getHTTPClient
+	var xmuxManager2 *XmuxManager
 	if options.Download != nil {
 		options2 := options.Download
 		dialer2 := dialer
@@ -149,7 +157,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		if xmuxOptions2 == (option.V2RayXHTTPXmuxOptions{}) {
 			applyXmuxDefaults(&xmuxOptions2)
 		}
-		xmuxManager2 := NewXmuxManager(xmuxOptions2, func() XmuxConn {
+		xmuxManager2 = NewXmuxManager(xmuxOptions2, func() XmuxConn {
 			return createHTTPClient(dest2, dialer2, &options2.V2RayXHTTPBaseOptions, tlsConfig2)
 		})
 		getHTTPClient2 = func() (DialerClient, *XmuxClient) {
@@ -165,6 +173,8 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		getHTTPClient2: getHTTPClient2,
 		getRequestURL:  getRequestURL,
 		getRequestURL2: getRequestURL2,
+		xmuxManager:    xmuxManager,
+		xmuxManager2:   xmuxManager2,
 	}
 	// uploadBudget И streamSlots — ОБА ОТКЛЮЧЕНЫ (2026-07-18). Поля + nil-guarded
 	// Acquire/Release в DialContext оставлены (no-op), чтобы вернуть с
@@ -496,7 +506,30 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 	return &conn, nil
 }
 
+// Close — СБРОС транспорта, не уничтожение: закрывает все соединения обоих
+// xmux-пулов и опустошает их, после чего клиент ОБЯЗАН оставаться рабочим для
+// новых диалов (менеджеры пересоздают DialerClient'ов лениво). Ровно та же
+// семантика, что у v2rayhttp.Client.Close (ResetTransport).
+//
+// InHive 2026-07-19. Контракт sing-box: при сне/пробуждении Windows
+// route/network.go зовёт ResetNetwork() → InterfaceUpdated() у outbound'ов →
+// vless/vmess/trojan зовут transport.Close(), чтобы транспорт передиалился
+// свежим. Наш порт Xray splithttp этот контракт не реализовал (`return nil`):
+// XmuxManager с тёплым пулом (дефолт 26.7.11 — maxConnections 6..6) переживал
+// сброс с мёртвым TCP под собой, и после пробуждения туннель висел до
+// аварийных таймеров (h2 ReadIdleTimeout 45с + ping 15с; h3 QUIC
+// MaxIdleTimeout — до 300с), тогда как остальные протоколы оживали сразу.
+// Побочно та же заглушка текла живыми H2-сессиями при каждом перезапуске
+// конфига (Outbound.Close() тоже приходит сюда).
+//
+// In-flight горутины, державшие старого DialerClient'а, самовосстанавливаются:
+// их POST падает (соединения закрыты), ротация в цикле отправки берёт нового
+// клиента через c.getHTTPClient().
 func (c *Client) Close() error {
+	c.xmuxManager.Reset()
+	if c.xmuxManager2 != nil {
+		c.xmuxManager2.Reset()
+	}
 	return nil
 }
 

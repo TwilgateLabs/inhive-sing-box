@@ -520,17 +520,29 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 	r.ResetNetwork()
 }
 
+// notifyWindowsPowerEvent — обработчик suspend/resume от winpowrprof
+// (PowerRegisterSuspendResumeNotification, работает из DLL без HWND).
+//
+// InHive 2026-07-19: добавлено логирование. Раньше ни suspend, ни resume не
+// писались никуда, и по логам пользователя нельзя было даже понять, доехало ли
+// событие питания до ядра. Уровень — Warn, НЕ Info: клиент выставляет уровень
+// лога ядра `warn` (singbox_config_builder.dart `_baseLog`), Info до вкладки
+// «Логи» не доезжает (тот же прецедент — v2/hcore/mem_sampler.go). События
+// редкие (сон/пробуждение), спама не создают.
 func (r *NetworkManager) notifyWindowsPowerEvent(event int) {
 	switch event {
 	case winpowrprof.EVENT_SUSPEND:
+		r.logger.Warn("power: system suspend, pausing device and resetting network")
 		r.pauseManager.DevicePause()
 		r.ResetNetwork()
 	case winpowrprof.EVENT_RESUME:
 		if !r.pauseManager.IsDevicePaused() {
+			r.logger.Warn("power: resume event ignored (device was not paused)")
 			return
 		}
 		fallthrough
 	case winpowrprof.EVENT_RESUME_AUTOMATIC:
+		r.logger.Warn("power: system resume, waking device and resetting network")
 		r.pauseManager.DeviceWake()
 		r.ResetNetwork()
 	}

@@ -10,9 +10,13 @@ import (
 	"net/http/httptrace"
 	"sync"
 
+	"github.com/sagernet/quic-go/http3"
 	common "github.com/sagernet/sing-box/common/xray"
 	"github.com/sagernet/sing-box/common/xray/signal/done"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/transport/v2rayhttp"
+
+	"golang.org/x/net/http2"
 )
 
 // interface to abstract between use of browser dialer, vs net/http
@@ -39,6 +43,48 @@ type DefaultDialerClient struct {
 
 func (c *DefaultDialerClient) IsClosed() bool {
 	return c.closed
+}
+
+// Close помечает клиента закрытым и АКТИВНО закрывает соединения его пулов.
+//
+// InHive 2026-07-19: клиент после Close ВЫБРАСЫВАЕТСЯ (XmuxManager.Reset
+// вычёркивает его из пула; IsClosed()==true не даст переиспользовать), поэтому
+// восстанавливать работоспособность транспорта не нужно — новый диал получит
+// СВЕЖИЙ DefaultDialerClient из newConnFunc. Задача здесь — не оставить живых
+// (или мёртвых после сна) TCP/QUIC-сессий без владельца:
+//   - h2: рабочий образец в дереве — v2rayhttp.ResetTransport
+//     (transport/v2rayhttp/force_close.go): закрывает ВСЕ соединения приватного
+//     пула http2 через go:linkname. Именно h2 держал тёплый пул xmux с мёртвым
+//     TCP после пробуждения Windows.
+//   - h1: у http.Transport DisableKeepAlives=true (пула idle-соединений нет,
+//     CloseIdleConnections — страховка); реальный пул h1-аплоада —
+//     uploadRawPool с сырыми conn'ами, его дренируем и закрываем.
+//   - h3: http3.Transport.Close() закрывает QUIC-соединения; после Close этот
+//     transport непереиспользуем ("A Transport cannot be used after it has
+//     been closed") — не проблема, см. выше: клиент одноразовый.
+func (c *DefaultDialerClient) Close() error {
+	c.closed = true
+	if c.client == nil {
+		return nil
+	}
+	switch transport := c.client.Transport.(type) {
+	case *http.Transport:
+		transport.CloseIdleConnections()
+		for {
+			pooled := c.uploadRawPool.Get()
+			if pooled == nil {
+				break
+			}
+			if conn, isConn := pooled.(*H1Conn); isConn {
+				_ = conn.Close()
+			}
+		}
+	case *http2.Transport:
+		v2rayhttp.ResetTransport(transport)
+	case *http3.Transport:
+		_ = transport.Close()
+	}
+	return nil
 }
 
 func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body io.Reader, uploadOnly bool) (wrc io.ReadCloser, remoteAddr, localAddr net.Addr, err error) {

@@ -3,6 +3,7 @@ package xhttp
 import (
 	"context"
 	"crypto/rand"
+	"io"
 	"math"
 	"math/big"
 	"sync"
@@ -65,6 +66,29 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
 	// InHive instrumentation (TEMPORARY, see chunkhist.go).
 	recordXmuxNewConn(len(m.xmuxClients))
 	return xmuxClient
+}
+
+// Reset закрывает ВСЕ соединения пула и опустошает его. Менеджер остаётся
+// рабочим: следующий GetXmuxClient лениво создаст свежий XmuxConn через
+// newConnFunc — это семантика «сброс», не «уничтожение».
+//
+// InHive 2026-07-19 (в Xray аналога нет — у него другой lifecycle транспорта):
+// это опора контракта sing-box V2RayClientTransport.Close(). При событии
+// сна/пробуждения Windows route/network.go зовёт ResetNetwork() →
+// InterfaceUpdated() у outbound'ов → transport.Close(); без сброса тёплый пул
+// xmux (дефолт 26.7.11 — maxConnections 6..6) переживал сброс с мёртвым TCP
+// под собой, и туннель после пробуждения висел до аварийных таймеров
+// (h2 ReadIdleTimeout 45с + ping 15с, h3 — до 300с). Тот же путь закрывает
+// утечку живых H2-сессий при каждом перезапуске конфига (Outbound.Close()).
+func (m *XmuxManager) Reset() {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	for _, xmuxClient := range m.xmuxClients {
+		if closer, ok := xmuxClient.XmuxConn.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+	m.xmuxClients = make([]*XmuxClient, 0)
 }
 
 func (m *XmuxManager) GetXmuxClient(ctx context.Context) *XmuxClient {
