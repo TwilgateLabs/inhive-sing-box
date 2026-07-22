@@ -138,6 +138,14 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	}
 }
 
+// DialProbeFresh — см. adapter.ProbeFreshDialer. Проба идёт мимо mux прямым
+// протокол-дайлером: свежий underlying-conn + свежий vmess-хендшейк, без
+// добавления сессии в переиспользуемый mux-пул (боевой пул не трогаем). Без
+// mux — тот же путь, что DialContext (естественный no-op).
+func (h *Outbound) DialProbeFresh(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return (*vmessDialer)(h).DialContext(ctx, network, destination)
+}
+
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if h.multiplexDialer == nil {
 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)

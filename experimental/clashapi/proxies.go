@@ -202,6 +202,15 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeout))
 		defer cancel()
 
+		// InHive (2026-07-22): fresh=1 → проба дайлит свежим транспортом мимо
+		// пула (честный вердикт после смены сети — пулящийся протокол не
+		// покажет зелёный с протухшего живого пула; см. urltest.go). Шлёт
+		// InHive Dart-клиент для НЕ-несущих резидентных серверов. Без параметра
+		// поведение прежнее.
+		if query.Get("fresh") == "1" {
+			ctx = urltest.ContextWithProbeFresh(ctx)
+		}
+
 		delay, err := urltest.URLTest(ctx, url, proxy)
 		defer func() {
 			realTag := group.RealTag(proxy)

@@ -122,7 +122,27 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 	}
 
 	start := time.Now()
-	instance, err := detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
+	// InHive fresh-probe (2026-07-22): пулящиеся протоколы (sing-mux; xhttp
+	// xmux h2/h3; hysteria2/tuic QUIC-сессия) ПЕРЕИСПОЛЬЗУЮТ живое транспортное
+	// соединение в обычном DialContext. После смены оператора/сети
+	// протухший-но-ещё-живой пул отвечает на пробу → ЛОЖНЫЙ зелёный, хотя новое
+	// соединение сейчас не встаёт. Когда клиент помечает пробу fresh (clash
+	// delay-хендлер: query `fresh=1`; шлёт InHive Dart-клиент для НЕ-несущих
+	// резидентных серверов), дайлим свежим транспортом МИМО пула через opt-in
+	// adapter.ProbeFreshDialer — боевой пул при этом НЕ трогаем (транзиентная
+	// сессия закрывается вместе с probe-conn). Протоколы без пула интерфейс не
+	// реализуют → обычный DialContext, для них и так свежий (no-op). БЕЗ
+	// fresh-флага — поведение бит-в-бит апстримное.
+	var instance net.Conn
+	if isProbeFresh(ctx) {
+		if fresh, ok := detour.(adapter.ProbeFreshDialer); ok {
+			instance, err = fresh.DialProbeFresh(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
+		} else {
+			instance, err = detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
+		}
+	} else {
+		instance, err = detour.DialContext(ctx, "tcp", M.ParseSocksaddrHostPortStr(hostname, port))
+	}
 	if err != nil {
 		return
 	}

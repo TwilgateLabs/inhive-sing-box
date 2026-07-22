@@ -105,6 +105,14 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	}
 }
 
+// DialProbeFresh — см. adapter.ProbeFreshDialer. Проба идёт мимо mux прямым
+// протокол-дайлером: свежий underlying-conn + свежий ss-хендшейк, без
+// добавления сессии в переиспользуемый mux-пул (боевой пул не трогаем). Без
+// mux — тот же путь, что DialContext (естественный no-op).
+func (h *Outbound) DialProbeFresh(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return (*shadowsocksDialer)(h).DialContext(ctx, network, destination)
+}
+
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()

@@ -37,6 +37,12 @@ type Outbound struct {
 	outbound.Adapter
 	logger logger.ContextLogger
 	client *hysteria2.Client
+	// clientOptions — точная копия опций, которыми построен боевой client.
+	// InHive: fresh-проба (adapter.ProbeFreshDialer) поднимает из них
+	// ТРАНЗИЕНТНЫЙ клиент, чтобы честно проверить, встаёт ли НОВАЯ QUIC-сессия
+	// (боевую сессию h.client переиспользует DialContext, и после смены сети
+	// она врёт зелёным).
+	clientOptions hysteria2.ClientOptions
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2OutboundOptions) (adapter.Outbound, error) {
@@ -65,7 +71,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	networkList := options.Network.Build()
-	client, err := hysteria2.NewClient(hysteria2.ClientOptions{
+	clientOptions := hysteria2.ClientOptions{
 		Context:            ctx,
 		Dialer:             outboundDialer,
 		Logger:             logger,
@@ -79,15 +85,41 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		Password:           options.Password,
 		TLSConfig:          tlsConfig,
 		UDPDisabled:        !common.Contains(networkList, N.NetworkUDP),
-	})
+	}
+	client, err := hysteria2.NewClient(clientOptions)
 	if err != nil {
 		return nil, err
 	}
 	return &Outbound{
-		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeHysteria2, tag, networkList, options.DialerOptions),
-		logger:  logger,
-		client:  client,
+		Adapter:       outbound.NewAdapterWithDialerOptions(C.TypeHysteria2, tag, networkList, options.DialerOptions),
+		logger:        logger,
+		client:        client,
+		clientOptions: clientOptions,
 	}, nil
+}
+
+// DialProbeFresh — см. adapter.ProbeFreshDialer. hysteria2 держит ОДНУ
+// QUIC-сессию в h.client и переиспользует её в DialContext; после смены сети
+// она отвечает зелёным с протухшего пула. Для пробы поднимаем ТРАНЗИЕНТНЫЙ
+// клиент из тех же опций (свой QUIC-хендшейк), дайлим по нему и закрываем его
+// вместе с conn'ом. Боевой h.client не трогаем. Только TCP-проба; UDP — падаем
+// на обычный путь (пробы урлтеста всегда TCP).
+func (h *Outbound) DialProbeFresh(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if N.NetworkName(network) != N.NetworkTCP {
+		return h.DialContext(ctx, network, destination)
+	}
+	probeClient, err := hysteria2.NewClient(h.clientOptions)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := probeClient.DialConn(ctx, destination)
+	if err != nil {
+		_ = probeClient.CloseWithError(os.ErrClosed)
+		return nil, err
+	}
+	return &adapter.ProbeConn{Conn: conn, OnClose: func() error {
+		return probeClient.CloseWithError(os.ErrClosed)
+	}}, nil
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {

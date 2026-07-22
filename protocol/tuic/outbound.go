@@ -36,6 +36,11 @@ type Outbound struct {
 	logger    logger.ContextLogger
 	client    *tuic.Client
 	udpStream bool
+	// clientOptions — точная копия опций боевого client. InHive: fresh-проба
+	// (adapter.ProbeFreshDialer) поднимает из них ТРАНЗИЕНТНЫЙ клиент, чтобы
+	// честно проверить новую QUIC-сессию (боевую h.client переиспользует
+	// DialContext → врёт зелёным после смены сети).
+	clientOptions tuic.ClientOptions
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TUICOutboundOptions) (adapter.Outbound, error) {
@@ -64,7 +69,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
-	client, err := tuic.NewClient(tuic.ClientOptions{
+	clientOptions := tuic.ClientOptions{
 		Context:           ctx,
 		Dialer:            outboundDialer,
 		ServerAddress:     options.ServerOptions.Build(),
@@ -75,16 +80,41 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		UDPStream:         tuicUDPStream,
 		ZeroRTTHandshake:  options.ZeroRTTHandshake,
 		Heartbeat:         time.Duration(options.Heartbeat),
-	})
+	}
+	client, err := tuic.NewClient(clientOptions)
 	if err != nil {
 		return nil, err
 	}
 	return &Outbound{
-		Adapter:   outbound.NewAdapterWithDialerOptions(C.TypeTUIC, tag, options.Network.Build(), options.DialerOptions),
-		logger:    logger,
-		client:    client,
-		udpStream: options.UDPOverStream,
+		Adapter:       outbound.NewAdapterWithDialerOptions(C.TypeTUIC, tag, options.Network.Build(), options.DialerOptions),
+		logger:        logger,
+		client:        client,
+		udpStream:     options.UDPOverStream,
+		clientOptions: clientOptions,
 	}, nil
+}
+
+// DialProbeFresh — см. adapter.ProbeFreshDialer. tuic держит ОДНУ QUIC-сессию в
+// h.client и переиспользует её в DialContext; после смены сети она врёт
+// зелёным. Для пробы поднимаем ТРАНЗИЕНТНЫЙ клиент из тех же опций (свой
+// QUIC-хендшейк), дайлим по нему и закрываем вместе с conn'ом. Боевой h.client
+// не трогаем. Только TCP-проба; UDP — на обычный путь.
+func (h *Outbound) DialProbeFresh(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	if N.NetworkName(network) != N.NetworkTCP {
+		return h.DialContext(ctx, network, destination)
+	}
+	probeClient, err := tuic.NewClient(h.clientOptions)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := probeClient.DialConn(ctx, destination)
+	if err != nil {
+		_ = probeClient.CloseWithError(os.ErrClosed)
+		return nil, err
+	}
+	return &adapter.ProbeConn{Conn: conn, OnClose: func() error {
+		return probeClient.CloseWithError(os.ErrClosed)
+	}}, nil
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {

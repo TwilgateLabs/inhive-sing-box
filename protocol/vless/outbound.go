@@ -117,6 +117,18 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	}
 }
 
+// DialProbeFresh — см. adapter.ProbeFreshDialer. При включённом mux обычный
+// DialContext открывает стрим в ПЕРЕИСПОЛЬЗУЕМОЙ mux-сессии — после смены сети
+// она отвечает зелёным с протухшего пула. Проба идёт мимо mux прямым
+// протокол-дайлером: свежий underlying-conn + свежий vless-хендшейк, БЕЗ
+// добавления сессии в mux-пул (боевой пул не трогаем). Для outbound'а без mux
+// это тот же путь, что и DialContext (естественный no-op).
+// NB: транспорт xhttp под vless может ещё переиспользовать xmux h2/h3-клиент —
+// свежесть на этом слое не покрыта (см. core/upstream.toml).
+func (h *Outbound) DialProbeFresh(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	return (*vlessDialer)(h).DialContext(ctx, network, destination)
+}
+
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if h.multiplexDialer == nil {
 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
