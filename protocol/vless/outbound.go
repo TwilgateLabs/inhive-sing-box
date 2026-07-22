@@ -37,8 +37,13 @@ type Outbound struct {
 	tlsConfig       tls.Config
 	tlsDialer       tls.Dialer
 	transport       adapter.V2RayClientTransport
-	packetAddr      bool
-	xudp            bool
+	// transportOptions — опции боевого transport'а. InHive: fresh-проба
+	// (adapter.ProbeFreshDialer) поднимает из них ТРАНЗИЕНТНЫЙ транспорт со
+	// СВОИМ xmux/h2/h3-пулом (xhttp/splithttp пулит НЕЗАВИСИМО от sing-mux и
+	// может пережить смену сети без InterfaceUpdated → врёт зелёным).
+	transportOptions *option.V2RayTransportOptions
+	packetAddr       bool
+	xudp             bool
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VLESSOutboundOptions) (adapter.Outbound, error) {
@@ -72,6 +77,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		if err != nil {
 			return nil, E.Cause(err, "create client transport: ", options.Transport.Type)
 		}
+		outbound.transportOptions = options.Transport // для fresh-пробы (транзиентный транспорт)
 	}
 	if options.PacketEncoding == nil {
 		outbound.xudp = true
@@ -117,16 +123,44 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	}
 }
 
-// DialProbeFresh — см. adapter.ProbeFreshDialer. При включённом mux обычный
-// DialContext открывает стрим в ПЕРЕИСПОЛЬЗУЕМОЙ mux-сессии — после смены сети
-// она отвечает зелёным с протухшего пула. Проба идёт мимо mux прямым
-// протокол-дайлером: свежий underlying-conn + свежий vless-хендшейк, БЕЗ
-// добавления сессии в mux-пул (боевой пул не трогаем). Для outbound'а без mux
-// это тот же путь, что и DialContext (естественный no-op).
-// NB: транспорт xhttp под vless может ещё переиспользовать xmux h2/h3-клиент —
-// свежесть на этом слое не покрыта (см. core/upstream.toml).
+// DialProbeFresh — см. adapter.ProbeFreshDialer. Свежесть пробы закрывает ДВА
+// переиспользуемых слоя, врущих зелёным после смены сети:
+//  1. sing-mux сессия — обходится прямым протокол-дайлером (inner vlessDialer
+//     не трогает multiplexDialer, сессия в пул не добавляется);
+//  2. xhttp/splithttp xmux h2/h3-пул — живёт в h.transport НЕЗАВИСИМО от mux и
+//     может пережить смену оператора без InterfaceUpdated. Для пробы поднимаем
+//     ТРАНЗИЕНТНЫЙ транспорт тем же v2ray.NewClientTransport (свой xmux-пул;
+//     дефолты идентичны боевому — те же transportOptions/dialer/tlsConfig) и
+//     дайлим vless-хендшейк поверх него через shallow-клон Outbound с
+//     подменённым только полем transport (боевой h.transport НЕ трогаем).
+//     Транзиент закрывается вместе с probe-conn (ProbeConn.OnClose →
+//     freshTransport.Close() = Reset xmux-пула, не течём h2/h3-сессиями).
+//
+// Без транспорта (plain/tls) — прямой inner dialer, естественно свежий.
+// Не-пулящие транспорты (ws/httpupgrade) через транзиент тоже проходят
+// корректно (свежий экземпляр = свежее соединение), лишь чуть дороже.
 func (h *Outbound) DialProbeFresh(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	return (*vlessDialer)(h).DialContext(ctx, network, destination)
+	if h.transport == nil {
+		return (*vlessDialer)(h).DialContext(ctx, network, destination)
+	}
+	freshTransport, err := v2ray.NewClientTransport(ctx, h.dialer, h.serverAddr, common.PtrValueOrDefault(h.transportOptions), h.tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+	if freshTransport == nil {
+		// options.Type пуст — транспорта фактически нет; обычный inner путь.
+		return (*vlessDialer)(h).DialContext(ctx, network, destination)
+	}
+	probe := *h
+	probe.transport = freshTransport
+	conn, err := (*vlessDialer)(&probe).DialContext(ctx, network, destination)
+	if err != nil {
+		_ = freshTransport.Close()
+		return nil, err
+	}
+	return &adapter.ProbeConn{Conn: conn, OnClose: func() error {
+		return freshTransport.Close()
+	}}, nil
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {

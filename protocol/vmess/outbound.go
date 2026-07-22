@@ -37,8 +37,11 @@ type Outbound struct {
 	tlsConfig       tls.Config
 	tlsDialer       tls.Dialer
 	transport       adapter.V2RayClientTransport
-	packetAddr      bool
-	xudp            bool
+	// transportOptions — опции боевого transport'а для fresh-пробы: транзиентный
+	// транспорт со СВОИМ xmux/h2/h3-пулом (xhttp пулит независимо от sing-mux).
+	transportOptions *option.V2RayTransportOptions
+	packetAddr       bool
+	xudp             bool
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.VMessOutboundOptions) (adapter.Outbound, error) {
@@ -66,6 +69,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		if err != nil {
 			return nil, E.Cause(err, "create client transport: ", options.Transport.Type)
 		}
+		outbound.transportOptions = options.Transport // для fresh-пробы (транзиентный транспорт)
 	}
 	outbound.multiplexDialer, err = mux.NewClientWithOptions((*vmessDialer)(outbound), logger, common.PtrValueOrDefault(options.Multiplex))
 	if err != nil {
@@ -138,12 +142,34 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	}
 }
 
-// DialProbeFresh — см. adapter.ProbeFreshDialer. Проба идёт мимо mux прямым
-// протокол-дайлером: свежий underlying-conn + свежий vmess-хендшейк, без
-// добавления сессии в переиспользуемый mux-пул (боевой пул не трогаем). Без
-// mux — тот же путь, что DialContext (естественный no-op).
+// DialProbeFresh — см. adapter.ProbeFreshDialer. Закрывает два переиспользуемых
+// слоя: (1) sing-mux сессию — обход прямым протокол-дайлером (inner vmessDialer,
+// пул не трогается); (2) xhttp xmux h2/h3-пул в h.transport — для пробы
+// поднимаем ТРАНЗИЕНТНЫЙ транспорт (свой пул, дефолты идентичны боевому) и
+// дайлим vmess-хендшейк через shallow-клон Outbound с подменённым transport
+// (боевой h.transport не трогаем). Транзиент закрывается вместе с probe-conn.
+// Без транспорта — прямой inner dialer, естественно свежий.
 func (h *Outbound) DialProbeFresh(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	return (*vmessDialer)(h).DialContext(ctx, network, destination)
+	if h.transport == nil {
+		return (*vmessDialer)(h).DialContext(ctx, network, destination)
+	}
+	freshTransport, err := v2ray.NewClientTransport(ctx, h.dialer, h.serverAddr, common.PtrValueOrDefault(h.transportOptions), h.tlsConfig)
+	if err != nil {
+		return nil, err
+	}
+	if freshTransport == nil {
+		return (*vmessDialer)(h).DialContext(ctx, network, destination)
+	}
+	probe := *h
+	probe.transport = freshTransport
+	conn, err := (*vmessDialer)(&probe).DialContext(ctx, network, destination)
+	if err != nil {
+		_ = freshTransport.Close()
+		return nil, err
+	}
+	return &adapter.ProbeConn{Conn: conn, OnClose: func() error {
+		return freshTransport.Close()
+	}}, nil
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
