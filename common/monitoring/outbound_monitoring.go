@@ -118,6 +118,32 @@ func (m *OutboundMonitoring) OutboundsHistory(groupTag string) map[string]*adapt
 	// inhive: Touch здесь — UI (Flutter через gRPC AllProxiesInfoStream) спрашивает
 	// пинги, значит активен → бустрапим ticker.
 	m.Touch()
+	return m.outboundsHistory(groupTag)
+}
+
+// OutboundsHistoryPassive — то же, но БЕЗ Touch: для потребителей ВНУТРИ ядра,
+// которые читают историю как побочный эффект работы карусели, а не потому что
+// её кто-то смотрит.
+//
+// InHive 2026-07-26. Зачем отдельный метод: карусель URLTest живёт по принципу
+// «крутимся, пока результаты кому-то нужны», и idleTimeout (10 мин без чтений)
+// её усыпляет. Но mode-watcher (v2/hcore/urltest_watcher.go) подписан на
+// события цикла и на КАЖДОМ событии дёргал OutboundsHistory("") → Touch() →
+// «кто-то смотрит» → тикер жив → следующий цикл проб → событие → снова
+// watcher. Контур замыкался сам на себя, idleTimeout не наступал НИКОГДА:
+// полный TLS-свип всех outbound'ов подписки каждые 5 минут, пока поднят
+// туннель (на Windows/Android — на iOS watcher выключен именно из-за этого,
+// см. start.go). Цена: N хендшейков раз в 5 мин на канале юзера + залп
+// одновременных коннектов ко всем серверам как узнаваемый паттерн для DPI.
+// Watcher — не зритель, он лишь читает то, что и так посчитано.
+func (m *OutboundMonitoring) OutboundsHistoryPassive(groupTag string) map[string]*adapter.URLTestHistory {
+	if m == nil {
+		return map[string]*adapter.URLTestHistory{}
+	}
+	return m.outboundsHistory(groupTag)
+}
+
+func (m *OutboundMonitoring) outboundsHistory(groupTag string) map[string]*adapter.URLTestHistory {
 	histories := make(map[string]*adapter.URLTestHistory)
 
 	grp, ok := m.groups[groupTag]

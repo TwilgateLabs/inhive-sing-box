@@ -132,6 +132,14 @@ func (s *Balancer) worker() {
 			if !ok {
 				return
 			}
+			// SIBLING к mode-watcher'у (v2/hcore/urltest_watcher.go): та же
+			// форма контура «событие цикла → чтение истории → Touch → цикл
+			// живёт вечно». Там это баг и переведено на
+			// OutboundsHistoryPassive; ЗДЕСЬ Touch оставлен НАМЕРЕННО —
+			// балансировщик не наблюдатель, свежие замеры и есть его работа,
+			// без живой карусели он перестаёт балансировать. Не «чинить» по
+			// аналогии. (Клиент этот путь сейчас не использует: боевой конфиг
+			// строит Dart без балансера — core/v2/config/builder_outbound.go.)
 			outbounds := s.monitor.OutboundsHistory(s.Tag())
 			if s.strategyFn.UpdateOutboundsInfo(outbounds) {
 				s.interruptGroup.Interrupt(s.interruptExternalConnections)
