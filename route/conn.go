@@ -88,6 +88,20 @@ const (
 	cbProbeMax      = 30 * time.Second // потолок backoff'а (=макс время между проверками recovery)
 )
 
+// tryClaimProbe — атомарно решает, идёт ли этот дайл down-outbound'а полным
+// путём как probe (не чаще раза в probeInterval; 0 трактуется как cbProbeBase —
+// свежий trip и сброс ResetHealth дают немедленный probe). Вынесено из
+// NewConnection единственно ради юнит-теста (conn_test.go): тест обязан
+// проверять ТУ ЖЕ логику, а не её копию — иначе связанность-на-расстоянии.
+func (h *outboundHealth) tryClaimProbe(nowNano int64) bool {
+	last := h.lastProbe.Load()
+	interval := h.probeInterval.Load()
+	if interval == 0 {
+		interval = int64(cbProbeBase)
+	}
+	return nowNano-last >= interval && h.lastProbe.CompareAndSwap(last, nowNano)
+}
+
 type ConnectionManager struct {
 	logger      logger.ContextLogger
 	access      sync.Mutex
@@ -117,6 +131,51 @@ func (m *ConnectionManager) Start(stage adapter.StartStage) error {
 
 func (m *ConnectionManager) Count() int {
 	return m.connections.Len()
+}
+
+// ResetHealth — сброс probe-часов circuit-breaker'а при смене сети (зовётся
+// из NetworkManager.ResetNetwork рядом с CloseAll: смена интерфейса, resume
+// Windows, wake-reset iOS после долгого сна).
+//
+// ЗАЧЕМ. Здоровье outbound'а меряется НА КОНКРЕТНОЙ СЕТИ: 8 подряд-фейлов на
+// умершем Wi-Fi ничего не говорят о доступности сервера с LTE. Без сброса
+// сервер, помеченный down на старой сети, продолжал fast-fail'ить все дайлы
+// на новой, рабочей — до 30с (потолок probe-backoff'а): «переключил сеть, а
+// VPN ещё полминуты не работает».
+//
+// Пометку down НЕ снимаем НАМЕРЕННО — её снимает только фактический успешный
+// дайл (см. NewConnection). Авто-снятие вернуло бы ровно тот шторм, ради
+// которого брейкер строился (8 висящих дайлов × 5с TCPConnectTimeout ×
+// каждый down-outbound), и противоречило бы решению Никиты 2026-07-17: сервер
+// не подменяем и «здоровым» его не объявляем — это делает только реальность.
+// Сбрасываем только probe-часы: probeInterval → 0 (в NewConnection это
+// трактуется как cbProbeBase) и lastProbe → 0 — ПЕРВЫЙ ЖЕ дайл на новой сети
+// идёт полным путём как probe. Цена: один полный дайл (≤5с TCPConnectTimeout)
+// на каждый down-outbound на смену сети; остальные дайлы down-сервера
+// по-прежнему fast-fail, шторм не возвращается.
+//
+// consecFails ТОЖЕ сохраняем — это решение, не забывчивость. Цена сохранения
+// мала: 7 фейлов со старого Wi-Fi + один транзиентный фейл на свежей LTE —
+// и живой сервер на ~1с ложно down (probe через cbProbeBase тут же снимет).
+// Цена сброса — катастрофа в худшем сценарии: при ФЛАПЕ интерфейса
+// (дрожащий Wi-Fi даёт ResetNetwork каждые несколько секунд) счётчик
+// обнулялся бы раньше, чем добирался до порога 8, брейкер не срабатывал бы
+// НИКОГДА — и возвращается шторм висящих дайлов, ради которого он написан,
+// ровно в сценарии слабой сети на iOS, где тот убивает процесс (thread
+// exhaustion, инцидент 2026-07-17). Асимметрия односторонняя: секунда
+// ложного fast-fail против SIGABRT. Гейт: conn_test.go assert'ит сохранение.
+//
+// Смежное per-outbound состояние, ОСОЗНАННО не сбрасываемое здесь: DNS
+// negFail-кэш (dns/client.go) — TTL 5с, самоистекает быстрее, чем юзер
+// заметит; urltest-история (UI-вердикты пингов) — обновляется только явным
+// пингом по решению Никиты, к маршрутизации трафика не привязана.
+func (m *ConnectionManager) ResetHealth() {
+	m.health.Range(func(_, value any) bool {
+		health := value.(*outboundHealth)
+		health.probeInterval.Store(0)
+		health.lastProbe.Store(0)
+		return true
+	})
 }
 
 func (m *ConnectionManager) CloseAll() {
@@ -172,16 +231,10 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
 		health = m.outboundHealthFor(outbound.Tag())
 		if health.down.Load() {
-			nowNano := time.Now().UnixNano()
-			last := health.lastProbe.Load()
-			interval := health.probeInterval.Load()
-			if interval == 0 {
-				interval = int64(cbProbeBase)
-			}
 			// Recovery ловится ТОЛЬКО пропущенным probe: пропускаем 1 дайл раз в
 			// interval (растёт с backoff'ом), остальные fast-fail (0ms). Никакого
 			// синтетического трафика — это одна из уже идущих попыток приложений.
-			if nowNano-last >= interval && health.lastProbe.CompareAndSwap(last, nowNano) {
+			if health.tryClaimProbe(time.Now().UnixNano()) {
 				isProbe = true // идёт полным путём; успех снимет down, фейл увеличит backoff
 			} else {
 				N.CloseOnHandshakeFailure(conn, onClose, E.New("outbound [", outbound.Tag(), "] circuit-open (server unreachable)"))

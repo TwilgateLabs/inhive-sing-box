@@ -453,6 +453,11 @@ func (r *NetworkManager) UpdateWIFIState() {
 func (r *NetworkManager) ResetNetwork() {
 	if r.connectionManager != nil {
 		r.connectionManager.CloseAll()
+		// Смена сети обнуляет и probe-часы circuit-breaker'а (down остаётся —
+		// его снимет только успешный дайл). Именно здесь, а НЕ внутри
+		// CloseAll: тот зовётся и на закрытии бокса/юзерской кнопкой, где
+		// сеть не менялась. См. ConnectionManager.ResetHealth.
+		r.connectionManager.ResetHealth()
 	}
 
 	for _, endpoint := range r.endpoint.Endpoints() {
@@ -500,15 +505,32 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 			return it.Interface.Index == defaultInterface.Index
 		})
 		if networkInterface.Name == "" {
-			// race
-			return
-		}
-		options = append(options, F.ToString("type ", networkInterface.Type))
-		if networkInterface.Expensive {
-			options = append(options, "expensive")
-		}
-		if networkInterface.Constrained {
-			options = append(options, "constrained")
+			// InHive 2026-07-26: апстрим здесь делал голый `return` («race») —
+			// и апдейт ПРОГЛАТЫВАЛСЯ НАВСЕГДА: platformDefaultInterfaceMonitor
+			// (libbox/monitor.go) к этому моменту уже записал новый
+			// defaultInterface, так что следующий колбек с тем же интерфейсом
+			// отсекается same-interface early-return'ом — ResetNetwork не
+			// случится до следующей РЕАЛЬНОЙ смены сети, соединения остаются
+			// прибиты к старому интерфейсу.
+			//
+			// Повторного UpdateInterfaces здесь НЕТ намеренно: монитор
+			// (libbox/monitor.go updateDefaultInterface) зовёт
+			// networkManager.UpdateInterfaces() тем же стеком непосредственно
+			// перед эмитом колбеков — список УЖЕ свежий, а «не найден» — это
+			// фильтр (networkInterfaces отбрасывает интерфейсы без FlagUp),
+			// не устаревание. Повторная энумерация вернула бы то же самое
+			// ценой лишнего похода через мост в горячем колбеке.
+			// Продолжаем БЕЗ type-опций (лог беднее), но С ResetNetwork:
+			// лишний сброс дешевле молча потерянного.
+			r.logger.Warn("default interface ", defaultInterface.Name, " missing from interface list — proceeding with network reset")
+		} else {
+			options = append(options, F.ToString("type ", networkInterface.Type))
+			if networkInterface.Expensive {
+				options = append(options, "expensive")
+			}
+			if networkInterface.Constrained {
+				options = append(options, "constrained")
+			}
 		}
 	}
 	r.logger.Info("updated default interface ", defaultInterface.Name, ", ", strings.Join(options, ", "))
