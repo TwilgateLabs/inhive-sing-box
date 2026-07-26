@@ -12,6 +12,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
+	xnet "github.com/sagernet/sing-box/common/xray/net"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -48,8 +49,31 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 			tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
 		}
 		tlsDialer := tls.NewDialer(dialer, tlsConfig)
+		// InHive 2026-07-26: health-check по умолчанию, а не только когда
+		// idle_timeout задан в подписке (в диком виде он не задан почти никогда).
+		// Без него мёртвый после сна девайса H2-коннект (NAT снёс TCP, RST не
+		// пришёл) жил в пуле вечно, и все новые стримы уходили в чёрную дыру до
+		// TCP RTO — «первые N секунд после пробуждения VPN не работает».
+		// Дефолт = ChromeH2KeepAlivePeriod (45s), та же константа, что у нашего
+		// порта Xray splithttp (v2rayxhttp/client.go) — browser-подобный PING-
+		// период, не выделяющийся для DPI. Явный idle_timeout из подписки
+		// по-прежнему уважается.
+		//
+		// Отрицательный idle_timeout = «выключить пинги совсем» — конвенция
+		// Xray, дословно повторённая в нашем порту splithttp
+		// (v2rayxhttp/client.go: keepAlivePeriod<0 → 0). Без неё у чужой
+		// подписки не остаётся способа отказаться от нашего дефолта, а это
+		// wire-поведение на ЧУЖОМ сервере: универсальный клиент обязан давать
+		// владельцу конфига последнее слово (feedback_domain_universal_client).
+		readIdleTimeout := time.Duration(options.IdleTimeout)
+		switch {
+		case readIdleTimeout == 0:
+			readIdleTimeout = xnet.ChromeH2KeepAlivePeriod
+		case readIdleTimeout < 0:
+			readIdleTimeout = 0
+		}
 		transport = &http2.Transport{
-			ReadIdleTimeout: time.Duration(options.IdleTimeout),
+			ReadIdleTimeout: readIdleTimeout,
 			PingTimeout:     time.Duration(options.PingTimeout),
 			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.STDConfig) (net.Conn, error) {
 				return tlsDialer.DialTLSContext(ctx, M.ParseSocksaddr(addr))
