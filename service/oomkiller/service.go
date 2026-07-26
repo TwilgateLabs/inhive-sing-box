@@ -108,6 +108,16 @@ func (s *Service) Start(stage adapter.StartStage) error {
 
 	if s.hasTimerMode {
 		s.adaptiveTimer = newAdaptiveTimer(s.logger, s.router, s.timerConfig)
+		// InHive 2026-07-26: поллер запускается СРАЗУ, как на не-darwin стабе
+		// (service_stub.go). Раньше на darwin он только создавался, а стартовал
+		// исключительно из goMemoryPressureCallback по DISPATCH critical — то
+		// есть по ровно тому системному сигналу, ради обхода которого timer-режим
+		// и добавляли: при per-process jetsam (iOS режет NE по личному ~50MB
+		// при гигабайтах свободной RAM) dispatch молчит. Итог: страховка
+		// существовала только на бумаге, а 4 jetsam'а за день 2026-07-14 прошли
+		// без единого срабатывания. Интервал адаптивный (min→max, service_timer.go),
+		// в покое разрежается сам; цена тика — один task_info.
+		s.adaptiveTimer.start(0)
 		if s.memoryLimit > 0 {
 			s.logger.Info("started memory monitor with limit: ", s.memoryLimit/(1024*1024), " MiB")
 		} else {
@@ -182,7 +192,13 @@ func goMemoryPressureCallback(status C.ulong) {
 				s.logger.Warn("memory pressure: ", level, ", usage: ", usage/(1024*1024), " MiB")
 			} else {
 				s.logger.Debug("memory pressure: ", level, ", usage: ", usage/(1024*1024), " MiB")
-				if s.adaptiveTimer != nil {
+				// Гасим поллер по «системе полегчало» только в limit-режиме, где
+				// он и был реакцией на системное давление. В useAvailable-режиме
+				// (iOS, per-process бюджет) системное «normal» не значит ничего:
+				// NE может стоять в 3MB от своего лимита при свободных гигабайтах
+				// устройства. Иначе первый же переход warn→normal убивал бы
+				// поллер, который мы теперь стартуем в Start().
+				if s.adaptiveTimer != nil && !s.useAvailable {
 					s.adaptiveTimer.stop()
 				}
 			}

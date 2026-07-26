@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/batch"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing-box/common/memlite"
 	"github.com/sagernet/sing/common/memory"
 	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/common/x/list"
@@ -440,7 +441,19 @@ func (s *StartedService) ReadStatus() *Status {
 }
 func (s *StartedService) readStatus() *Status {
 	var status Status
-	status.Memory = memory.Total()
+	// InHive 2026-07-26: этот метод сидит на секундном тике GetSystemInfoStream
+	// (hcore readStatus → ss.ReadStatus). memory.Total() без нативного пути =
+	// Inuse() = runtime.ReadMemStats = stop-the-world каждую секунду.
+	// ПОЧЕМУ ГЕЙТ darwin: нативный путь usageNative (task_info/phys_footprint,
+	// БЕЗ STW) в sing/common/memory существует только под darwin — там Total()
+	// оставляем (та же цифра, что раньше). На остальных ОС (Windows DLL,
+	// Android) Total() падал в Inuse() — заменяем на тождественный по цифре
+	// memlite.Inuse() без STW. Число не меняется ни на одной платформе.
+	if runtime.GOOS == "darwin" {
+		status.Memory = memory.Total()
+	} else {
+		status.Memory = memlite.Inuse()
+	}
 	status.Goroutines = int32(runtime.NumGoroutine())
 	s.serviceAccess.RLock()
 	nowService := s.instance

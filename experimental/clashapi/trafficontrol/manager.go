@@ -1,12 +1,12 @@
 package trafficontrol
 
 import (
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/common/compatible"
+	"github.com/sagernet/sing-box/common/memlite"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/json"
@@ -112,7 +112,11 @@ func (m *Manager) PushUploaded(outbound string, size int64) {
 func (m *Manager) PushDownloaded(outbound string, size int64) {
 	m.downloadTotal.Add(size)
 	v, _ := m.outboundDownloadTotal.LoadOrStore(outbound, &atomic.Int64{})
-	v.(*atomic.Int64).Add(100)
+	// InHive 2026-07-26: было Add(100) — константа вместо размера чтения (опечатка
+	// в нашем же per-outbound патче; PushUploaded строкой выше всегда был верным).
+	// Занижало «скачано через сервер X» примерно в 320 раз при 32KB-чтениях;
+	// цифра едет в UI через hcore OutboundUsage.
+	v.(*atomic.Int64).Add(size)
 }
 
 func (m *Manager) Total() (up int64, down int64) {
@@ -173,9 +177,12 @@ func (m *Manager) Snapshot() *Snapshot {
 		return true
 	})
 
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-	m.memory = memStats.StackInuse + memStats.HeapInuse + memStats.HeapIdle - memStats.HeapReleased
+	// InHive 2026-07-26: было runtime.ReadMemStats (stop-the-world) с ровно
+	// этой же формулой — а Snapshot() тикает 1/с на каждый websocket вкладки
+	// «Соединения», т.е. STW каждую секунду, пока вкладка открыта.
+	// memlite.Inuse — та же цифра (Stack+HeapInuse+HeapIdle−HeapReleased)
+	// через runtime/metrics, без STW.
+	m.memory = memlite.Inuse()
 
 	return &Snapshot{
 		Upload:      m.uploadTotal.Load(),

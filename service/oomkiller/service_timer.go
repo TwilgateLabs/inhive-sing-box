@@ -109,6 +109,7 @@ func (t *adaptiveTimer) poll() {
 
 	var remaining uint64
 	var triggered bool
+	var noBudgetData bool
 
 	if t.memoryLimit > 0 {
 		if usage >= t.memoryLimit {
@@ -119,10 +120,19 @@ func (t *adaptiveTimer) poll() {
 		}
 	} else if t.useAvailable {
 		available := memory.Available()
-		if available <= t.safetyMargin {
+		switch {
+		case available == 0:
+			// InHive 2026-07-26: 0 от os_proc_available_memory означает «процесс
+			// не под лимитом» (или символ не разрезолвился) — по документации
+			// Apple, НЕ «до лимита ноль байт». Трактовать 0 как исчерпанный
+			// бюджет = рвать все соединения на КАЖДОМ тике: страховка от
+			// обрыва превращается в источник обрывов. Данных нет — не
+			// триггерим и уходим в максимальный интервал.
+			noBudgetData = true
+		case available <= t.safetyMargin:
 			remaining = 0
 			triggered = true
-		} else {
+		default:
 			remaining = available - t.safetyMargin
 		}
 	} else {
@@ -136,7 +146,7 @@ func (t *adaptiveTimer) poll() {
 	}
 
 	var interval time.Duration
-	if triggered {
+	if triggered || noBudgetData {
 		interval = t.maxInterval
 	} else if delta <= 0 {
 		interval = t.maxInterval
