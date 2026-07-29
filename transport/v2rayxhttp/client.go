@@ -332,6 +332,15 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 			if xmuxClient2 != nil && xmuxClient2 != xmuxClient {
 				xmuxClient2.OpenUsage.Add(-1)
 			}
+			// InHive 2026-07-29 (фикс зомби-xmux, см. mux.go): закрытие
+			// проксируемого conn — ровно тот момент, когда retired-клиент, которого
+			// он удерживал (например, вечным download-GET'ом), мог освободиться.
+			// Подметаем сразу, не дожидаясь следующего диала — иначе последний
+			// зомби жил бы до следующей активности.
+			c.xmuxManager.SweepRetired()
+			if c.xmuxManager2 != nil {
+				c.xmuxManager2.SweepRetired()
+			}
 		},
 	}
 	// Ошибочный возврат ниже означает, что conn.onClose уже никогда не вызовется —
@@ -450,16 +459,29 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 					break
 				}
 			}
+			// InHive 2026-07-29 (фикс зомби-xmux, см. mux.go): считаем летящий POST
+			// на клиенте. OpenUsage ротационных клиентов не покрывает (он
+			// инкрементируется один раз на проксируемый conn для клиентов, выданных
+			// в НАЧАЛЕ DialContext), а закрывать транспорт под летящим POST'ом
+			// нельзя — обрыв POST'а превращается в Interrupt всей upload-половины.
+			// Инкремент ДО запуска горутины: между запуском и её первой инструкцией
+			// не должно быть окна, где POST есть, а счётчик ещё нулевой.
+			if dynamicXmuxClient != nil {
+				dynamicXmuxClient.inflightPosts.Add(1)
+			}
 			// hClient передаётся ПАРАМЕТРОМ (parity с Xray 26.7.11): горутина обязана
 			// работать с тем клиентом, который был актуален на момент её запуска, а
 			// не с тем, на который переменную успела перезаписать ротация.
-			go func(hClient DialerClient) {
+			go func(hClient DialerClient, hXmuxClient *XmuxClient) {
 				err := hClient.PostPacket(
 					ctx,
 					url.String(),
 					&buf.MultiBufferContainer{MultiBuffer: chunk},
 					int64(chunk.Len()),
 				)
+				if hXmuxClient != nil {
+					hXmuxClient.inflightPosts.Add(-1)
+				}
 				if c.uploadBudget != nil {
 					c.uploadBudget.Release(acquired)
 				}
@@ -477,7 +499,7 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 					recordUploadError(err)
 					uploadPipeReader.Interrupt()
 				}
-			}(dynamicHTTPClient)
+			}(dynamicHTTPClient, dynamicXmuxClient)
 			if _, ok := dynamicHTTPClient.(*DefaultDialerClient); ok {
 				// InHive 2026-07-19: возвращена безусловная семантика Xray
 				// (splithttp/dialer.go — `<-wroteRequest.Wait()`).

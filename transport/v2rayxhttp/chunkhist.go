@@ -70,11 +70,22 @@ var (
 // newXmuxClient() calls; liveClients is the current pool size. If connsCreated
 // stays at 1 while thousands of POSTs fly, everything is still funnelled into a
 // single h2 connection and the parity fix did not take effect.
+// retired/reaped (InHive 2026-07-29, фикс зомби-xmux — см. mux.go): до фикса
+// пруненные клиенты исчезали из учёта БЕССЛЕДНО (connsCreated=70 при live≤6 на
+// 255ч-снимке — 64 «куда-то делись»), и накопление зомби было невидимо. Теперь:
+// retired — gauge, сколько пруненных клиентов ещё удерживаются живыми
+// стримами/POST'ами (кандидаты в зомби, сумма по всем менеджерам); reaped —
+// кумулятивно, сколько пруненных клиентов реально закрыто reaper'ом (Reset не
+// считается — это другой механизм). Верификация фикса на живом устройстве без
+// 255ч-repro: reaped растёт вместе с connsCreated, retired остаётся малым и
+// возвращается к ~0; рост retired без роста reaped = снова копим зомби.
 var (
 	xmuxConcurrency  atomic.Int64
 	xmuxConnections  atomic.Int64
 	xmuxConnsCreated atomic.Int64
 	xmuxLiveClients  atomic.Int64
+	xmuxRetiredGauge atomic.Int64
+	xmuxReaped       atomic.Int64
 )
 
 func recordXmuxConfig(concurrency, connections int32) {
@@ -91,12 +102,25 @@ func recordXmuxPool(live int) {
 	xmuxLiveClients.Store(int64(live))
 }
 
+// recordXmuxRetired двигает gauge ДЕЛЬТОЙ (+1 retire, -1 sweep, -len(retired)
+// на Reset): менеджеров несколько (up/down на каждый Client), Store последнего
+// звонившего затирал бы чужие значения — Add суммирует корректно.
+func recordXmuxRetired(delta int) {
+	xmuxRetiredGauge.Add(int64(delta))
+}
+
+func recordXmuxReaped(n int) {
+	xmuxReaped.Add(int64(n))
+}
+
 // XmuxState returns the current xmux picture for the diag log.
 func XmuxState() string {
 	return "xmux[concurrency=" + strconv.FormatInt(xmuxConcurrency.Load(), 10) +
 		" connections=" + strconv.FormatInt(xmuxConnections.Load(), 10) +
 		" connsCreated=" + strconv.FormatInt(xmuxConnsCreated.Load(), 10) +
-		" live=" + strconv.FormatInt(xmuxLiveClients.Load(), 10) + "]"
+		" live=" + strconv.FormatInt(xmuxLiveClients.Load(), 10) +
+		" retired=" + strconv.FormatInt(xmuxRetiredGauge.Load(), 10) +
+		" reaped=" + strconv.FormatInt(xmuxReaped.Load(), 10) + "]"
 }
 
 func recordPostChunk(n int) {
