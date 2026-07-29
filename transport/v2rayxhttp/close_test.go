@@ -289,6 +289,17 @@ func TestDefaultDialerClientCloseH1DrainsUploadPool(t *testing.T) {
 		t.Fatalf("getBaseRequestURL: %v", err)
 	}
 
+	// Контракт uploadRawPool детерминирован только БЕЗ -race: под гонко-детектором
+	// sync.Pool.Put дропает элемент с вероятностью 1/4 (runtime, sync/pool.go),
+	// поэтому и reuse (второй POST берёт из пула), и drain на Close (дропнутые
+	// соединения оказываются вне пула и Close их не видит) становятся
+	// недетерминированными. Это артефакт гонко-детектора, а не наш баг — под
+	// -race проверку семантики пула пропускаем, оставляя её для обычного прогона
+	// (CI гоняет пакет и без -race). См. race_on_test.go / race_off_test.go.
+	if raceEnabled {
+		t.Skip("uploadRawPool reuse/drain assertions are nondeterministic under -race (sync.Pool.Put drops 1/4)")
+	}
+
 	postOnce(t, dc, requestURL.String())
 	postOnce(t, dc, requestURL.String())
 	if got := dialer.dialCount(); got != 1 {
