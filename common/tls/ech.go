@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 	aTLS "github.com/sagernet/sing/common/tls"
 	"github.com/sagernet/sing/service"
 
@@ -24,7 +25,7 @@ import (
 	"golang.org/x/crypto/cryptobyte"
 )
 
-func parseECHClientConfig(ctx context.Context, clientConfig ECHCapableConfig, options option.OutboundTLSOptions) (Config, error) {
+func parseECHClientConfig(ctx context.Context, logger logger.ContextLogger, serverName string, clientConfig ECHCapableConfig, options option.OutboundTLSOptions) (Config, error) {
 	var echConfig []byte
 	if len(options.ECH.Config) > 0 {
 		echConfig = []byte(strings.Join(options.ECH.Config, "\n"))
@@ -51,6 +52,8 @@ func parseECHClientConfig(ctx context.Context, clientConfig ECHCapableConfig, op
 			ECHCapableConfig: clientConfig,
 			dnsRouter:        service.FromContext[adapter.DNSRouter](ctx),
 			queryServerName:  options.ECH.QueryServerName,
+			logger:           logger,
+			serverName:       serverName,
 		}, nil
 	}
 }
@@ -113,6 +116,49 @@ type ECHClientConfig struct {
 	queryServerName string
 	lastTTL         time.Duration
 	lastUpdate      time.Time
+
+	// InHive: only for the honest warning in STDConfig (see there).
+	logger       logger.ContextLogger
+	serverName   string
+	warnQUICOnce sync.Once
+}
+
+// STDConfig — InHive: honest warning about ECH silently not applying.
+//
+// This type exists ONLY for the DNS-fetched ECH flow: parseECHClientConfig
+// returns it when the config carries no inline ECHConfigList, and the list is
+// fetched from an HTTPS-RR inside ClientHandshake. An inline list never reaches
+// here — that path returns the plain client config with the list already set.
+//
+// Anything that consumes TLS through STDConfig() never calls our ClientHandshake
+// and therefore never triggers that fetch: it takes the *tls.Config and runs the
+// handshake itself. In this build that means every QUIC consumer — hysteria2 and
+// tuic (via sing-quic quic.go), plus the DoQ/DoH3 resolvers (dns/transport/quic).
+// So on those the fetch never happens, EncryptedClientHelloConfigList stays
+// empty, and ECH is silently OFF while the user believes the SNI is hidden.
+//
+// A silent privacy downgrade is exactly what must not stay silent (Stability
+// bar), so we say it once per config and return the underlying std config
+// unchanged — degrading loudly, never failing the connection. Gate is
+// "STDConfig was called", not a protocol list: it is the precise property that
+// causes the miss, so a future QUIC-ish consumer is covered automatically and
+// no TCP protocol is ever warned at by accident.
+//
+// NOT covered here: making it actually work (eager fetch). STDConfig has no
+// context and no deadline, and is called on the construction path, so a blocking
+// DNS round-trip here would stall engine start on a hostile network. Deliberately
+// left to the caller-side design; see the ECH note in CHANGELOG.
+func (s *ECHClientConfig) STDConfig() (*STDConfig, error) {
+	s.warnQUICOnce.Do(func() {
+		if s.logger != nil {
+			s.logger.Warn("ECH is enabled for ", s.serverName,
+				" but its config list is fetched over DNS (no inline ech= blob), and this",
+				" connection type (QUIC: hysteria2/tuic/DoQ/DoH3) cannot perform that fetch",
+				" — ECH is NOT active here and the SNI is sent in plaintext. Use a server",
+				" that ships an inline ECH config, or a TCP-based protocol, if you need ECH.")
+		}
+	})
+	return s.ECHCapableConfig.STDConfig()
 }
 
 func (s *ECHClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (aTLS.Conn, error) {

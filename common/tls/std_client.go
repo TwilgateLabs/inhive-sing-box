@@ -205,7 +205,7 @@ func NewSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 	var config Config = &STDClientConfig{ctx, &tlsConfig, options.Fragment, time.Duration(options.FragmentFallbackDelay), options.RecordFragment}
 	if options.ECH != nil && options.ECH.Enabled {
 		var err error
-		config, err = parseECHClientConfig(ctx, config.(ECHCapableConfig), options)
+		config, err = parseECHClientConfig(ctx, logger, serverName, config.(ECHCapableConfig), options)
 		if err != nil {
 			return nil, err
 		}

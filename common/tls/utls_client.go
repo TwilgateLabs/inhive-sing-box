@@ -264,7 +264,7 @@ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 		if options.Reality != nil && options.Reality.Enabled {
 			return nil, E.New("Reality is conflict with ECH")
 		}
-		config, err = parseECHClientConfig(ctx, config.(ECHCapableConfig), options)
+		config, err = parseECHClientConfig(ctx, logger, serverName, config.(ECHCapableConfig), options)
 		if err != nil {
 			return nil, err
 		}

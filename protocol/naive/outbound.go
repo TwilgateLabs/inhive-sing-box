@@ -84,6 +84,19 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.TLS.Reality != nil && options.TLS.Reality.Enabled {
 		return nil, E.New("reality is not supported on naive outbound")
 	}
+	// InHive: naive terminates TLS inside cronet (Chromium), which builds its own
+	// ClientHello — our tls_tricks never touch that path, so MixedCaseSNI is a
+	// no-op here rather than an error. Everything above is rejected because it
+	// would change the wire; this one silently would NOT, which is worse for the
+	// user: they enable an anti-DPI trick, see no error, and assume it is on.
+	// Warn instead of failing — the node still works, only the trick does not,
+	// and a Universal Client must not refuse a foreign subscription over it.
+	// Warned here rather than in the parser because every ingest path (share
+	// link, Clash, sing-box JSON) converges on this constructor.
+	if options.TLS.TLSTricks != nil && options.TLS.TLSTricks.MixedCaseSNI {
+		logger.Warn("tls-trick mixed-case SNI ignored on naive outbound: TLS is ",
+			"handled by the embedded cronet engine, which builds its own ClientHello")
+	}
 
 	serverAddress := options.ServerOptions.Build()
 
