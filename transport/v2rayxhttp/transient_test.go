@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -30,11 +31,11 @@ func TestTransientClientPoolIsolation(t *testing.T) {
 	serverAddr := M.ParseSocksaddr("example.com:443")
 	tlsCfg := plainTLS(t)
 
-	live, err := NewClient(context.Background(), probeStubDialer{}, serverAddr, opts, tlsCfg)
+	live, err := NewClient(context.Background(), logger.NOP(), probeStubDialer{}, serverAddr, opts, tlsCfg)
 	if err != nil {
 		t.Fatalf("build live client: %v", err)
 	}
-	transient, err := NewClient(context.Background(), probeStubDialer{}, serverAddr, opts, tlsCfg)
+	transient, err := NewClient(context.Background(), logger.NOP(), probeStubDialer{}, serverAddr, opts, tlsCfg)
 	if err != nil {
 		t.Fatalf("build transient client: %v", err)
 	}

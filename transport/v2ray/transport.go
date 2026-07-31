@@ -47,7 +47,12 @@ func NewServerTransport(ctx context.Context, logger logger.ContextLogger, option
 	}
 }
 
-func NewClientTransport(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayTransportOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error) {
+// InHive 2026-07-31: clientLogger добавлен ради xhttp-детектора глухого
+// download (transport/v2rayxhttp/deafwatch.go) — клиентским транспортам
+// логгер раньше не передавался вовсе (в отличие от серверных), и целый класс
+// отказов «сессия висит-но-жива» был неозвучиваем. Прокидывается только в
+// xhttp; остальные транспорты не трогаем (сигнатуры их NewClient прежние).
+func NewClientTransport(ctx context.Context, clientLogger logger.ContextLogger, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayTransportOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error) {
 	if options.Type == "" {
 		return nil, nil
 	}
@@ -67,7 +72,7 @@ func NewClientTransport(ctx context.Context, dialer N.Dialer, serverAddr M.Socks
 	case C.V2RayTransportTypeHTTPUpgrade:
 		return v2rayhttpupgrade.NewClient(ctx, dialer, serverAddr, options.HTTPUpgradeOptions, tlsConfig)
 	case C.V2RayTransportTypeXHTTP:
-		return xhttp.NewClient(ctx, dialer, serverAddr, options.XHTTPOptions, tlsConfig)
+		return xhttp.NewClient(ctx, clientLogger, dialer, serverAddr, options.XHTTPOptions, tlsConfig)
 	default:
 		return nil, E.New("unknown client transport type: " + options.Type)
 	}

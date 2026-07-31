@@ -79,6 +79,12 @@ var (
 // считается — это другой механизм). Верификация фикса на живом устройстве без
 // 255ч-repro: reaped растёт вместе с connsCreated, retired остаётся малым и
 // возвращается к ~0; рост retired без роста reaped = снова копим зомби.
+// silentdl (InHive 2026-07-31, детектор глухого download — см. deafwatch.go):
+// кумулятивно, сколько раз детектор поймал состояние «download молчит
+// >deafSilenceThreshold при активном uplink» (один инкремент на эпизод, не на
+// тик). Раньше это состояние было НЕВИДИМО (лог пуст, сессия висит-но-жива);
+// теперь rост silentdl на устройстве = подтверждение CDN idle-cut без
+// device-repro.
 var (
 	xmuxConcurrency  atomic.Int64
 	xmuxConnections  atomic.Int64
@@ -86,7 +92,12 @@ var (
 	xmuxLiveClients  atomic.Int64
 	xmuxRetiredGauge atomic.Int64
 	xmuxReaped       atomic.Int64
+	xhttpSilentDL    atomic.Int64
 )
+
+func recordSilentDownload() {
+	xhttpSilentDL.Add(1)
+}
 
 func recordXmuxConfig(concurrency, connections int32) {
 	xmuxConcurrency.Store(int64(concurrency))
@@ -120,7 +131,8 @@ func XmuxState() string {
 		" connsCreated=" + strconv.FormatInt(xmuxConnsCreated.Load(), 10) +
 		" live=" + strconv.FormatInt(xmuxLiveClients.Load(), 10) +
 		" retired=" + strconv.FormatInt(xmuxRetiredGauge.Load(), 10) +
-		" reaped=" + strconv.FormatInt(xmuxReaped.Load(), 10) + "]"
+		" reaped=" + strconv.FormatInt(xmuxReaped.Load(), 10) +
+		" silentdl=" + strconv.FormatInt(xhttpSilentDL.Load(), 10) + "]"
 }
 
 func recordPostChunk(n int) {

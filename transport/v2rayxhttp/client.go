@@ -38,9 +38,15 @@ import (
 )
 
 type Client struct {
-	ctx            context.Context
-	options        *option.V2RayXHTTPOptions
-	mode           string // resolved dial mode ("auto" is resolved at construction, per Xray semantics)
+	ctx     context.Context
+	options *option.V2RayXHTTPOptions
+	// logger — user-facing канал (box.log → gRPC log-стрим → вкладка «Логи»
+	// клиента), тот же, куда route/conn.go пишет `connection download ... closed`.
+	// InHive 2026-07-31: прокидывается через v2ray.NewClientTransport от outbound'а
+	// ради детектора глухого download (deafwatch.go) — до этого у client-транспорта
+	// логгера не было вовсе и весь этот класс отказов был неозвучиваем.
+	logger logger.ContextLogger
+	mode   string // resolved dial mode ("auto" is resolved at construction, per Xray semantics)
 	getRequestURL  func(sessionId string) url.URL
 	getRequestURL2 func(sessionId string) url.URL
 	getHTTPClient  func() (DialerClient, *XmuxClient)
@@ -79,7 +85,10 @@ type Client struct {
 	streamSlots chan struct{}
 }
 
-func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayXHTTPOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error) {
+// InHive 2026-07-31: ctxLogger добавлен ради детектора глухого download
+// (deafwatch.go) — см. комментарий у поля Client.logger. nil допустим
+// (детектор тогда только считает, не логирует).
+func NewClient(ctx context.Context, ctxLogger logger.ContextLogger, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayXHTTPOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error) {
 	// Resolve the dial mode up front. Xray treats an empty mode and mode:"auto"
 	// identically (GetNormalizedMode), and our subscription parser (xray2sing)
 	// defaults xhttp mode to "auto" — so most real configs arrive as "auto".
@@ -168,6 +177,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	client := &Client{
 		ctx:            ctx,
 		options:        &options,
+		logger:         ctxLogger,
 		mode:           resolvedMode,
 		getHTTPClient:  getHTTPClient,
 		getHTTPClient2: getHTTPClient2,
@@ -398,6 +408,24 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 		uploadPipeWriter,
 		maxUploadSize,
 	}
+	// InHive 2026-07-31: детектор «глухого download» — ТОЛЬКО packet-up (гейт по
+	// resolved mode; stream-one/stream-up вернулись выше и сюда не доходят, гейт
+	// страхует от экзотических явных mode, проваливающихся в POST-цикл). Чистый
+	// наблюдатель: лог + счётчик, НИЧЕГО не рвёт. Дизайн, пороги и обоснование —
+	// deafwatch.go. Для не-packet-up dw == nil, все вызовы — no-op (nil-safe).
+	var dw *deafWatch
+	if mode == "packet-up" {
+		session := sessionIdUuid.String()
+		if len(session) > 8 {
+			session = session[:8]
+		}
+		dw = newDeafWatch(c.logger, session)
+		// Реальные байты вниз двигают lastDownlink (h2 PING/заголовки не считаются).
+		conn.reader = &deafReader{ReadCloser: conn.reader, watch: dw}
+		// Watchdog-тикер умирает вместе с сессией: uploadCtx отменяется в
+		// conn.onClose и на всех ошибочных путях DialContext (defer выше).
+		go dw.run(uploadCtx)
+	}
 	go func() {
 		var seq int64
 		var lastWrite time.Time
@@ -486,6 +514,13 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 					c.uploadBudget.Release(acquired)
 				}
 				wroteRequest.Close()
+				if err == nil {
+					// InHive 2026-07-31: forward-progress аплинка для детектора глухого
+					// download — PostPacket вернул nil, т.е. сервер ответил 200 (обе
+					// ветки dialer.go проверяют статус). «Вызвали Write» прогрессом НЕ
+					// считается — зависший POST метку не двигает.
+					dw.noteUploadProgress()
+				}
 				if err != nil {
 					// InHive 2026-07-19: до этой строки отказ POST'а НИГДЕ не
 					// фиксировался — Interrupt() молча убивал upload-половину, а

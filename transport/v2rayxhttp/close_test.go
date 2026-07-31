@@ -200,7 +200,7 @@ func TestClientCloseResetsXmuxPoolH2(t *testing.T) {
 		},
 	}
 
-	transport, err := NewClient(context.Background(), dialer, dest, options, tlsConfig)
+	transport, err := NewClient(context.Background(), logger.NOP(), dialer, dest, options, tlsConfig)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

@@ -65,7 +65,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		}
 	}
 	if options.Transport != nil {
-		outbound.transport, err = v2ray.NewClientTransport(ctx, outbound.dialer, outbound.serverAddr, common.PtrValueOrDefault(options.Transport), outbound.tlsConfig)
+		outbound.transport, err = v2ray.NewClientTransport(ctx, logger, outbound.dialer, outbound.serverAddr, common.PtrValueOrDefault(options.Transport), outbound.tlsConfig)
 		if err != nil {
 			return nil, E.Cause(err, "create client transport: ", options.Transport.Type)
 		}
@@ -153,7 +153,7 @@ func (h *Outbound) DialProbeFresh(ctx context.Context, network string, destinati
 	if h.transport == nil {
 		return (*vmessDialer)(h).DialContext(ctx, network, destination)
 	}
-	freshTransport, err := v2ray.NewClientTransport(ctx, h.dialer, h.serverAddr, common.PtrValueOrDefault(h.transportOptions), h.tlsConfig)
+	freshTransport, err := v2ray.NewClientTransport(ctx, h.logger, h.dialer, h.serverAddr, common.PtrValueOrDefault(h.transportOptions), h.tlsConfig)
 	if err != nil {
 		return nil, err
 	}
