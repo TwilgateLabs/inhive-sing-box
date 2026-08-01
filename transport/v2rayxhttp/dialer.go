@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sagernet/quic-go/http3"
 	common "github.com/sagernet/sing-box/common/xray"
@@ -278,13 +279,26 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 // сессии: приём падал с `context canceled` / `read/write on closed pipe`, а
 // upload-горутина продолжала жить — сессия наполовину мертва, порядок seq
 // нарушен, сервер встаёт головой очереди.
+// InHive 2026-08-01: НАМЕРЕННОЕ расхождение с апстримом (упомянуто в
+// core/upstream.toml). У Xray поле — голое встроенное `io.ReadCloser`:
+// Set() пишет его из горутины ответа OpenStream, а Read()/Close() читают из
+// горутины читателя БЕЗ синхронизации. Интерфейсное значение — это два
+// машинных слова, так что это не «ложный шум детектора», а настоящий torn
+// read: читатель может увидеть type-слово от нового значения с data-словом
+// от старого. Подтверждено go test -race (гонка воспроизводится и с
+// downFrame:false — к фреймингу отношения не имеет, это общий reader всех
+// режимов xhttp). Чиним atomic.Pointer'ом: Set атомарно публикует, горячий
+// путь Read платит один атомарный Load (обычная загрузка + барьер
+// компилятора — деградации нет). Семантика Wait/Close сохранена бит-в-бит,
+// включая recover на двойное close(Wait) при гонке Set против Close.
+// У апстрима гонка тоже есть — кандидат в отдельный PR к XTLS.
 type WaitReadCloser struct {
 	Wait chan struct{}
-	io.ReadCloser
+	rc   atomic.Pointer[io.ReadCloser]
 }
 
 func (w *WaitReadCloser) Set(rc io.ReadCloser) {
-	w.ReadCloser = rc
+	w.rc.Store(&rc)
 	defer func() {
 		if recover() != nil {
 			rc.Close()
@@ -294,21 +308,25 @@ func (w *WaitReadCloser) Set(rc io.ReadCloser) {
 }
 
 func (w *WaitReadCloser) Read(b []byte) (int, error) {
-	if w.ReadCloser == nil {
-		if <-w.Wait; w.ReadCloser == nil {
+	rc := w.rc.Load()
+	if rc == nil {
+		<-w.Wait
+		if rc = w.rc.Load(); rc == nil {
 			return 0, io.ErrClosedPipe
 		}
 	}
-	return w.ReadCloser.Read(b)
+	return (*rc).Read(b)
 }
 
 func (w *WaitReadCloser) Close() error {
-	if w.ReadCloser != nil {
-		return w.ReadCloser.Close()
+	if rc := w.rc.Load(); rc != nil {
+		return (*rc).Close()
 	}
 	defer func() {
-		if recover() != nil && w.ReadCloser != nil {
-			w.ReadCloser.Close()
+		if recover() != nil {
+			if rc := w.rc.Load(); rc != nil {
+				(*rc).Close()
+			}
 		}
 	}()
 	close(w.Wait)

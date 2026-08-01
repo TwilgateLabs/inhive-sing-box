@@ -62,30 +62,13 @@ func (s *capturingServer) lastQuery(t *testing.T) url.Values {
 	return s.queries[len(s.queries)-1]
 }
 
-// skipIfRaceWaitReadCloser — любой тест, который РЕАЛЬНО читает из стрима
-// OpenStream, под -race спотыкается о ПРЕДСУЩЕСТВУЮЩУЮ гонку в WaitReadCloser
-// (dialer.go, verbatim из апстрима Xray splithttp): Read() читает поле
-// w.ReadCloser без синхронизации, пока горутина ответа присваивает его в Set().
-//
-// К фреймингу отношения не имеет — проверено пробником с downFrame:false, гонка
-// та же на нетронутом пути; до этих тестов её просто некому было вскрыть (ни
-// один тест пакета не читал из OpenStream). Чинить надо в самом WaitReadCloser
-// отдельным изменением: это горячий путь ВСЕХ режимов xhttp и расхождение с
-// апстримом. Глушить гонку правкой тестов — нельзя, поэтому здесь честный skip
-// с указанием причины, а не обход.
-//
-// CI гоняет тесты без -race (.github/workflows/build.yml), так что покрытие
-// negotiation в CI полное.
-func skipIfRaceWaitReadCloser(t *testing.T) {
-	t.Helper()
-	if raceEnabled {
-		t.Skip("pre-existing WaitReadCloser data race (upstream Xray parity) — см. комментарий у skipIfRaceWaitReadCloser")
-	}
-}
+// 2026-08-01: здесь жил skipIfRaceWaitReadCloser — гонка в WaitReadCloser
+// (verbatim из Xray splithttp) чинилась в самом dialer.go, а не правкой
+// тестов. Починена (atomic.Pointer, см. комментарий у WaitReadCloser),
+// пакет проходит -race без skip'ов на этот счёт.
 
 func newTestDialerClient(t *testing.T, httpServer *httptest.Server, options option.V2RayXHTTPBaseOptions) *DefaultDialerClient {
 	t.Helper()
-	skipIfRaceWaitReadCloser(t)
 	return &DefaultDialerClient{
 		options:       &options,
 		client:        httpServer.Client(),
@@ -251,7 +234,6 @@ func (h collectingHandler) NewConnectionEx(ctx context.Context, conn net.Conn, s
 // реальному HTTP: negotiation проходит, данные доезжают в целости, а
 // keepalive-записи, вкраплённые сервером в тишину, читателем не видны.
 func TestDownFrameClientServerLoopback(t *testing.T) {
-	skipIfRaceWaitReadCloser(t)
 	handler := collectingHandler{conns: make(chan net.Conn, 1)}
 	xhttpServer, err := NewServer(context.Background(), logger.NOP(), option.V2RayXHTTPOptions{
 		V2RayXHTTPBaseOptions: option.V2RayXHTTPBaseOptions{
