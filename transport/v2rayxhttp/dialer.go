@@ -130,6 +130,23 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 	if body != nil && !c.options.NoGRPCHeader {
 		req.Header.Set("Content-Type", "application/grpc")
 	}
+	// InHive 2026-08-01: negotiation фрейминга stream-down (Xray PR #6562).
+	//
+	// Маркер кладём ТОЛЬКО на download-GET и ТОЛЬКО если клиент явно включил
+	// downFrame. Порядок как в PR B: сначала считается padding (GetRequestHeader
+	// выше — аналог FillStreamRequest), потом дописывается маркер, поэтому
+	// длина x_padding не съезжает. Ключ по умолчанию "x_df" — это ЧАСТЬ ПРОВОДА,
+	// совпадает с апстримом побайтово.
+	//
+	// GET здесь = download-половина packet-up И stream-up (у обоих body == nil);
+	// stream-one идёт с телом → method = uplink method → маркера не получает.
+	// Ровно та же граница, что в PR B (`method == "GET" && cfg.DownFrame`).
+	downFrameRequested := method == http.MethodGet && c.options.DownFrame
+	if downFrameRequested {
+		query := req.URL.Query()
+		query.Set(c.options.GetNormalizedDownFrameKey(), "1")
+		req.URL.RawQuery = query.Encode()
+	}
 	wrc = &WaitReadCloser{Wait: make(chan struct{})}
 	go func() {
 		resp, err := c.client.Do(req)
@@ -145,6 +162,13 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close() // if it is called immediately, the upload will be interrupted also
 			wrc.Close()
+			return
+		}
+		// Стриппер включаем ТОЛЬКО если сами просили И сервер подтвердил
+		// заголовком. Без подтверждения (старый/непатченый сервер, CDN срезал
+		// заголовок) читаем сырой поток — то есть ровно сегодняшнее поведение.
+		if downFrameRequested && resp.Header.Get(downFrameConfirmHeader) == "1" {
+			wrc.(*WaitReadCloser).Set(newFramedReader(resp.Body))
 			return
 		}
 		wrc.(*WaitReadCloser).Set(resp.Body)

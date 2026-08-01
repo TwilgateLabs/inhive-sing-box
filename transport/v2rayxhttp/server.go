@@ -3,6 +3,7 @@ package xhttp
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"io"
 	"net"
 	"net/http"
@@ -249,6 +250,21 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			// magic header to make the HTTP middle box consider this as SSE to disable buffer
 			writer.Header().Set("Content-Type", "text/event-stream")
 		}
+		// InHive 2026-08-01: серверная половина фрейминга stream-down (Xray PR
+		// #6562). Симметрия с клиентом (dialer.go) — наши прод-сервера сейчас
+		// Xray, но без этого наш core-сервер нельзя ни протестировать против
+		// нашего же клиента, ни поставить как сервер вообще.
+		//
+		// Фреймим, только если клиент прислал маркер И оператор включил
+		// scStreamDownServerSecs. stream-one (сессии нет) не фреймится никогда.
+		scStreamDownServerSecs := s.options.GetNormalizedScStreamDownServerSecs()
+		downFrameRequested := request.URL.Query().Get(s.options.GetNormalizedDownFrameKey()) != ""
+		framingNegotiated := sessionId != "" && downFrameRequested && scStreamDownServerSecs.To > 0
+		if framingNegotiated {
+			// Подтверждаем ДО начала тела: старый клиент маркер не слал, старый
+			// сервер заголовок не ставит — в обоих случаях поток остаётся сырым.
+			writer.Header().Set(downFrameConfirmHeader, "1")
+		}
 		writer.WriteHeader(http.StatusOK)
 		writer.(http.Flusher).Flush()
 		httpSC := &httpServerConn{
@@ -264,6 +280,36 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		if sessionId != "" { // if not stream-one
 			conn.reader = currentSession.uploadQueue
+		}
+		if framingNegotiated {
+			// Каждый проксируемый Write становится data-записью, а пока
+			// download-половина молчит (например, идёт bulk-аплоад) капаем
+			// padding-записи, чтобы не сработал idle-таймаут фронтящего CDN.
+			framer := newDownFramer(httpSC)
+			conn.writer = framer
+			go func() {
+				for {
+					interval := time.Duration(scStreamDownServerSecs.Rand()) * time.Second
+					if interval <= 0 {
+						return
+					}
+					timer := time.NewTimer(interval)
+					select {
+					case <-request.Context().Done():
+						timer.Stop()
+						return
+					case <-httpSC.Wait():
+						timer.Stop()
+						return
+					case <-timer.C:
+					}
+					padding := make([]byte, int(s.options.GetNormalizedXPaddingBytes().Rand()))
+					_, _ = crand.Read(padding)
+					if _, err := framer.WritePadding(interval, padding); err != nil {
+						return
+					}
+				}
+			}()
 		}
 		s.handler.NewConnectionEx(request.Context(), &conn, sHttp.SourceAddress(request), M.Socksaddr{}, func(it error) {})
 		// "A ResponseWriter may not be used after [Handler.ServeHTTP] has returned."

@@ -194,6 +194,25 @@ type V2RayXHTTPBaseOptions struct {
 	XPaddingKey       string `json:"xPaddingKey,omitempty"`
 	XPaddingHeader    string `json:"xPaddingHeader,omitempty"`
 	XPaddingPlacement string `json:"xPaddingPlacement,omitempty"`
+
+	// --- InHive: stream-down keepalive framing (XTLS/Xray-core PR #6562, "Variant 2").
+	// JSON-имена совпадают с полями proto из PR B (downFrame / downFrameKey /
+	// scStreamDownServerSecs), поэтому один и тот же `extra`-блок подписки
+	// понимают и наше ядро, и патченый Xray. Все три ВЫКЛЮЧЕНЫ по умолчанию —
+	// без явного opt-in обеих сторон провод побайтово прежний.
+
+	// DownFrame — КЛИЕНТСКИЙ переключатель: слать ли на download-GET маркер
+	// поддержки фрейминга. Стриппер включается только после подтверждающего
+	// заголовка X-Down-Frame от сервера (см. transport/v2rayxhttp/dialer.go).
+	DownFrame bool `json:"downFrame,omitempty"`
+
+	// DownFrameKey — query-ключ маркера. Пусто => "x_df".
+	DownFrameKey string `json:"downFrameKey,omitempty"`
+
+	// ScStreamDownServerSecs — СЕРВЕРНЫЙ интервал keepalive-записей на
+	// stream-down. В отличие от scStreamUpServerSecs (дефолт 20-80с) дефолт
+	// здесь 0 = выключено.
+	ScStreamDownServerSecs *Xbadoption.Range `json:"scStreamDownServerSecs,omitempty"`
 }
 
 // XHTTP placement / padding-method constants (verbatim upstream Xray splithttp string values).
@@ -775,6 +794,27 @@ func (c *V2RayXHTTPBaseOptions) GetNormalizedScStreamUpServerSecs() Xbadoption.R
 		}
 	}
 	return *c.ScStreamUpServerSecs
+}
+
+// GetNormalizedScStreamDownServerSecs — серверный интервал keepalive для
+// stream-down ответа. В отличие от scStreamUpServerSecs (дефолт 20-80с) здесь
+// дефолт 0 = выключено, поэтому провод не меняется, пока оператор явно не
+// включил. Parity с Xray PR #6562 (GetNormalizedScStreamDownServerSecs).
+func (c *V2RayXHTTPBaseOptions) GetNormalizedScStreamDownServerSecs() Xbadoption.Range {
+	if c.ScStreamDownServerSecs == nil {
+		return Xbadoption.Range{From: 0, To: 0}
+	}
+	return *c.ScStreamDownServerSecs
+}
+
+// GetNormalizedDownFrameKey — query-ключ, которым клиент объявляет поддержку
+// stream-down фрейминга. Дефолт "x_df" (Xray PR #6562). Значение обязано
+// совпадать с апстримом: это часть провода.
+func (c *V2RayXHTTPBaseOptions) GetNormalizedDownFrameKey() string {
+	if c.DownFrameKey != "" {
+		return c.DownFrameKey
+	}
+	return "x_df"
 }
 
 type V2RayXHTTPXmuxOptions struct {
