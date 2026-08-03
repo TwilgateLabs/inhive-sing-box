@@ -145,7 +145,7 @@ func TestDefaultDialerClientCloseH2(t *testing.T) {
 	baseOptions := &option.V2RayXHTTPBaseOptions{Path: "/upload"}
 	tlsConfig := insecureH2TLS(t)
 
-	dc := createHTTPClient(dest, dialer, baseOptions, tlsConfig)
+	dc := createHTTPClient(dest, dialer, baseOptions, tlsConfig, nil)
 	ddc, isDefault := dc.(*DefaultDialerClient)
 	if !isDefault {
 		t.Fatalf("createHTTPClient returned %T, want *DefaultDialerClient", dc)
@@ -279,7 +279,7 @@ func TestDefaultDialerClientCloseH1DrainsUploadPool(t *testing.T) {
 	dialer := &trackingDialer{}
 	baseOptions := &option.V2RayXHTTPBaseOptions{Path: "/upload"}
 
-	dc := createHTTPClient(dest, dialer, baseOptions, nil) // tls=nil → httpVersion "1.1"
+	dc := createHTTPClient(dest, dialer, baseOptions, nil, nil) // tls=nil → httpVersion "1.1"
 	ddc := dc.(*DefaultDialerClient)
 	if ddc.httpVersion != "1.1" {
 		t.Fatalf("httpVersion = %q, want \"1.1\"", ddc.httpVersion)

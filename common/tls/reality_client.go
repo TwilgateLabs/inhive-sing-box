@@ -44,6 +44,15 @@ import (
 
 var _ ConfigCompat = (*RealityClientConfig)(nil)
 
+// Версия клиента, объявляемая REALITY-серверу в SessionId[0:3]. Совпадает с
+// Xray-эталоном (core/upstream.toml, запись `xhttp`: ref = v26.7.11) — сервер
+// сверяет её с minClientVer/maxClientVer. Подробности — в ClientHandshake.
+const (
+	realityClientVerX = 26
+	realityClientVerY = 7
+	realityClientVerZ = 11
+)
+
 type RealityClientConfig struct {
 	ctx       context.Context
 	uClient   *UTLSClientConfig
@@ -168,9 +177,25 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowTime.Unix()))
 
-	hello.SessionId[0] = 1
-	hello.SessionId[1] = 8
-	hello.SessionId[2] = 1
+	// InHive 2026-08-03: версия КЛИЕНТА, которую REALITY-сервер читает из
+	// SessionId[0:3] и сверяет с `minClientVer`/`maxClientVer`
+	// (XTLS/REALITY tls.go: `Value(ClientVer[:]...) >= Value(MinClientVer...)`).
+	//
+	// Апстрим sing-box шлёт здесь 1.8.1 — застывший номер, не связанный ни с
+	// одной живой версией. Xray-клиент шлёт СВОЮ core-версию (26.x), поэтому
+	// любой сервер с выставленным `minClientVer` пускает Xray/Happ/v2rayNG и
+	// молча роняет нас: auth не проходит → сервер отдаёт настоящий сертификат
+	// dest → у нас `reality verification failed` (а на xhttp-пути и вовсе немой
+	// таймаут). Замерено на внешней подписке 2026-08-03, чередованием версий
+	// в одном сеансе, 3/3 воспроизводимо:
+	//     ver=1.8.1   → VERIFIED=false   (сервер отдал реальный серт dest)
+	//     ver=26.7.11 → VERIFIED=true
+	//
+	// Держим ровно версию Xray-эталона из core/upstream.toml (запись `xhttp`,
+	// ref = v26.7.11) — двигать её ВМЕСТЕ с бампом эталона, не отдельно.
+	hello.SessionId[0] = realityClientVerX
+	hello.SessionId[1] = realityClientVerY
+	hello.SessionId[2] = realityClientVerZ
 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
 	copy(hello.SessionId[8:], e.shortID[:])
 	if debug.Enabled {

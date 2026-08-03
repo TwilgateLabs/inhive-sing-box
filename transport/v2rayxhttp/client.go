@@ -117,7 +117,7 @@ func NewClient(ctx context.Context, ctxLogger logger.ContextLogger, dialer N.Dia
 		applyXmuxDefaults(&xmuxOptions)
 	}
 	xmuxManager := NewXmuxManager(xmuxOptions, func() XmuxConn {
-		return createHTTPClient(dest, dialer, &options.V2RayXHTTPBaseOptions, tlsConfig)
+		return createHTTPClient(dest, dialer, &options.V2RayXHTTPBaseOptions, tlsConfig, ctxLogger)
 	})
 	getHTTPClient := func() (DialerClient, *XmuxClient) {
 		xmuxClient := xmuxManager.GetXmuxClient(ctx)
@@ -167,7 +167,7 @@ func NewClient(ctx context.Context, ctxLogger logger.ContextLogger, dialer N.Dia
 			applyXmuxDefaults(&xmuxOptions2)
 		}
 		xmuxManager2 = NewXmuxManager(xmuxOptions2, func() XmuxConn {
-			return createHTTPClient(dest2, dialer2, &options2.V2RayXHTTPBaseOptions, tlsConfig2)
+			return createHTTPClient(dest2, dialer2, &options2.V2RayXHTTPBaseOptions, tlsConfig2, ctxLogger)
 		})
 		getHTTPClient2 = func() (DialerClient, *XmuxClient) {
 			xmuxClient2 := xmuxManager2.GetXmuxClient(ctx)
@@ -528,9 +528,11 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 					// errors.LogInfoInner(ctx, err, "failed to send upload").
 					// Из-за пропажи этого лога отсутствие строк про non-200 в
 					// box.log ошибочно читалось как «отказов нет», хотя
-					// access-лог origin их показывал. Logger'а в конструкторе
-					// транспорта нет, поэтому считаем счётчиками (chunkhist.go),
-					// которые сэмплер выводит и в box.log.
+					// access-лог origin их показывал. Считаем счётчиками
+					// (chunkhist.go), которые сэмплер выводит и в box.log; с
+					// 2026-08-03 сам отказ POST'а озвучивает и dialer.go
+					// (DefaultDialerClient.logDial) — счётчик остаётся как
+					// агрегат, лог даёт причину.
 					recordUploadError(err)
 					uploadPipeReader.Interrupt()
 				}
@@ -697,7 +699,7 @@ func getBaseRequestURL(options *option.V2RayXHTTPBaseOptions, dest M.Socksaddr, 
 	return requestURL, nil
 }
 
-func createHTTPClient(dest M.Socksaddr, dialer N.Dialer, options *option.V2RayXHTTPBaseOptions, tlsConfig tls.Config) DialerClient {
+func createHTTPClient(dest M.Socksaddr, dialer N.Dialer, options *option.V2RayXHTTPBaseOptions, tlsConfig tls.Config, ctxLogger logger.ContextLogger) DialerClient {
 	httpVersion := decideHTTPVersion(tlsConfig)
 	dialContext := func(ctxInner context.Context) (net.Conn, error) {
 		conn, err := dialer.DialContext(ctxInner, "tcp", dest)
@@ -769,6 +771,7 @@ func createHTTPClient(dest M.Socksaddr, dialer N.Dialer, options *option.V2RayXH
 	}
 	client := &DefaultDialerClient{
 		options: options,
+		logger:  ctxLogger,
 		client: &http.Client{
 			Transport: transport,
 		},

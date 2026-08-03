@@ -284,8 +284,9 @@ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 }
 
 var (
-	randomFingerprint     utls.ClientHelloID
-	randomizedFingerprint utls.ClientHelloID
+	randomFingerprint           utls.ClientHelloID
+	randomizedFingerprint       utls.ClientHelloID
+	randomizedNoALPNFingerprint utls.ClientHelloID
 )
 
 func init() {
@@ -304,10 +305,89 @@ func init() {
 	randomizedFingerprint = utls.HelloRandomized
 	randomizedFingerprint.Seed, _ = utls.NewPRNGSeed()
 	randomizedFingerprint.Weights = &weights
+
+	randomizedNoALPNFingerprint = utls.HelloRandomizedNoALPN
+	randomizedNoALPNFingerprint.Seed, _ = utls.NewPRNGSeed()
+	randomizedNoALPNFingerprint.Weights = &weights
+}
+
+// xrayFingerprints — версионные имена отпечатков в написании Xray
+// (`transport/internet/tls/tls.go`: ModernFingerprints + OtherFingerprints).
+//
+// InHive 2026-08-03: апстримный sing-box знает только 11 коротких псевдонимов и
+// на всём остальном возвращает ОШИБКУ — а ошибка здесь роняет разбор всего
+// outbound'а, то есть сервер из чужой подписки просто исчезает. Xray же принимает
+// ~40 имён, и провайдеры их пишут: `fp=randomizednoalpn` (у Xray это вообще
+// пресет), `fp=hellochrome_133`, `fp=hellofirefox_105`. Отпечаток влияет только
+// на маскировку ClientHello и никак — на протокол, так что отвергать из-за него
+// живой сервер нечем оправдать. Границу держим по Xray: что принимает он —
+// принимаем и мы, что не принимает он — честно роняем (тихой подмены нет).
+var xrayFingerprints = map[string]utls.ClientHelloID{
+	"hellogolang":           utls.HelloGolang,
+	"hellorandomized":       utls.HelloRandomized,
+	"hellorandomizedalpn":   utls.HelloRandomizedALPN,
+	"hellorandomizednoalpn": utls.HelloRandomizedNoALPN,
+
+	"hellochrome_auto":                 utls.HelloChrome_Auto,
+	"hellochrome_58":                   utls.HelloChrome_58,
+	"hellochrome_62":                   utls.HelloChrome_62,
+	"hellochrome_70":                   utls.HelloChrome_70,
+	"hellochrome_72":                   utls.HelloChrome_72,
+	"hellochrome_83":                   utls.HelloChrome_83,
+	"hellochrome_87":                   utls.HelloChrome_87,
+	"hellochrome_96":                   utls.HelloChrome_96,
+	"hellochrome_100":                  utls.HelloChrome_100,
+	"hellochrome_100_psk":              utls.HelloChrome_100_PSK,
+	"hellochrome_102":                  utls.HelloChrome_102,
+	"hellochrome_106_shuffle":          utls.HelloChrome_106_Shuffle,
+	"hellochrome_112_psk_shuf":         utls.HelloChrome_112_PSK_Shuf,
+	"hellochrome_114_padding_psk_shuf": utls.HelloChrome_114_Padding_PSK_Shuf,
+	"hellochrome_115_pq":               utls.HelloChrome_115_PQ,
+	"hellochrome_115_pq_psk":           utls.HelloChrome_115_PQ_PSK,
+	"hellochrome_120":                  utls.HelloChrome_120,
+	"hellochrome_120_pq":               utls.HelloChrome_120_PQ,
+	"hellochrome_131":                  utls.HelloChrome_131,
+	"hellochrome_133":                  utls.HelloChrome_133,
+
+	"hellofirefox_auto": utls.HelloFirefox_Auto,
+	"hellofirefox_55":   utls.HelloFirefox_55,
+	"hellofirefox_56":   utls.HelloFirefox_56,
+	"hellofirefox_63":   utls.HelloFirefox_63,
+	"hellofirefox_65":   utls.HelloFirefox_65,
+	"hellofirefox_99":   utls.HelloFirefox_99,
+	"hellofirefox_102":  utls.HelloFirefox_102,
+	"hellofirefox_105":  utls.HelloFirefox_105,
+	"hellofirefox_120":  utls.HelloFirefox_120,
+	// Xray-only (его форк uTLS): у нас в metacubex/utls такого билда нет —
+	// отдаём ближайший свежий Firefox вместо отказа.
+	"hellofirefox_148": utls.HelloFirefox_120,
+
+	"helloedge_auto": utls.HelloEdge_Auto,
+	"helloedge_85":   utls.HelloEdge_85,
+	"helloedge_106":  utls.HelloEdge_106,
+
+	"hellosafari_auto": utls.HelloSafari_Auto,
+	"hellosafari_16_0": utls.HelloSafari_16_0,
+	"hellosafari_26_3": utls.HelloSafari_Auto, // Xray-only, см. выше
+
+	"helloios_auto": utls.HelloIOS_Auto,
+	"helloios_11_1": utls.HelloIOS_11_1,
+	"helloios_12_1": utls.HelloIOS_12_1,
+	"helloios_13":   utls.HelloIOS_13,
+	"helloios_14":   utls.HelloIOS_14,
+
+	"hello360_auto": utls.Hello360_Auto,
+	"hello360_7_5":  utls.Hello360_7_5,
+	"hello360_11_0": utls.Hello360_11_0,
+
+	"helloqq_auto": utls.HelloQQ_Auto,
+	"helloqq_11_1": utls.HelloQQ_11_1,
+
+	"helloandroid_11_okhttp": utls.HelloAndroid_11_OkHttp,
 }
 
 func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
-	switch name {
+	switch strings.ToLower(name) {
 	case "chrome_psk", "chrome_psk_shuffle", "chrome_padding_psk_shuffle", "chrome_pq", "chrome_pq_psk":
 		fallthrough
 	case "chrome", "":
@@ -330,7 +410,14 @@ func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
 		return randomFingerprint, nil
 	case "randomized":
 		return randomizedFingerprint, nil
-	default:
-		return utls.ClientHelloID{}, E.New("unknown uTLS fingerprint: ", name)
+	case "randomizednoalpn":
+		// Пресет Xray. Свой рандомизированный отпечаток, как и `randomized`
+		// выше: seed на процесс, TLS 1.3 обязателен (иначе REALITY некуда
+		// положить key_share и хендшейк не состоится вовсе).
+		return randomizedNoALPNFingerprint, nil
 	}
+	if id, loaded := xrayFingerprints[strings.ToLower(name)]; loaded {
+		return id, nil
+	}
+	return utls.ClientHelloID{}, E.New("unknown uTLS fingerprint: ", name)
 }

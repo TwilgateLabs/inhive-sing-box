@@ -16,6 +16,8 @@ import (
 	"github.com/sagernet/sing-box/common/xray/signal/done"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/transport/v2rayhttp"
+	F "github.com/sagernet/sing/common/format"
+	"github.com/sagernet/sing/common/logger"
 
 	"golang.org/x/net/http2"
 )
@@ -33,8 +35,13 @@ type DialerClient interface {
 
 // implements xhttp.DialerClient in terms of direct network connections
 type DefaultDialerClient struct {
-	options     *option.V2RayXHTTPBaseOptions
-	client      *http.Client
+	options *option.V2RayXHTTPBaseOptions
+	client  *http.Client
+	// logger — тот же user-facing канал, что у Client (box.log → gRPC log-стрим
+	// → вкладка «Логи»). InHive 2026-08-03: до этого у дозвонщика логгера не
+	// было вовсе, и ВЕСЬ класс отказов открытия стрима был немым — см. logDial.
+	// nil допустим (тесты, download-detour без логгера); все вызовы nil-safe.
+	logger      logger.ContextLogger
 	closed      bool
 	httpVersion string
 	// pool of net.Conn, created using dialUploadConn
@@ -44,6 +51,28 @@ type DefaultDialerClient struct {
 
 func (c *DefaultDialerClient) IsClosed() bool {
 	return c.closed
+}
+
+// logDial озвучивает отказ ДОЗВОНА (открытия HTTP-стрима) в пользовательский лог.
+//
+// InHive 2026-08-03: раньше здесь была тишина. `OpenStream` глотал и ошибку
+// `client.Do`, и non-200 (`wrc.Close(); return`), а вызывающий код в client.go
+// проверяет возвращённую ошибку только ради browser dialer — у сетевого
+// дозвонщика ошибка живёт в горутине и наверх не идёт вообще. Наблюдаемый
+// эффект: транспорт «дозвонился», прокси-conn открыт, данные не текут, и
+// пользователь видит лишь `context deadline exceeded` от urltest.
+//
+// Цена этой немоты измерена: отказ REALITY-auth (сервер с `minClientVer`
+// отдаёт настоящий сертификат dest, TLS падает с x509-ошибкой) на xhttp-пути
+// не давал НИ ОДНОЙ строчки, хотя на обычном пути тот же отказ читается как
+// `reality verification failed`. Диагностировать пришлось ручной
+// инструментацией ядра. Ровно класс «отказ невидим» — такой обязан быть
+// озвучен, а не выведен постфактум.
+func (c *DefaultDialerClient) logDial(ctx context.Context, message string) {
+	if c.logger == nil {
+		return
+	}
+	c.logger.WarnContext(ctx, message)
 }
 
 // Close помечает клиента закрытым и АКТИВНО закрывает соединения его пулов.
@@ -152,12 +181,16 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 	go func() {
 		resp, err := c.client.Do(req)
 		if err != nil {
+			c.logDial(ctx, F.ToString("xhttp: ", method, " stream failed: ", err))
 			if !uploadOnly { // stream-down is enough
 				c.closed = true
 			}
 			gotConn.Close()
 			wrc.Close()
 			return
+		}
+		if resp.StatusCode != 200 {
+			c.logDial(ctx, F.ToString("xhttp: ", method, " stream rejected by server: HTTP ", resp.StatusCode))
 		}
 		if resp.StatusCode != 200 || uploadOnly { // stream-up
 			io.Copy(io.Discard, resp.Body)
