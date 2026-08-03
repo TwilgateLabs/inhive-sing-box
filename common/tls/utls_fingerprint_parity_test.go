@@ -34,6 +34,12 @@ func TestUTLSFingerprintXrayParity(t *testing.T) {
 		"hello360_auto", "hello360_7_5", "hello360_11_0",
 		"helloqq_auto", "helloqq_11_1",
 		"helloandroid_11_okhttp",
+
+		// Написания mihomo/Clash.Meta (component/tls/utls.go) — Clash-подписки
+		// пишут версию слитно, без префикса `hello`.
+		"chrome120", "firefox120", "safari16",
+		"chrome_psk", "chrome_psk_shuffle", "chrome_padding_psk_shuffle",
+		"chrome_pq", "chrome_pq_psk",
 	}
 	for _, name := range names {
 		id, err := uTLSClientHelloID(name)

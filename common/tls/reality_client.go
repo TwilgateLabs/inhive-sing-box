@@ -211,6 +211,21 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	}
 	ecdheKey := keyShareKeys.Ecdhe
 	if ecdheKey == nil {
+		// InHive 2026-08-03: когда отпечаток предлагает X25519MLKEM768, uTLS
+		// кладёт X25519-половину в MlkemEcdhe и оставляет Ecdhe пустым. Без этой
+		// ветки такой отпечаток не мог установить REALITY вовсе — падал на
+		// «nil ecdheKey», хотя ключ есть.
+		//
+		// Так делают И Xray (transport/internet/reality/reality.go), И mihomo
+		// (component/tls/reality.go) — из троих без этого оставался только
+		// апстримный sing-box (проверено на v1.13.16, свежайшем на дату правки).
+		// Вырезание MLKEM выше (оно делает Ecdhe непустым на сегодняшних
+		// отпечатках) остаётся дефолтом — mihomo держит его по той же причине:
+		// «X25519MLKEM768 does not work properly with the old reality server».
+		// Эта ветка — страховка на случай, когда вырезать нечего.
+		ecdheKey = keyShareKeys.MlkemEcdhe
+	}
+	if ecdheKey == nil {
 		return nil, E.New("nil ecdheKey")
 	}
 	authKey, err := ecdheKey.ECDH(publicKey)

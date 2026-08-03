@@ -384,6 +384,14 @@ var xrayFingerprints = map[string]utls.ClientHelloID{
 	"helloqq_11_1": utls.HelloQQ_11_1,
 
 	"helloandroid_11_okhttp": utls.HelloAndroid_11_OkHttp,
+
+	// Написания mihomo/Clash.Meta (component/tls/utls.go): без префикса `hello`
+	// и без подчёркивания перед версией. Clash-подписки пишут именно так
+	// (`client-fingerprint: chrome120`), и для нас это был очередной
+	// исчезнувший сервер.
+	"chrome120":  utls.HelloChrome_120,
+	"firefox120": utls.HelloFirefox_120,
+	"safari16":   utls.HelloSafari_16_0,
 }
 
 func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
