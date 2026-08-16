@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/monitoring"
+	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -272,9 +273,16 @@ func (w *Endpoint) NewConnectionEx(ctx context.Context, conn net.Conn, source M.
 	w.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
+// Start delegates StartStateStart to the embedded transport Device EXPLICITLY.
+// This method shadows the promoted (*awg.Device).Start, so without the explicit
+// call the amneziawg device was never created (no IpcSet, no tun start, no Up):
+// the tunnel could never handshake, and Close() dereferenced the nil awgDevice
+// inside a box-close goroutine — an unrecoverable SIGSEGV that killed the whole
+// process (field crash 2026-08-16: pinging an imported AmneziaWG .conf made the
+// Windows app vanish without a trace).
 func (o *Endpoint) Start(stage adapter.StartStage) error {
-	if stage != adapter.StartStateStart {
-		// return o.endpoint.Start(false)
+	if stage == adapter.StartStateStart {
+		return o.Device.Start(stage)
 	}
 	if stage == adapter.StartStatePostStart {
 		go o.readyChecker()
@@ -282,19 +290,25 @@ func (o *Endpoint) Start(stage adapter.StartStage) error {
 	return nil
 }
 
+// readyChecker mirrors protocol/wireguard/endpoint.go: probe THROUGH the
+// tunnel until it answers, then flip started. The old version was a blind
+// 10-second timer that marked the endpoint ready unconditionally — IsReady()
+// lied both ways (false for a tunnel that handshook in 1s, true for a dead
+// one), which cost every awg ping the full waitDetourReady budget.
 func (w *Endpoint) readyChecker() {
-	defer func() {
-		w.started = true
-		monitoring.Get(w.ctx).TestNow(w.Tag())
-	}()
-	for i := 0; i < 10; i++ {
-		if w.IsReady() {
-			return
-		}
+	for i := 0; i < 30; i++ {
 		select {
 		case <-w.ctx.Done():
 			return
 		case <-time.After(time.Second):
+		}
+		ctx, cancel := context.WithTimeout(w.ctx, time.Second*5)
+		res, err := urltest.URLTest(ctx, "https://1.1.1.1", w)
+		cancel()
+		if res > 0 && res < 20000 && err == nil {
+			w.started = true
+			monitoring.Get(w.ctx).TestNow(w.Tag())
+			return
 		}
 	}
 }

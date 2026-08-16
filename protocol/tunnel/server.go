@@ -100,10 +100,13 @@ func (s *ServerEndpoint) DialContext(ctx context.Context, network string, destin
 			s.mtx.Lock()
 			var ok bool
 			ch, ok = s.conns[tunnelDestination]
+			// Unlock BEFORE the not-found return: the early return used to leave
+			// s.mtx held forever, so one dial to an unknown destination froze every
+			// later DialContext/connHandler on this endpoint (silent hang, no error).
+			s.mtx.Unlock()
 			if !ok {
 				return nil, E.New("user ", metadata.TunnelDestination, " not found")
 			}
-			s.mtx.Unlock()
 		}
 		if metadata.TunnelSource != "" {
 			tunnelSource, err := uuid.FromString(metadata.TunnelSource)
@@ -186,11 +189,16 @@ func (s *ServerEndpoint) connHandler(ctx context.Context, conn net.Conn, metadat
 		s.mtx.Lock()
 		if request.DestinationUUID != s.uuid {
 			_, ok = s.keys[request.DestinationUUID]
-			if !ok {
-				return E.New("user ", sourceUUID, " not found")
-			}
+		} else {
+			ok = true
 		}
+		// Unlock BEFORE the not-found return — same leak as in DialContext: the
+		// early return inside the locked section kept s.mtx forever and froze the
+		// whole endpoint after a single request to an unknown user.
 		s.mtx.Unlock()
+		if !ok {
+			return E.New("user ", sourceUUID, " not found")
+		}
 		metadata.Inbound = s.Tag()
 		metadata.InboundType = C.TypeTunnelServer
 		metadata.Destination = request.Destination

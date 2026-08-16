@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,9 +61,17 @@ func NewWARPEndpoint(ctx context.Context, router adapter.Router, logger log.Cont
 		if !options.Profile.Recreate && cacheFile != nil && cacheFile.StoreWARPConfig() {
 			savedProfile := cacheFile.LoadBinary(uniqueId)
 			if savedProfile != nil {
+				// A cache entry that does not unmarshal or does not validate is
+				// treated as NO cache (fetch a fresh profile below), not as a fatal
+				// error and certainly not as input for the construction code — a
+				// stale/partial cached config used to panic at config.Peers[0]
+				// inside this goroutine and kill the whole process.
 				if err = json.Unmarshal(savedProfile.Content, &config); err != nil {
-					logger.ErrorContext(ctx, err)
-					return
+					logger.ErrorContext(ctx, E.Cause(err, "broken cached WARP config, refetching"))
+					config = nil
+				} else if err = validateWARPConfig(config); err != nil {
+					logger.ErrorContext(ctx, E.Cause(err, "invalid cached WARP config, refetching"))
+					config = nil
 				}
 			}
 		}
@@ -90,15 +99,21 @@ func NewWARPEndpoint(ctx context.Context, router adapter.Router, logger log.Cont
 				})
 			}
 		}
+		// startHandler runs in its own goroutine (Start does `go w.startHandler()`),
+		// so ANY panic here is an unrecoverable process-killing crash, not an error
+		// the user ever sees. validateWARPConfig above guarantees Peers is non-empty
+		// and the interface addresses parse; pickWARPPeerPort guarantees the port
+		// selection cannot hit rand.Intn(0).
+		if err := validateWARPConfig(config); err != nil {
+			logger.ErrorContext(ctx, E.Cause(err, "invalid WARP config"))
+			return
+		}
 		peer := config.Peers[0]
 		hostParts := strings.Split(peer.Endpoint.Host, ":")
 		peerAddr := hostParts[0]
-		perrPort := uint16(peer.Endpoint.Ports[rand.Intn(len(peer.Endpoint.Ports))])
+		perrPort := pickWARPPeerPort(options.ServerOptions.ServerPort, peer.Endpoint.Ports, hostParts)
 		if options.ServerOptions.Server != "" {
 			peerAddr = options.ServerOptions.Server
-		}
-		if options.ServerOptions.ServerPort != 0 {
-			perrPort = options.ServerOptions.ServerPort
 		}
 		warpEndpoint.endpoint, err = NewEndpoint(
 			ctx,
@@ -149,6 +164,54 @@ func NewWARPEndpoint(ctx context.Context, router adapter.Router, logger log.Cont
 		}
 	}
 	return warpEndpoint, nil
+}
+
+// validateWARPConfig rejects every WARPConfig shape that used to panic inside
+// the startHandler goroutine and therefore kill the whole process:
+//   - empty Peers        → config.Peers[0] index out of range
+//   - bad/empty addresses → netip.MustParsePrefix panic
+//
+// (empty Ports — rand.Intn(0) — is handled separately by pickWARPPeerPort,
+// because a port can still legitimately come from the Host or an override.)
+func validateWARPConfig(config *C.WARPConfig) error {
+	if config == nil {
+		return E.New("missing config")
+	}
+	if config.PrivateKey == "" {
+		return E.New("missing private_key")
+	}
+	if len(config.Peers) == 0 {
+		return E.New("missing peers")
+	}
+	if config.Peers[0].PublicKey == "" {
+		return E.New("missing peer public_key")
+	}
+	if _, err := netip.ParsePrefix(config.Interface.Addresses.V4 + "/32"); err != nil {
+		return E.Cause(err, "invalid interface v4 address")
+	}
+	if _, err := netip.ParsePrefix(config.Interface.Addresses.V6 + "/128"); err != nil {
+		return E.Cause(err, "invalid interface v6 address")
+	}
+	return nil
+}
+
+// pickWARPPeerPort never panics: the old inline rand.Intn(len(ports)) crashed
+// the process when a cached or user-supplied config carried an empty ports
+// list. Priority: explicit override > advertised ports > port embedded in the
+// endpoint host ("engage.cloudflareclient.com:2408") > Cloudflare's default.
+func pickWARPPeerPort(override uint16, ports []int, hostParts []string) uint16 {
+	if override != 0 {
+		return override
+	}
+	if len(ports) > 0 {
+		return uint16(ports[rand.Intn(len(ports))])
+	}
+	if len(hostParts) > 1 {
+		if port, err := strconv.ParseUint(hostParts[1], 10, 16); err == nil && port != 0 {
+			return uint16(port)
+		}
+	}
+	return 2408 // default WARP UDP port
 }
 func GetWarpProfile(ctx context.Context, profile *option.WARPProfile) (*cloudflare.CloudflareProfile, error) {
 	var dialer N.Dialer

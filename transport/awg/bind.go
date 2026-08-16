@@ -29,8 +29,13 @@ type bind_adapter struct {
 	hasReserved bool
 }
 
-func newBind(dial N.Dialer, reserved [3]byte, hasReserved bool) conn.Bind {
+func newBind(ctx context.Context, dial N.Dialer, reserved [3]byte, hasReserved bool) conn.Bind {
+	// ctx was previously left nil — the first Open() (device.Up → BindUpdate)
+	// then passed a nil context into dialer.ListenPacket, which panics on the
+	// first ctx.Value lookup. It went unnoticed only because the endpoint never
+	// actually started the device (see protocol/awg Endpoint.Start).
 	return &bind_adapter{
+		ctx:         ctx,
 		dialer:      dial,
 		reserved:    reserved,
 		hasReserved: hasReserved,

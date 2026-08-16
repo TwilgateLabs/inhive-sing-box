@@ -67,7 +67,7 @@ func NewDevice(ctx context.Context, logger logger.ContextLogger, dial network.Di
 
 	return &Device{
 		tun:       tun,
-		bind:      newBind(dial, opts.Reserved, opts.HasReserved),
+		bind:      newBind(ctx, dial, opts.Reserved, opts.HasReserved),
 		logger:    awgLogger,
 		ipcConfig: ipcConfig,
 	}, nil
@@ -91,6 +91,14 @@ func (d *Device) Start(stage adapter.StartStage) error {
 }
 
 func (d *Device) Close() error {
+	// awgDevice is created in Start(StartStateStart). If bring-up failed before
+	// that stage (or Start was never reached), Close must be a no-op — the
+	// endpoint manager closes every endpoint unconditionally, from a goroutine
+	// (box.closeWithTimeout) where a nil dereference is an unrecoverable
+	// process-killing SIGSEGV, not a catchable error.
+	if d.awgDevice == nil {
+		return nil
+	}
 	d.awgDevice.Close()
 	return nil
 }
