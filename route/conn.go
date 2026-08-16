@@ -80,7 +80,23 @@ type outboundHealth struct {
 	down          atomic.Bool  // true = outbound помечен мёртвым
 	lastProbe     atomic.Int64 // unixNano последнего probe-дайла
 	probeInterval atomic.Int64 // текущий backoff-интервал probe (наносек)
+	downSince     atomic.Int64 // unixNano момента trip'а (для лога recovery «сколько был down»)
 }
+
+// Наблюдаемость брейкера (2026-08-11). В диагностике инцидента 2026-08-10 было
+// НОЛЬ следов брейкера при явном dial-шторме (dropped 12→47, goroutines 89→340):
+// и брейкер, и dial-cap закрывают через CloseOnHandshakeFailure, чья ошибка
+// никуда не логируется — по логам нельзя было отличить «не сработал» от
+// «сработал и не помогло» (класс unreportable-bug: механизм безопасности
+// невидим). Логируем ПЕРЕХОДЫ (trip/probe/recovery — редкие по построению,
+// probe ≤1/probeInterval), а fast-fail'ы — rate-limited счётчиком раз в
+// секунду, тем же приёмом, что dial-cap (dialLastLogSec + CompareAndSwap).
+// Уровень WARN: дефолтный log level клиента — 'warn' (singbox_config_builder),
+// INFO/DEBUG до box.log не доехали бы.
+var (
+	cbFastFails      atomic.Uint64
+	cbFastFailLogSec atomic.Int64
+)
 
 const (
 	cbFailThreshold = 8                // подряд-фейлов → trip (пометить down)
@@ -123,6 +139,18 @@ func (m *ConnectionManager) outboundHealthFor(tag string) *outboundHealth {
 	}
 	v, _ := m.health.LoadOrStore(tag, &outboundHealth{})
 	return v.(*outboundHealth)
+}
+
+// IsOutboundDown — read-only доступ к пометке down для не-dial путей
+// (adapter.ConnectionManager). Сейчас единственный потребитель — DNS-клиент:
+// fast-fail запросов через transport, чей detour-outbound уже помечен мёртвым,
+// вместо 10s ожидания на имя (инцидент 2026-08-10). Нарочно НЕ создаёт
+// health-запись: отсутствие записи = «не down».
+func (m *ConnectionManager) IsOutboundDown(tag string) bool {
+	if v, ok := m.health.Load(tag); ok {
+		return v.(*outboundHealth).down.Load()
+	}
+	return false
 }
 
 func (m *ConnectionManager) Start(stage adapter.StartStage) error {
@@ -226,18 +254,35 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	// он помечен down, fast-fail'им дайл МГНОВЕННО (кроме ≤1 probe/с). Проверка
 	// ДО dial-cap — fast-fail'ные дайлы не касаются семафора, слоты остаются
 	// свободны для probe и дайлов на живые серверы. См. outboundHealth.
-	var health *outboundHealth
-	var isProbe bool
+	var (
+		health    *outboundHealth
+		healthTag string
+		isProbe   bool
+	)
 	if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
-		health = m.outboundHealthFor(outbound.Tag())
+		healthTag = outbound.Tag()
+		health = m.outboundHealthFor(healthTag)
 		if health.down.Load() {
 			// Recovery ловится ТОЛЬКО пропущенным probe: пропускаем 1 дайл раз в
 			// interval (растёт с backoff'ом), остальные fast-fail (0ms). Никакого
 			// синтетического трафика — это одна из уже идущих попыток приложений.
 			if health.tryClaimProbe(time.Now().UnixNano()) {
 				isProbe = true // идёт полным путём; успех снимет down, фейл увеличит backoff
+				// Probe редкий по построению (≤1 раз в probeInterval) — WARN не флудит.
+				// Отдельная строка на старте нужна: probe может висеть до 5s
+				// (TCPConnectTimeout), и без неё окно «probe в полёте» невидимо.
+				m.logger.WarnContext(ctx, "outbound [", healthTag, "] circuit-breaker: probing (down for ",
+					time.Duration(time.Now().UnixNano()-health.downSince.Load()).Round(time.Second), ")")
 			} else {
-				N.CloseOnHandshakeFailure(conn, onClose, E.New("outbound [", outbound.Tag(), "] circuit-open (server unreachable)"))
+				// Rate-limited (≤1 строка/с) счётчик fast-fail'ов — по образцу
+				// dial-cap ниже. Каждый дайл логировать нельзя: в шторме их тысячи/с.
+				failed := cbFastFails.Add(1)
+				now := time.Now().Unix()
+				last := cbFastFailLogSec.Load()
+				if now != last && cbFastFailLogSec.CompareAndSwap(last, now) {
+					m.logger.WarnContext(ctx, "outbound [", healthTag, "] circuit-open, fast-failed ", failed, " dials total")
+				}
+				N.CloseOnHandshakeFailure(conn, onClose, E.New("outbound [", healthTag, "] circuit-open (server unreachable)"))
 				return
 			}
 		}
@@ -270,33 +315,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	// Circuit-breaker: обновляем здоровье outbound'а по исходу дайла. Отмена по
 	// ctx (юзер закрыл сокет) здоровьем не считается.
 	if health != nil {
-		switch {
-		case err == nil:
-			// Успех (обычный дайл или probe) → сервер жив/ожил, полный сброс.
-			health.consecFails.Store(0)
-			health.probeInterval.Store(0)
-			health.down.Store(false)
-		case errors.Is(err, context.Canceled):
-			// отмена юзером — не сигнал здоровья, игнор
-		case isProbe:
-			// probe упал — сервер всё ещё мёртв, backoff (×2, потолок cbProbeMax).
-			next := health.probeInterval.Load() * 2
-			if next < int64(cbProbeBase) {
-				next = int64(cbProbeBase)
-			}
-			if next > int64(cbProbeMax) {
-				next = int64(cbProbeMax)
-			}
-			health.probeInterval.Store(next)
-		default:
-			// обычный dial-фейл (timeout/refused) на живом-считающемся outbound →
-			// счётчик; порог → trip: пометить down, стартовать probe-часы.
-			if health.consecFails.Add(1) >= cbFailThreshold && !health.down.Load() {
-				health.probeInterval.Store(int64(cbProbeBase))
-				health.lastProbe.Store(time.Now().UnixNano())
-				health.down.Store(true)
-			}
-		}
+		m.updateHealthAfterDial(ctx, health, healthTag, isProbe, err)
 	}
 	if err != nil {
 		var remoteString string
@@ -333,6 +352,53 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	m.preConnectionCopy(ctx, remoteConn, conn, true, &done, onClose)
 	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
 	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
+}
+
+// updateHealthAfterDial — переходы состояния брейкера по исходу дайла. Вынесено
+// из NewConnection по тому же принципу, что tryClaimProbe: юнит-тест
+// (conn_test.go) обязан проверять ТУ ЖЕ логику переходов и логирования, а не её
+// копию. Логируются только ПЕРЕХОДЫ (trip / probe-фейл / recovery) — они редкие
+// по построению, в отличие от самих дайлов; см. комментарий у cbFastFails.
+func (m *ConnectionManager) updateHealthAfterDial(ctx context.Context, health *outboundHealth, tag string, isProbe bool, err error) {
+	switch {
+	case err == nil:
+		// Успех (обычный дайл или probe) → сервер жив/ожил, полный сброс.
+		// Swap вместо Store: ловим переход true→false ровно один раз для лога
+		// (снять down может и обычный дайл, стартовавший до trip'а, не только probe).
+		health.consecFails.Store(0)
+		health.probeInterval.Store(0)
+		if health.down.Swap(false) {
+			m.logger.WarnContext(ctx, "outbound [", tag, "] circuit-breaker: recovered after ",
+				time.Duration(time.Now().UnixNano()-health.downSince.Load()).Round(time.Second), " down")
+		}
+	case errors.Is(err, context.Canceled):
+		// отмена юзером — не сигнал здоровья, игнор
+	case isProbe:
+		// probe упал — сервер всё ещё мёртв, backoff (×2, потолок cbProbeMax).
+		next := health.probeInterval.Load() * 2
+		if next < int64(cbProbeBase) {
+			next = int64(cbProbeBase)
+		}
+		if next > int64(cbProbeMax) {
+			next = int64(cbProbeMax)
+		}
+		health.probeInterval.Store(next)
+		m.logger.WarnContext(ctx, "outbound [", tag, "] circuit-breaker: probe failed, next probe in ",
+			time.Duration(next))
+	default:
+		// обычный dial-фейл (timeout/refused) на живом-считающемся outbound →
+		// счётчик; порог → trip: пометить down, стартовать probe-часы.
+		// CompareAndSwap вместо Load+Store: переход false→true клеймится ровно
+		// одним дайлом — и probe-часы/downSince/лог не перетираются конкурентом.
+		fails := health.consecFails.Add(1)
+		if fails >= cbFailThreshold && health.down.CompareAndSwap(false, true) {
+			health.probeInterval.Store(int64(cbProbeBase))
+			health.lastProbe.Store(time.Now().UnixNano())
+			health.downSince.Store(time.Now().UnixNano())
+			m.logger.WarnContext(ctx, "outbound [", tag, "] circuit-breaker: tripped after ",
+				fails, " consecutive dial failures")
+		}
+	}
 }
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

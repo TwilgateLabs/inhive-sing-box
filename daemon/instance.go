@@ -181,3 +181,11 @@ func (i *Instance) CacheFile() adapter.CacheFile {
 func (i *Instance) ClashServer() adapter.ClashServer {
 	return i.clashServer
 }
+
+// ConnectionManager — доступ к менеджеру соединений box'а (там живёт
+// circuit-breaker). InHive 2026-08-11 (audit A2): hcore читает через него
+// IsOutboundDown(активный outbound) в SystemInfo, чтобы UI перестал показывать
+// зелёное «Подключено» при мёртвом сервере.
+func (i *Instance) ConnectionManager() adapter.ConnectionManager {
+	return i.connectionManager
+}

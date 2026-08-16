@@ -18,6 +18,7 @@ import (
 	"github.com/sagernet/sing/common/task"
 	"github.com/sagernet/sing/contrab/freelru"
 	"github.com/sagernet/sing/contrab/maphash"
+	"github.com/sagernet/sing/service"
 
 	"github.com/miekg/dns"
 )
@@ -41,9 +42,9 @@ type Client struct {
 	initRDRCFunc       func() adapter.RDRCStore
 	logger             logger.ContextLogger
 	cache              freelru.Cache[dns.Question, *dns.Msg]
-	cacheLock          compatible.Map[dns.Question, chan struct{}]
+	cacheLock          compatible.Map[dns.Question, *exchangeFlight]
 	transportCache     freelru.Cache[transportCacheKey, *dns.Msg]
-	transportCacheLock compatible.Map[dns.Question, chan struct{}]
+	transportCacheLock compatible.Map[dns.Question, *exchangeFlight]
 	// negFail — короткоживущий negative-cache на СЕТЕВЫЕ фейлы (timeout/reset),
 	// а не Rcode-ответы. Когда активный сервер сдох, DNS-через-туннель отваливается
 	// и каждый повтор идентичного запроса жёг полные c.timeout (10s) + держал слот
@@ -55,6 +56,93 @@ type Client struct {
 
 // negFailTTL — как долго идентичный DNS-запрос fast-fail'ит после сетевого фейла.
 const negFailTTL = 5 * time.Second
+
+// exchangeFlight — запись single-flight'а по question. Раньше это был голый
+// chan struct{}, и каждый ждун ждал СВОИ полные c.timeout (10s), хотя лидер
+// стартовал раньше и упадёт раньше: при мёртвом транспорте каждое имя стояло
+// ~10s × волна ждунов (инцидент 2026-08-10 — «cache wait timeout» 1080 из
+// ~2900 ошибок, gateway.icloud.com висел 5 минут; арифметика по логу: ждуны со
+// стартом 1.0/3.0/7.4s падали ровно на +10.0s). Теперь рядом с каналом храним
+// дедлайн лидера (leaderStart + c.timeout): ждун ждёт не дольше остатка лидера.
+type exchangeFlight struct {
+	done     chan struct{}
+	deadline time.Time // момент, позже которого лидер заведомо не принесёт ответ
+}
+
+// awaitFlight — ожидание ждуном завершения лидера. nil = лидер завершился
+// (успех ИЛИ фейл — вызывающий смотрит в кеш и решает сам, семантика прежняя).
+// Ошибка = ждать дальше бессмысленно. Ждун, пришедший на 9-й секунде окна
+// лидера, падает через ~1s, а не через свои полные 10s; пришедший после
+// дедлайна лидера — сразу. time.NewTimer+Stop вместо time.After — в шторме
+// висели бы тысячи 10-секундных таймеров до истечения.
+func (c *Client) awaitFlight(ctx context.Context, flight *exchangeFlight) error {
+	remain := time.Until(flight.deadline)
+	if remain <= 0 {
+		return E.New("cache wait timeout")
+	}
+	timer := time.NewTimer(remain)
+	defer timer.Stop()
+	select {
+	case <-flight.done:
+		return nil
+	case <-timer.C:
+		return E.New("cache wait timeout")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// transportCircuitOpen — короткое замыкание по мёртвому outbound'у: если
+// transport дайлит через outbound (заявленный в конфиге detour, см.
+// TransportAdapter.detourTag), который circuit-breaker пометил down, — не
+// вставать в single-flight-очередь и не жечь c.timeout вообще. Брейкер
+// прикрывает только app-дайлы (route.ConnectionManager.NewConnection), DNS-путь
+// шёл мимо него (инцидент 2026-08-10). Read-only: DNS не влияет на здоровье,
+// recovery по-прежнему приходит от probe app-дайлов. Наш negFail гасит повторы
+// ПОСЛЕ фейла лидера — эта проверка закрывает другую дыру: ждунов/лидеров
+// ВНУТРИ окна, когда брейкер уже знает, что outbound мёртв.
+func transportCircuitOpen(ctx context.Context, transport adapter.DNSTransport) error {
+	detour, hasDetour := transport.(interface{ DetourTag() string })
+	if !hasDetour {
+		return nil
+	}
+	tag := detour.DetourTag()
+	if tag == "" {
+		return nil
+	}
+	connManager := service.FromContext[adapter.ConnectionManager](ctx)
+	if connManager == nil {
+		return nil
+	}
+	// Detour в конфиге обычно указывает на СЕЛЕКТОР ('select'/'select-tun'), а
+	// брейкер ключует здоровье по тегу РЕАЛЬНОГО outbound'а: Selector реализует
+	// ConnectionHandlerEx и делегирует в NewConnection уже выбранный inner
+	// (protocol/group/selector.go). Без разворота группы проверка сравнивала бы
+	// теги из разных пространств и не сработала бы никогда. Разворачиваем через
+	// Now() итеративно (группы могут вкладываться), с потолком — защита от
+	// цикла в кривом конфиге.
+	if outboundManager := service.FromContext[adapter.OutboundManager](ctx); outboundManager != nil {
+		for i := 0; i < 8; i++ {
+			outbound, loaded := outboundManager.Outbound(tag)
+			if !loaded {
+				break
+			}
+			group, isGroup := outbound.(adapter.OutboundGroup)
+			if !isGroup {
+				break
+			}
+			now := group.Now()
+			if now == "" || now == tag {
+				break
+			}
+			tag = now
+		}
+	}
+	if !connManager.IsOutboundDown(tag) {
+		return nil
+	}
+	return E.New("dns: outbound [", tag, "] circuit-open, fast-fail")
+}
 
 type ClientOptions struct {
 	Timeout          time.Duration
@@ -155,36 +243,34 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 		!options.ClientSubnet.IsValid()
 	disableCache := !isSimpleRequest || c.disableCache || options.DisableCache
 	if !disableCache {
+		var flightLock *compatible.Map[dns.Question, *exchangeFlight]
 		if c.cache != nil {
-			cond, loaded := c.cacheLock.LoadOrStore(question, make(chan struct{}))
-			if loaded {
-				select {
-				case <-cond:
-				case <-time.After(c.timeout):
-					return nil, E.New("cache wait timeout")
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				}
-			} else {
-				defer func() {
-					c.cacheLock.Delete(question)
-					close(cond)
-				}()
-			}
+			flightLock = &c.cacheLock
 		} else if c.transportCache != nil {
-			cond, loaded := c.transportCacheLock.LoadOrStore(question, make(chan struct{}))
+			flightLock = &c.transportCacheLock
+		}
+		if flightLock != nil {
+			flight, loaded := flightLock.LoadOrStore(question, &exchangeFlight{
+				done:     make(chan struct{}),
+				deadline: time.Now().Add(c.timeout),
+			})
 			if loaded {
-				select {
-				case <-cond:
-				case <-time.After(c.timeout):
-					return nil, E.New("cache wait timeout")
-				case <-ctx.Done():
-					return nil, ctx.Err()
+				// Ждун. Сначала — короткое замыкание по брейкеру: если outbound
+				// transport'а уже помечен down, в очередь не встаём вообще.
+				// Проверка стоит ПОСЛЕ LoadOrStore(loaded) намеренно: лидерский
+				// путь она не трогает, и cache-hit при down-сервере по-прежнему
+				// отдаётся из кеша ниже.
+				if err := transportCircuitOpen(ctx, transport); err != nil {
+					return nil, err
+				}
+				if err := c.awaitFlight(ctx, flight); err != nil {
+					return nil, err
 				}
 			} else {
+				// Лидер. Идемпотентность прежняя: Delete до close, ровно один раз.
 				defer func() {
-					c.transportCacheLock.Delete(question)
-					close(cond)
+					flightLock.Delete(question)
+					close(flight.done)
 				}()
 			}
 		}
@@ -214,6 +300,14 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 	negFailKey := transportCacheKey{Question: question, transportTag: transport.Tag()}
 	if _, failed := c.negFail.Get(negFailKey); failed {
 		return nil, E.New("dns: recent network failure cached for ", question.Name)
+	}
+	// Короткое замыкание по брейкеру для лидера и для запросов мимо кеша
+	// (disableCache): outbound помечен down → не жжём c.timeout на заведомо
+	// мёртвом transport.Exchange. Стоит ПОСЛЕ проверки кеша (cache-hit при
+	// down-сервере обязан отдаваться) и не пишет в negFail — это не сетевой
+	// фейл этого запроса, а уже известное состояние outbound'а.
+	if err := transportCircuitOpen(ctx, transport); err != nil {
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	response, err := transport.Exchange(ctx, message)
