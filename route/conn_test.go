@@ -3,15 +3,20 @@ package route
 import (
 	"context"
 	"fmt"
+	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
-	"time"
+
+	"github.com/sagernet/sing-box/adapter"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
-// recordingLogger — захват строк для проверки, что переходы брейкера реально
+// recordingLogger — захват строк для проверки, что переходы дегрейда реально
 // логируются (наблюдаемость, инцидент 2026-08-10: ноль следов брейкера в
-// диагностике). Пишем только Warn*: брейкер обязан логировать на WARN —
+// диагностике). Пишем только Warn*: переходы обязаны логироваться на WARN —
 // дефолтный log level клиента 'warn', ниже до box.log не доедет.
 type recordingLogger struct {
 	mu    sync.Mutex
@@ -55,10 +60,41 @@ func warnContaining(lines []string, substr string) int {
 	return count
 }
 
-// Переходы брейкера обязаны быть видимы в логе (WARN): trip после порога
-// подряд-фейлов, probe-фейл с backoff'ом, recovery со временем down.
-// Гоняем ТУ ЖЕ логику, что и NewConnection (updateHealthAfterDial вынесен
-// ровно ради этого — по прецеденту tryClaimProbe).
+// stubOutbound — минимальный adapter.Outbound для прогона НАСТОЯЩЕГО
+// NewConnection (не копии его логики): бюджет берётся/возвращается именно
+// там, и утечка слота — главный риск правки, ловить её надо на реальном
+// пути, включая ветки shed и dial-cap.
+type stubOutbound struct {
+	tag   string
+	dials int
+	dial  func(ctx context.Context) (net.Conn, error)
+}
+
+func (o *stubOutbound) Type() string           { return "stub" }
+func (o *stubOutbound) Tag() string            { return o.tag }
+func (o *stubOutbound) Network() []string      { return []string{N.NetworkTCP} }
+func (o *stubOutbound) Dependencies() []string { return nil }
+func (o *stubOutbound) DisplayType() string    { return "Stub" }
+func (o *stubOutbound) IsReady() bool          { return true }
+
+func (o *stubOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	o.dials++
+	return o.dial(ctx)
+}
+
+func (o *stubOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return nil, os.ErrInvalid
+}
+
+// Доменное назначение без DestinationAddresses → NewConnection идёт веткой
+// this.DialContext, без DialSerialNetwork-обвязки.
+func stubMetadata() adapter.InboundContext {
+	return adapter.InboundContext{Destination: M.ParseSocksaddr("stub.invalid:80")}
+}
+
+// Переходы дегрейда обязаны быть видимы в логе (WARN): вход в дегрейд после
+// порога подряд-фейлов, recovery со временем в дегрейде. Гоняем ТУ ЖЕ логику,
+// что и NewConnection (updateHealthAfterDial вынесен ровно ради этого).
 func TestUpdateHealthAfterDial_TransitionsAreLogged(t *testing.T) {
 	log := &recordingLogger{}
 	m := NewConnectionManager(log)
@@ -66,132 +102,269 @@ func TestUpdateHealthAfterDial_TransitionsAreLogged(t *testing.T) {
 	ctx := context.Background()
 	dialErr := context.DeadlineExceeded
 
-	// До порога — тишина и не down.
+	// До порога — тишина и не degraded.
 	for i := 0; i < cbFailThreshold-1; i++ {
-		m.updateHealthAfterDial(ctx, h, "srv", false, dialErr)
+		m.updateHealthAfterDial(ctx, h, "srv", dialErr)
 	}
-	if h.down.Load() {
-		t.Fatal("down до порога подряд-фейлов")
+	if h.degraded.Load() {
+		t.Fatal("degraded до порога подряд-фейлов")
 	}
-	if m.IsOutboundDown("srv") {
-		t.Fatal("IsOutboundDown=true до trip'а")
+	if m.IsOutboundDegraded("srv") {
+		t.Fatal("IsOutboundDegraded=true до порога")
 	}
 	if len(log.warnLines()) != 0 {
-		t.Fatalf("лог до trip'а не пуст: %v", log.warnLines())
+		t.Fatalf("лог до дегрейда не пуст: %v", log.warnLines())
 	}
 
-	// Порог → trip: down + ровно одна строка о trip'е.
-	m.updateHealthAfterDial(ctx, h, "srv", false, dialErr)
-	if !h.down.Load() || !m.IsOutboundDown("srv") {
-		t.Fatal("после порога outbound обязан быть down")
+	// Порог → дегрейд: флаг + ровно одна строка о переходе.
+	m.updateHealthAfterDial(ctx, h, "srv", dialErr)
+	if !h.degraded.Load() || !m.IsOutboundDegraded("srv") {
+		t.Fatal("после порога outbound обязан быть degraded")
 	}
-	if got := warnContaining(log.warnLines(), "circuit-breaker: tripped"); got != 1 {
-		t.Fatalf("строк о trip'е: %d, ожидалась 1; лог: %v", got, log.warnLines())
-	}
-
-	// Дальнейшие обычные фейлы down-outbound'а НЕ плодят trip-строки.
-	m.updateHealthAfterDial(ctx, h, "srv", false, dialErr)
-	if got := warnContaining(log.warnLines(), "circuit-breaker: tripped"); got != 1 {
-		t.Fatalf("повторный фейл добавил trip-строку; лог: %v", log.warnLines())
+	if got := warnContaining(log.warnLines(), "degraded after"); got != 1 {
+		t.Fatalf("строк о входе в дегрейд: %d, ожидалась 1; лог: %v", got, log.warnLines())
 	}
 
-	// Probe-фейл: backoff ×2 + строка об исходе probe.
-	intervalBefore := h.probeInterval.Load()
-	m.updateHealthAfterDial(ctx, h, "srv", true, dialErr)
-	if got := h.probeInterval.Load(); got != intervalBefore*2 {
-		t.Fatalf("probe-фейл: interval %d, ожидался %d", got, intervalBefore*2)
-	}
-	if got := warnContaining(log.warnLines(), "probe failed"); got != 1 {
-		t.Fatalf("строк о probe-фейле: %d, ожидалась 1; лог: %v", got, log.warnLines())
+	// Дальнейшие фейлы degraded-outbound'а НЕ плодят строки о переходе.
+	m.updateHealthAfterDial(ctx, h, "srv", dialErr)
+	if got := warnContaining(log.warnLines(), "degraded after"); got != 1 {
+		t.Fatalf("повторный фейл добавил строку о переходе; лог: %v", log.warnLines())
 	}
 
 	// Отмена юзером — не сигнал здоровья: состояние и лог не меняются.
 	linesBefore := len(log.warnLines())
-	m.updateHealthAfterDial(ctx, h, "srv", false, context.Canceled)
-	if !h.down.Load() || len(log.warnLines()) != linesBefore {
+	m.updateHealthAfterDial(ctx, h, "srv", context.Canceled)
+	if !h.degraded.Load() || len(log.warnLines()) != linesBefore {
 		t.Fatal("context.Canceled повлиял на здоровье или лог")
 	}
 
-	// Успех → recovery: полный сброс + ровно одна строка recovery.
-	m.updateHealthAfterDial(ctx, h, "srv", true, nil)
-	if h.down.Load() || m.IsOutboundDown("srv") || h.consecFails.Load() != 0 || h.probeInterval.Load() != 0 {
-		t.Fatal("успех не сбросил состояние брейкера полностью")
+	// Успех → recovery МГНОВЕННО (никаких probe-окон): полный сброс + ровно
+	// одна строка recovery.
+	m.updateHealthAfterDial(ctx, h, "srv", nil)
+	if h.degraded.Load() || m.IsOutboundDegraded("srv") || h.consecFails.Load() != 0 {
+		t.Fatal("успех не сбросил дегрейд полностью")
 	}
-	if got := warnContaining(log.warnLines(), "circuit-breaker: recovered"); got != 1 {
+	if got := warnContaining(log.warnLines(), "recovered after"); got != 1 {
 		t.Fatalf("строк о recovery: %d, ожидалась 1; лог: %v", got, log.warnLines())
 	}
 
 	// Повторный успех на живом outbound'е — тишина (переходов нет).
 	linesBefore = len(log.warnLines())
-	m.updateHealthAfterDial(ctx, h, "srv", false, nil)
+	m.updateHealthAfterDial(ctx, h, "srv", nil)
 	if len(log.warnLines()) != linesBefore {
 		t.Fatalf("успех без перехода добавил строку: %v", log.warnLines())
 	}
 }
 
-// IsOutboundDown по незнакомому тегу — false и НЕ создаёт health-запись.
-func TestIsOutboundDown_UnknownTag(t *testing.T) {
+// IsOutboundDegraded по незнакомому тегу — false и НЕ создаёт health-запись.
+func TestIsOutboundDegraded_UnknownTag(t *testing.T) {
 	m := NewConnectionManager(&recordingLogger{})
-	if m.IsOutboundDown("nonexistent") {
-		t.Fatal("незнакомый тег считается down")
+	if m.IsOutboundDegraded("nonexistent") {
+		t.Fatal("незнакомый тег считается degraded")
 	}
 	if _, loaded := m.health.Load("nonexistent"); loaded {
-		t.Fatal("IsOutboundDown создал health-запись — обязан быть read-only")
+		t.Fatal("IsOutboundDegraded создал health-запись — обязан быть read-only")
 	}
 }
 
-// Сценарий инцидента (аудит трубы 2026-07-26): сервер помечен down на старой
-// сети, probe-backoff дополз до потолка 30с → юзер переключил Wi-Fi↔LTE, а
-// брейкер ещё до полминуты fast-fail'ит дайлы на новой, рабочей сети.
-// ResetNetwork теперь зовёт ResetHealth: probe-часы сбрасываются, ПЕРВЫЙ же
-// дайл на новой сети идёт полным путём как probe. down при этом остаётся —
-// его снимает только фактический успешный дайл (решение Никиты 2026-07-17:
-// «здоровым» сервер объявляет только реальность, не смена сети).
-func TestResetHealth_NextDialBecomesProbeImmediately(t *testing.T) {
-	m := NewConnectionManager(nil)
+// Семантика бюджета: вне дегрейда слот даётся всегда (одновременность капит
+// глобальный dialSem); в дегрейде — только пока бюджет не насыщен; released
+// слот снова доступен.
+func TestTryAcquireSlot_BudgetSemantics(t *testing.T) {
+	m := NewConnectionManager(&recordingLogger{})
 	h := m.outboundHealthFor("srv")
 
-	// Состояние как в бою после долгого blackhole: down, backoff у потолка,
-	// последний probe — только что, счётчик за порогом.
-	h.down.Store(true)
-	h.consecFails.Store(cbFailThreshold + 3)
-	h.probeInterval.Store(int64(cbProbeMax))
-	h.lastProbe.Store(time.Now().UnixNano())
-
-	// До сброса дайл обязан fast-fail'иться: backoff-окно (30с) не истекло.
-	if h.tryClaimProbe(time.Now().UnixNano()) {
-		t.Fatal("probe прошёл до истечения backoff-окна — гейт брейкера сломан")
+	// Вне дегрейда бюджет не ограничивает даже при превышении.
+	for i := 0; i < degradedDialBudget+5; i++ {
+		if !h.tryAcquireSlot() {
+			t.Fatalf("здоровый outbound получил отказ слота на %d-м дайле", i+1)
+		}
 	}
+	// Вход в дегрейд при уже перебранном бюджете: новых слотов нет — висящие
+	// до дегрейда дайлы тоже пинят треды и считаются в бюджет.
+	h.degraded.Store(true)
+	if h.tryAcquireSlot() {
+		t.Fatal("degraded при inFlight>бюджета выдал слот")
+	}
+	// Дренаж ниже бюджета → слоты снова выдаются.
+	for i := 0; i < 6; i++ {
+		h.releaseSlot()
+	}
+	if !h.tryAcquireSlot() {
+		t.Fatal("degraded с свободным бюджетом отказал в слоте")
+	}
+	h.releaseSlot()
+	for i := 0; i < degradedDialBudget-1; i++ {
+		h.releaseSlot()
+	}
+	if got := h.inFlight.Load(); got != 0 {
+		t.Fatalf("парность acquire/release нарушена: inFlight=%d, ожидался 0", got)
+	}
+}
+
+// Дегрейд НЕ отшивает дайлы, пока бюджет не насыщен: дайл degraded-outbound'а
+// идёт полным путём (реальный вызов DialContext), а слот бюджета возвращается
+// после фейла.
+func TestNewConnection_DegradedDialsFullPathWhileBudgetFree(t *testing.T) {
+	log := &recordingLogger{}
+	m := NewConnectionManager(log)
+	h := m.outboundHealthFor("srv")
+	h.degraded.Store(true)
+	failsBefore := h.consecFails.Load()
+
+	out := &stubOutbound{tag: "srv", dial: func(ctx context.Context) (net.Conn, error) {
+		return nil, context.DeadlineExceeded
+	}}
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	m.NewConnection(context.Background(), out, c1, stubMetadata(), nil)
+
+	if out.dials != 1 {
+		t.Fatalf("degraded-outbound со свободным бюджетом обязан дайлить: dials=%d", out.dials)
+	}
+	if got := h.inFlight.Load(); got != 0 {
+		t.Fatalf("слот бюджета утёк на пути dial-фейла: inFlight=%d", got)
+	}
+	if got := h.consecFails.Load(); got != failsBefore+1 {
+		t.Fatalf("фейл дайла не учёлся: consecFails=%d", got)
+	}
+	if got := warnContaining(log.warnLines(), "budget saturated"); got != 0 {
+		t.Fatalf("shed-строка при свободном бюджете: %v", log.warnLines())
+	}
+}
+
+// Насыщенный бюджет degraded-outbound'а → shed: дайл НЕ идёт (DialContext не
+// зовётся), flow закрывается, rate-limited строка в WARN, чужой слот не
+// возвращается (shed слота не занимал).
+func TestNewConnection_ShedWhenBudgetSaturated(t *testing.T) {
+	log := &recordingLogger{}
+	m := NewConnectionManager(log)
+	h := m.outboundHealthFor("srv")
+	h.degraded.Store(true)
+	h.inFlight.Store(degradedDialBudget) // бюджет выбран висящими дайлами
+	defer h.inFlight.Store(0)
+
+	out := &stubOutbound{tag: "srv", dial: func(ctx context.Context) (net.Conn, error) {
+		t.Error("DialContext вызван при насыщенном бюджете")
+		return nil, os.ErrInvalid
+	}}
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	m.NewConnection(context.Background(), out, c1, stubMetadata(), nil)
+
+	if out.dials != 0 {
+		t.Fatalf("shed-путь дайлил: dials=%d", out.dials)
+	}
+	if got := h.inFlight.Load(); got != degradedDialBudget {
+		t.Fatalf("shed изменил inFlight: %d, ожидался %d", got, degradedDialBudget)
+	}
+	if got := warnContaining(log.warnLines(), "dial budget saturated"); got != 1 {
+		t.Fatalf("строк о shed: %d, ожидалась 1; лог: %v", got, log.warnLines())
+	}
+}
+
+// Главный риск правки: слот бюджета ОБЯЗАН вернуться, когда глобальный
+// dialSem насыщен (tryAcquireDial()==false) — иначе бюджет утекает по одному
+// слоту на каждый такой дроп, и outbound залипает в shed навсегда.
+func TestNewConnection_BudgetSlotReleasedWhenDialSemSaturated(t *testing.T) {
+	log := &recordingLogger{}
+	m := NewConnectionManager(log)
+	h := m.outboundHealthFor("srv")
+
+	// Насыщаем глобальный семафор (package-scope; тесты в пакете идут
+	// последовательно, параллельных пользователей нет).
+	for i := 0; i < maxConcurrentDials; i++ {
+		dialSem <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < maxConcurrentDials; i++ {
+			<-dialSem
+		}
+	}()
+
+	out := &stubOutbound{tag: "srv", dial: func(ctx context.Context) (net.Conn, error) {
+		t.Error("DialContext вызван при насыщенном dialSem")
+		return nil, os.ErrInvalid
+	}}
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	m.NewConnection(context.Background(), out, c1, stubMetadata(), nil)
+
+	if got := h.inFlight.Load(); got != 0 {
+		t.Fatalf("слот бюджета утёк на ветке dial-cap: inFlight=%d", got)
+	}
+	if got := warnContaining(log.warnLines(), "overloaded"); got != 1 {
+		t.Fatalf("строк о dial-cap: %d, ожидалась 1; лог: %v", got, log.warnLines())
+	}
+	// Дроп по dial-cap — не сигнал здоровья outbound'а: дайл даже не начинался.
+	if got := h.consecFails.Load(); got != 0 {
+		t.Fatalf("дроп по dial-cap учёлся как фейл дайла: consecFails=%d", got)
+	}
+}
+
+// Успешный дайл снимает дегрейд МГНОВЕННО — без всяких probe-окон: одна из
+// попыток, идущих в рамках бюджета, ответила — и outbound здоров. Слот
+// бюджета при этом возвращается и на успешном пути.
+func TestNewConnection_SuccessClearsDegradedImmediately(t *testing.T) {
+	log := &recordingLogger{}
+	m := NewConnectionManager(log)
+	h := m.outboundHealthFor("srv")
+	h.degraded.Store(true)
+	h.consecFails.Store(cbFailThreshold + 3)
+
+	remoteA, remoteB := net.Pipe()
+	defer remoteA.Close()
+	defer remoteB.Close()
+	out := &stubOutbound{tag: "srv", dial: func(ctx context.Context) (net.Conn, error) {
+		return remoteA, nil
+	}}
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	m.NewConnection(context.Background(), out, c1, stubMetadata(), nil)
+
+	if h.degraded.Load() || m.IsOutboundDegraded("srv") {
+		t.Fatal("успешный дайл не снял дегрейд мгновенно")
+	}
+	if got := h.consecFails.Load(); got != 0 {
+		t.Fatalf("успех не сбросил consecFails: %d", got)
+	}
+	if got := h.inFlight.Load(); got != 0 {
+		t.Fatalf("слот бюджета утёк на успешном пути: inFlight=%d", got)
+	}
+	if got := warnContaining(log.warnLines(), "recovered after"); got != 1 {
+		t.Fatalf("строк о recovery: %d, ожидалась 1; лог: %v", got, log.warnLines())
+	}
+}
+
+// ResetHealth (смена сети) НЕ снимает дегрейд и НЕ сбрасывает счётчик фейлов.
+// Обнуление здесь выглядит «очевидным» («здоровье меряется на конкретной
+// сети»), но при флапе интерфейса ResetNetwork приходит чаще, чем набирается
+// порог 8 — дегрейд не наступал бы никогда, и шторм висящих дайлов (thread
+// exhaustion на iOS, 2026-07-17) вернулся бы ровно в сценарии слабой сети.
+// Цена сохранения при бюджетной схеме мизерна: ложный дегрейд живёт до
+// первого успешного дайла (~RTT). См. комментарий у ResetHealth, прежде чем
+// «чинить» этот assert.
+func TestResetHealth_KeepsDegradedAndConsecFails(t *testing.T) {
+	m := NewConnectionManager(nil)
+	h := m.outboundHealthFor("srv")
+	h.degraded.Store(true)
+	h.consecFails.Store(cbFailThreshold + 3)
 
 	m.ResetHealth()
 
-	if !h.down.Load() {
-		t.Fatal("ResetHealth снял down — это право только успешного дайла")
+	if !h.degraded.Load() {
+		t.Fatal("ResetHealth снял degraded — это право только успешного дайла")
 	}
-	if got := h.probeInterval.Load(); got != 0 {
-		t.Fatalf("probeInterval после ResetHealth = %d, ожидался 0", got)
-	}
-	if got := h.lastProbe.Load(); got != 0 {
-		t.Fatalf("lastProbe после ResetHealth = %d, ожидался 0", got)
-	}
-	// consecFails ОБЯЗАН пережить сброс. Обнуление здесь выглядит «очевидным»
-	// («здоровье меряется на конкретной сети»), но при флапе интерфейса
-	// ResetNetwork приходит чаще, чем набирается порог 8 — брейкер не
-	// сработал бы никогда, и шторм висящих дайлов (thread exhaustion на iOS,
-	// 2026-07-17) вернулся бы ровно в сценарии слабой сети. См. комментарий
-	// у ResetHealth, прежде чем «чинить» этот assert.
 	if got := h.consecFails.Load(); got != cbFailThreshold+3 {
 		t.Fatalf("consecFails после ResetHealth = %d, ожидался %d (сохранение)",
 			got, cbFailThreshold+3)
-	}
-
-	// Первый дайл на новой сети — probe (interval==0 трактуется как база, а
-	// lastProbe==0 делает окно заведомо истёкшим).
-	if !h.tryClaimProbe(time.Now().UnixNano()) {
-		t.Fatal("после ResetHealth первый дайл обязан идти probe'ом")
-	}
-	// Конкурентный дайл сразу следом — снова fast-fail: probe ровно один.
-	if h.tryClaimProbe(time.Now().UnixNano()) {
-		t.Fatal("второй дайл сразу после захваченного probe обязан fast-fail")
 	}
 }

@@ -52,9 +52,9 @@ func newStubTransport(detour string, exchange func(ctx context.Context, message 
 }
 
 // stubConnManager — минимальный adapter.ConnectionManager для проверки
-// circuit-open-ветки; управляем только IsOutboundDown.
+// circuit-open-ветки; управляем только IsOutboundDegraded.
 type stubConnManager struct {
-	downTags map[string]*atomic.Bool
+	degradedTags map[string]*atomic.Bool
 }
 
 func (m *stubConnManager) Start(stage adapter.StartStage) error            { return nil }
@@ -69,8 +69,8 @@ func (m *stubConnManager) NewConnection(ctx context.Context, this N.Dialer, conn
 func (m *stubConnManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 }
 
-func (m *stubConnManager) IsOutboundDown(tag string) bool {
-	if v, ok := m.downTags[tag]; ok {
+func (m *stubConnManager) IsOutboundDegraded(tag string) bool {
+	if v, ok := m.degradedTags[tag]; ok {
 		return v.Load()
 	}
 	return false
@@ -301,7 +301,7 @@ func TestExchangeWaiterCtxCancel(t *testing.T) {
 func TestExchangeCircuitOpenFastFail(t *testing.T) {
 	t.Parallel()
 	var down atomic.Bool
-	manager := &stubConnManager{downTags: map[string]*atomic.Bool{"proxy": &down}}
+	manager := &stubConnManager{degradedTags: map[string]*atomic.Bool{"proxy": &down}}
 	ctx := service.ContextWith[adapter.ConnectionManager](context.Background(), manager)
 
 	transport := newStubTransport("proxy", func(ctx context.Context, message *dns.Msg) (*dns.Msg, error) {
@@ -347,7 +347,7 @@ func TestExchangeCircuitOpenUnwrapsSelector(t *testing.T) {
 	t.Parallel()
 	var down atomic.Bool
 	down.Store(true)
-	manager := &stubConnManager{downTags: map[string]*atomic.Bool{"nl-1": &down}}
+	manager := &stubConnManager{degradedTags: map[string]*atomic.Bool{"nl-1": &down}}
 	ctx := service.ContextWith[adapter.ConnectionManager](context.Background(), manager)
 	ctx = service.ContextWith[adapter.OutboundManager](ctx, &stubOutboundManager{outbounds: map[string]adapter.Outbound{
 		"select": &stubGroupOutbound{tag: "select", now: "nl-1"},
@@ -378,7 +378,7 @@ func TestExchangeCircuitOpenUnwrapsSelector(t *testing.T) {
 func TestExchangeCircuitOpenWaiterFastFail(t *testing.T) {
 	t.Parallel()
 	var down atomic.Bool
-	manager := &stubConnManager{downTags: map[string]*atomic.Bool{"proxy": &down}}
+	manager := &stubConnManager{degradedTags: map[string]*atomic.Bool{"proxy": &down}}
 	ctx := service.ContextWith[adapter.ConnectionManager](context.Background(), manager)
 
 	release := make(chan struct{})

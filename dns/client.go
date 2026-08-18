@@ -92,15 +92,21 @@ func (c *Client) awaitFlight(ctx context.Context, flight *exchangeFlight) error 
 	}
 }
 
-// transportCircuitOpen — короткое замыкание по мёртвому outbound'у: если
+// transportCircuitOpen — короткое замыкание по фейлящему outbound'у: если
 // transport дайлит через outbound (заявленный в конфиге detour, см.
-// TransportAdapter.detourTag), который circuit-breaker пометил down, — не
-// вставать в single-flight-очередь и не жечь c.timeout вообще. Брейкер
-// прикрывает только app-дайлы (route.ConnectionManager.NewConnection), DNS-путь
-// шёл мимо него (инцидент 2026-08-10). Read-only: DNS не влияет на здоровье,
-// recovery по-прежнему приходит от probe app-дайлов. Наш negFail гасит повторы
-// ПОСЛЕ фейла лидера — эта проверка закрывает другую дыру: ждунов/лидеров
-// ВНУТРИ окна, когда брейкер уже знает, что outbound мёртв.
+// TransportAdapter.detourTag), который дегрейд-контроль пометил degraded
+// (серия отказов дайла), — не вставать в single-flight-очередь и не жечь
+// c.timeout вообще. Дегрейд-контроль прикрывает только app-дайлы
+// (route.ConnectionManager.NewConnection), DNS-путь шёл мимо него (инцидент
+// 2026-08-10). Read-only: DNS не влияет на здоровье, recovery приносят
+// app-дайлы, которые при дегрейде продолжают идти (бюджетная схема
+// 2026-08-18) — жёсткий отказ DNS дайл-путь не стравливает: app-дайлы к
+// IP-назначениям (route.go RouteConnection → NewConnection) резолва не
+// требуют, sniffed-домены резолвятся на прокси удалённо. Наш negFail гасит
+// повторы ПОСЛЕ фейла лидера — эта проверка закрывает другую дыру:
+// ждунов/лидеров ВНУТРИ окна, когда health уже знает, что outbound фейлит.
+// Побочный плюс новой схемы: пометка снимается первым успешным дайлом
+// (~RTT после оживления), DNS разблокируется сразу, а не через окно probe.
 func transportCircuitOpen(ctx context.Context, transport adapter.DNSTransport) error {
 	detour, hasDetour := transport.(interface{ DetourTag() string })
 	if !hasDetour {
@@ -138,7 +144,7 @@ func transportCircuitOpen(ctx context.Context, transport adapter.DNSTransport) e
 			tag = now
 		}
 	}
-	if !connManager.IsOutboundDown(tag) {
+	if !connManager.IsOutboundDegraded(tag) {
 		return nil
 	}
 	return E.New("dns: outbound [", tag, "] circuit-open, fast-fail")

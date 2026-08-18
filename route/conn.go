@@ -62,61 +62,112 @@ func tryAcquireDial() bool {
 
 func releaseDial() { <-dialSem }
 
-// Circuit-breaker per-outbound (2026-07-17). Когда активный сервер сдох (NL
-// null-route хостера — рецидивирующий blackhole play2go), приложения штормят
-// TCP-ретраями: без брейкера КАЖДЫЙ дайл честно висит до TCPConnectTimeout (5s),
-// пиня горутину-стек + cached-буфер + gVisor-endpoint + (в cgo ProtectFunc-
-// резолве) OS-тред. Под iOS-лимитом SetMaxThreads(512) это → `fatal error:
-// thread exhaustion` = SIGABRT (краш мака 2026-07-02/17), а footprint вне
-// Go-heap → jetsam на телефоне. dial-cap 256 ограничивает ОДНОВРЕМЕННОСТЬ, но
-// шторм не гасит (256 висящих × 5s бесконечно). Брейкер помечает outbound down
-// после N подряд-фейлов и fast-fail'ит его дайлы МГНОВЕННО (0ms, слот/тред не
-// занимаются), пропуская 1 probe/с для детекта оживления. Туннель НЕ
-// переключается и НЕ реконнектится (решение Никиты: остаёмся на выбранном
-// сервере — юзер сам пингует и меняет конфиг, авто-подмена врёт о сервере).
-// Сервер self-heal (15-20 мин) → probe ловит → трафик идёт на ТОМ ЖЕ сервере.
+// Дегрейд-контроль per-outbound (2026-07-17, переработан 2026-08-18). Когда
+// активный сервер сдох (NL null-route хостера — рецидивирующий blackhole
+// play2go), приложения штормят TCP-ретраями: без ограничителя КАЖДЫЙ дайл
+// честно висит до TCPConnectTimeout (5s), пиня горутину-стек + cached-буфер +
+// gVisor-endpoint + (в cgo ProtectFunc-резолве) OS-тред. Под iOS-лимитом
+// SetMaxThreads(512) это → `fatal error: thread exhaustion` = SIGABRT (краш
+// мака 2026-07-02/17), а footprint вне Go-heap → jetsam на телефоне. dial-cap
+// 256 ограничивает ОДНОВРЕМЕННОСТЬ, но шторм не гасит (256 висящих × 5s
+// бесконечно). Эта защита ресурсов — обязательная, не опциональная.
+//
+// Первая версия (2026-07-17..2026-08-18) была классическим circuit-breaker'ом:
+// 8 подряд-фейлов → ЗАПОМНЕННЫЙ вердикт «сервер мёртв» (down), все дайлы
+// fast-fail, кроме одного probe раз в backoff-интервал (1s→30s). Замеры с mac
+// TestFlight (2026-08-18): 11 trip'ов за 5 дней, длительности до 56s при
+// реальных сбоях сети в секунды, 4429 fast-fail'ов — после потолка backoff'а
+// между probe проходило 30s, и всё это время НИ ОДНА попытка не шла. Юзер
+// видел «засор»: интернет как будто есть, а труба стоит, пока запрос случайно
+// не попадёт в окно probe. Корень: механизм смешал (1) защиту ресурсов и
+// (2) запомненный вердикт; задержка восстановления — свойство вердикта
+// (кто-то должен сходить его раз-помнить), а не сети.
+//
+// Теперь дегрейд — не ОТКАЗ, а ПОНИЖЕННЫЙ БЮДЖЕТ попыток: после порога
+// подряд-фейлов outbound получает лимит одновременных блокирующих дайлов
+// (degradedDialBudget). Есть свободный слот → дайл идёт полным путём с
+// обычным таймаутом; слотов нет → shed. Отсев — по НАСЫЩЕНИЮ ПРЯМО СЕЙЧАС,
+// а не по флагу «мы решили, что он мёртв». Это самолечится: когда сервер
+// оживает, одна из висящих попыток отвечает через RTT, успех снимает дегрейд
+// мгновенно. Probe/backoff не нужны — восстановление ловят реальные дайлы,
+// которые всегда в полёте. Защита ресурсов сохранена: на больной outbound
+// висит не больше degradedDialBudget дайлов.
+//
+// Сознательно НЕ делаем (чтобы не переизобрели):
+//   - НЕ сжимаем таймаут дайла под наблюдаемый RTT. Скорость восстановления
+//     определяется тем, что попытки постоянно в полёте, а не длиной таймаута.
+//     Плюс сжатие требовало бы ctx-дедлайна, а отмена производного ctx после
+//     успешного дайла может рвать установленные соединения у протоколов,
+//     держащих ctx-привязанные горутины (mux/quic/hysteria). Не лезем.
+//   - НЕ подавляем дегрейд, когда direct тоже падает («виновата локальная
+//     сеть, сервер ни при чём»): при мёртвом Wi-Fi падает ВСЁ, и подавление
+//     вернуло бы ровно шторм 2026-07-17 — полный таймаут × полная
+//     одновременность на слабой сети = thread exhaustion. При бюджетной схеме
+//     ложный дегрейд стоит копейки (урезанный бюджет на ~RTT), усложнение не
+//     окупается.
+//   - Туннель по-прежнему НЕ переключает сервер сам (решение Никиты
+//     2026-07-17: остаёмся на выбранном сервере — юзер сам пингует и меняет
+//     конфиг, авто-подмена врёт о сервере). Никакого авто-failover.
 type outboundHealth struct {
-	consecFails   atomic.Int64 // подряд-фейлов дайла до trip (сброс на успех)
-	down          atomic.Bool  // true = outbound помечен мёртвым
-	lastProbe     atomic.Int64 // unixNano последнего probe-дайла
-	probeInterval atomic.Int64 // текущий backoff-интервал probe (наносек)
-	downSince     atomic.Int64 // unixNano момента trip'а (для лога recovery «сколько был down»)
+	consecFails   atomic.Int64 // подряд-фейлов дайла до дегрейда (сброс на успех)
+	degraded      atomic.Bool  // true = серия отказов, бюджет дайлов урезан (НЕ «сервер мёртв»)
+	degradedSince atomic.Int64 // unixNano входа в дегрейд (для лога recovery «сколько был degraded»)
+	inFlight      atomic.Int64 // блокирующие дайлы этого outbound'а в полёте (бюджетный счётчик)
 }
 
-// Наблюдаемость брейкера (2026-08-11). В диагностике инцидента 2026-08-10 было
-// НОЛЬ следов брейкера при явном dial-шторме (dropped 12→47, goroutines 89→340):
+// Наблюдаемость (2026-08-11). В диагностике инцидента 2026-08-10 было НОЛЬ
+// следов брейкера при явном dial-шторме (dropped 12→47, goroutines 89→340):
 // и брейкер, и dial-cap закрывают через CloseOnHandshakeFailure, чья ошибка
 // никуда не логируется — по логам нельзя было отличить «не сработал» от
 // «сработал и не помогло» (класс unreportable-bug: механизм безопасности
-// невидим). Логируем ПЕРЕХОДЫ (trip/probe/recovery — редкие по построению,
-// probe ≤1/probeInterval), а fast-fail'ы — rate-limited счётчиком раз в
-// секунду, тем же приёмом, что dial-cap (dialLastLogSec + CompareAndSwap).
-// Уровень WARN: дефолтный log level клиента — 'warn' (singbox_config_builder),
-// INFO/DEBUG до box.log не доехали бы.
+// невидим). Логируем ПЕРЕХОДЫ (degraded/recovered — редкие по построению),
+// а shed'ы — rate-limited счётчиком раз в секунду, тем же приёмом, что
+// dial-cap (dialLastLogSec + CompareAndSwap). Уровень WARN: дефолтный log
+// level клиента — 'warn' (singbox_config_builder), INFO/DEBUG до box.log
+// не доехали бы.
 var (
-	cbFastFails      atomic.Uint64
-	cbFastFailLogSec atomic.Int64
+	cbShedDials  atomic.Uint64
+	cbShedLogSec atomic.Int64
 )
 
 const (
-	cbFailThreshold = 8                // подряд-фейлов → trip (пометить down)
-	cbProbeBase     = time.Second      // стартовый интервал probe после trip
-	cbProbeMax      = 30 * time.Second // потолок backoff'а (=макс время между проверками recovery)
+	// cbFailThreshold — подряд-фейлов дайла до входа в дегрейд. Это не
+	// «диагноз серверу», а просто сигнал «пора урезать бюджет попыток».
+	cbFailThreshold = 8
+
+	// degradedDialBudget — потолок одновременных блокирующих дайлов
+	// degraded-outbound'а. Почему 32 против потолков системы: iOS governor
+	// SetMaxThreads(512) — жёсткая смерть (SIGABRT); глобальный dialSem = 256;
+	// DNS-путь ест ещё до 96 своих слотов (route/dns.go). 32 висящих дайла
+	// пинят ≤32 OS-тредов (~6% от 512) — даже несколько одновременно
+	// degraded outbound'ов вместе с DNS-cap'ом далеки от потолка тредов, и
+	// 224 слота глобального dialSem остаются живым outbound'ам. При этом 32
+	// попытки × 5s TCPConnectTimeout под app-штормом означают, что попытки
+	// в полёте практически непрерывно — оживший сервер детектится за ~RTT,
+	// а не за окно probe. Меньше (например 8) — жальче для реального
+	// юзерского трафика в транзиентный сбой; больше — теряется смысл
+	// урезания. Тюнится по on-device замерам.
+	degradedDialBudget = 32
 )
 
-// tryClaimProbe — атомарно решает, идёт ли этот дайл down-outbound'а полным
-// путём как probe (не чаще раза в probeInterval; 0 трактуется как cbProbeBase —
-// свежий trip и сброс ResetHealth дают немедленный probe). Вынесено из
-// NewConnection единственно ради юнит-теста (conn_test.go): тест обязан
-// проверять ТУ ЖЕ логику, а не её копию — иначе связанность-на-расстоянии.
-func (h *outboundHealth) tryClaimProbe(nowNano int64) bool {
-	last := h.lastProbe.Load()
-	interval := h.probeInterval.Load()
-	if interval == 0 {
-		interval = int64(cbProbeBase)
+// tryAcquireSlot занимает слот бюджета дайлов outbound'а. inFlight считается
+// ВСЕГДА (не только в дегрейде): дайлы, повисшие ещё до входа в дегрейд, тоже
+// пинят треды и обязаны учитываться в бюджете — иначе trip при 256 висящих
+// пустил бы поверх ещё 32. Отсев только в дегрейде и только при насыщении.
+// false → flow надо shed'нуть. Вынесено в метод ради юнит-теста
+// (conn_test.go): тест обязан гонять ТУ ЖЕ логику, а не её копию.
+func (h *outboundHealth) tryAcquireSlot() bool {
+	if h.inFlight.Add(1) > degradedDialBudget && h.degraded.Load() {
+		h.inFlight.Add(-1)
+		return false
 	}
-	return nowNano-last >= interval && h.lastProbe.CompareAndSwap(last, nowNano)
+	return true
 }
+
+// releaseSlot возвращает слот бюджета. Обязан вызываться ровно один раз на
+// каждый успешный tryAcquireSlot, на ВСЕХ путях выхода — утёкший слот не
+// самоисцеляется, и outbound залипнет в shed навсегда.
+func (h *outboundHealth) releaseSlot() { h.inFlight.Add(-1) }
 
 type ConnectionManager struct {
 	logger      logger.ContextLogger
@@ -132,7 +183,7 @@ func NewConnectionManager(logger logger.ContextLogger) *ConnectionManager {
 }
 
 // outboundHealthFor возвращает (создавая при первом обращении) health-состояние
-// брейкера для outbound'а по тегу.
+// outbound'а по тегу.
 func (m *ConnectionManager) outboundHealthFor(tag string) *outboundHealth {
 	if v, ok := m.health.Load(tag); ok {
 		return v.(*outboundHealth)
@@ -141,14 +192,14 @@ func (m *ConnectionManager) outboundHealthFor(tag string) *outboundHealth {
 	return v.(*outboundHealth)
 }
 
-// IsOutboundDown — read-only доступ к пометке down для не-dial путей
+// IsOutboundDegraded — read-only доступ к пометке degraded для не-dial путей
 // (adapter.ConnectionManager). Сейчас единственный потребитель — DNS-клиент:
-// fast-fail запросов через transport, чей detour-outbound уже помечен мёртвым,
+// fast-fail запросов через transport, чей detour-outbound в дегрейде,
 // вместо 10s ожидания на имя (инцидент 2026-08-10). Нарочно НЕ создаёт
-// health-запись: отсутствие записи = «не down».
-func (m *ConnectionManager) IsOutboundDown(tag string) bool {
+// health-запись: отсутствие записи = «не degraded».
+func (m *ConnectionManager) IsOutboundDegraded(tag string) bool {
 	if v, ok := m.health.Load(tag); ok {
-		return v.(*outboundHealth).down.Load()
+		return v.(*outboundHealth).degraded.Load()
 	}
 	return false
 }
@@ -161,50 +212,35 @@ func (m *ConnectionManager) Count() int {
 	return m.connections.Len()
 }
 
-// ResetHealth — сброс probe-часов circuit-breaker'а при смене сети (зовётся
-// из NetworkManager.ResetNetwork рядом с CloseAll: смена интерфейса, resume
-// Windows, wake-reset iOS после долгого сна).
+// ResetHealth — хук смены сети (зовётся из NetworkManager.ResetNetwork рядом
+// с CloseAll: смена интерфейса, resume Windows, wake-reset iOS после долгого
+// сна). Исторически сбрасывал probe-часы circuit-breaker'а: без сброса
+// сервер, помеченный down на старом Wi-Fi, fast-fail'ил дайлы на новой,
+// рабочей сети до 30с (потолок probe-backoff'а). С переходом на бюджетную
+// схему (2026-08-18) probe-часов больше нет, а дайлы degraded-outbound'а
+// и так идут полным путём (до degradedDialBudget одновременных) — первая же
+// попытка на новой сети проверяет сервер сама, сбрасывать нечего.
 //
-// ЗАЧЕМ. Здоровье outbound'а меряется НА КОНКРЕТНОЙ СЕТИ: 8 подряд-фейлов на
-// умершем Wi-Fi ничего не говорят о доступности сервера с LTE. Без сброса
-// сервер, помеченный down на старой сети, продолжал fast-fail'ить все дайлы
-// на новой, рабочей — до 30с (потолок probe-backoff'а): «переключил сеть, а
-// VPN ещё полминуты не работает».
+// degraded/consecFails НЕ сбрасываем — это решение, не забывчивость. При
+// ФЛАПЕ интерфейса (дрожащий Wi-Fi даёт ResetNetwork каждые несколько
+// секунд) счётчик обнулялся бы раньше, чем добирался до порога 8, дегрейд
+// не наступал бы НИКОГДА — и возвращается шторм висящих дайлов ровно в
+// сценарии слабой сети на iOS, где он убивает процесс (thread exhaustion,
+// 2026-07-17). Цена сохранения при бюджетной схеме мизерна: ложный дегрейд
+// живёт до первого успешного дайла (~RTT), а не до окна probe. Гейт:
+// conn_test.go assert'ит сохранение. inFlight не трогаем тем более — он
+// привязан к реально висящим дайлам, а не к сети.
 //
-// Пометку down НЕ снимаем НАМЕРЕННО — её снимает только фактический успешный
-// дайл (см. NewConnection). Авто-снятие вернуло бы ровно тот шторм, ради
-// которого брейкер строился (8 висящих дайлов × 5с TCPConnectTimeout ×
-// каждый down-outbound), и противоречило бы решению Никиты 2026-07-17: сервер
-// не подменяем и «здоровым» его не объявляем — это делает только реальность.
-// Сбрасываем только probe-часы: probeInterval → 0 (в NewConnection это
-// трактуется как cbProbeBase) и lastProbe → 0 — ПЕРВЫЙ ЖЕ дайл на новой сети
-// идёт полным путём как probe. Цена: один полный дайл (≤5с TCPConnectTimeout)
-// на каждый down-outbound на смену сети; остальные дайлы down-сервера
-// по-прежнему fast-fail, шторм не возвращается.
-//
-// consecFails ТОЖЕ сохраняем — это решение, не забывчивость. Цена сохранения
-// мала: 7 фейлов со старого Wi-Fi + один транзиентный фейл на свежей LTE —
-// и живой сервер на ~1с ложно down (probe через cbProbeBase тут же снимет).
-// Цена сброса — катастрофа в худшем сценарии: при ФЛАПЕ интерфейса
-// (дрожащий Wi-Fi даёт ResetNetwork каждые несколько секунд) счётчик
-// обнулялся бы раньше, чем добирался до порога 8, брейкер не срабатывал бы
-// НИКОГДА — и возвращается шторм висящих дайлов, ради которого он написан,
-// ровно в сценарии слабой сети на iOS, где тот убивает процесс (thread
-// exhaustion, инцидент 2026-07-17). Асимметрия односторонняя: секунда
-// ложного fast-fail против SIGABRT. Гейт: conn_test.go assert'ит сохранение.
+// Метод оставлен в интерфейсе (adapter.ConnectionManager) с пустым телом:
+// вызов из ResetNetwork — осмысленный chokepoint «сеть сменилась», и если
+// сетепривязанное состояние здесь снова появится, чистить его надо будет
+// именно тут.
 //
 // Смежное per-outbound состояние, ОСОЗНАННО не сбрасываемое здесь: DNS
 // negFail-кэш (dns/client.go) — TTL 5с, самоистекает быстрее, чем юзер
 // заметит; urltest-история (UI-вердикты пингов) — обновляется только явным
 // пингом по решению Никиты, к маршрутизации трафика не привязана.
-func (m *ConnectionManager) ResetHealth() {
-	m.health.Range(func(_, value any) bool {
-		health := value.(*outboundHealth)
-		health.probeInterval.Store(0)
-		health.lastProbe.Store(0)
-		return true
-	})
-}
+func (m *ConnectionManager) ResetHealth() {}
 
 func (m *ConnectionManager) CloseAll() {
 	m.access.Lock()
@@ -250,47 +286,41 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = adapter.WithContext(ctx, &metadata)
-	// Circuit-breaker (2026-07-17): достаём health активного outbound'а и, если
-	// он помечен down, fast-fail'им дайл МГНОВЕННО (кроме ≤1 probe/с). Проверка
-	// ДО dial-cap — fast-fail'ные дайлы не касаются семафора, слоты остаются
-	// свободны для probe и дайлов на живые серверы. См. outboundHealth.
+	// Дегрейд-контроль (2026-07-17, бюджетная схема 2026-08-18): дайл
+	// конкурирует за per-outbound бюджет одновременных блокирующих дайлов.
+	// Вне дегрейда бюджет не ограничивает (капит глобальный dialSem); в
+	// дегрейде насыщение бюджета → shed. Проверка ДО dial-cap — shed'нутые
+	// дайлы не касаются глобального семафора, его слоты остаются живым
+	// outbound'ам. См. комментарий у outboundHealth.
 	var (
 		health    *outboundHealth
 		healthTag string
-		isProbe   bool
 	)
 	if outbound, isOutbound := this.(adapter.Outbound); isOutbound {
 		healthTag = outbound.Tag()
 		health = m.outboundHealthFor(healthTag)
-		if health.down.Load() {
-			// Recovery ловится ТОЛЬКО пропущенным probe: пропускаем 1 дайл раз в
-			// interval (растёт с backoff'ом), остальные fast-fail (0ms). Никакого
-			// синтетического трафика — это одна из уже идущих попыток приложений.
-			if health.tryClaimProbe(time.Now().UnixNano()) {
-				isProbe = true // идёт полным путём; успех снимет down, фейл увеличит backoff
-				// Probe редкий по построению (≤1 раз в probeInterval) — WARN не флудит.
-				// Отдельная строка на старте нужна: probe может висеть до 5s
-				// (TCPConnectTimeout), и без неё окно «probe в полёте» невидимо.
-				m.logger.WarnContext(ctx, "outbound [", healthTag, "] circuit-breaker: probing (down for ",
-					time.Duration(time.Now().UnixNano()-health.downSince.Load()).Round(time.Second), ")")
-			} else {
-				// Rate-limited (≤1 строка/с) счётчик fast-fail'ов — по образцу
-				// dial-cap ниже. Каждый дайл логировать нельзя: в шторме их тысячи/с.
-				failed := cbFastFails.Add(1)
-				now := time.Now().Unix()
-				last := cbFastFailLogSec.Load()
-				if now != last && cbFastFailLogSec.CompareAndSwap(last, now) {
-					m.logger.WarnContext(ctx, "outbound [", healthTag, "] circuit-open, fast-failed ", failed, " dials total")
-				}
-				N.CloseOnHandshakeFailure(conn, onClose, E.New("outbound [", healthTag, "] circuit-open (server unreachable)"))
-				return
+		if !health.tryAcquireSlot() {
+			// Rate-limited (≤1 строка/с) счётчик shed'ов — по образцу dial-cap
+			// ниже. Каждый дайл логировать нельзя: в шторме их тысячи/с.
+			shed := cbShedDials.Add(1)
+			now := time.Now().Unix()
+			last := cbShedLogSec.Load()
+			if now != last && cbShedLogSec.CompareAndSwap(last, now) {
+				m.logger.WarnContext(ctx, "outbound [", healthTag, "] degraded: dial budget saturated, shed ", shed, " dials total")
 			}
+			N.CloseOnHandshakeFailure(conn, onClose, E.New("outbound [", healthTag, "] degraded, dial budget saturated"))
+			return
 		}
 	}
 	// P1-a (2026-07-02): cap на одновременные блокирующие исходящие dial'ы.
 	// На насыщении дропаем flow (не копим заблокированные горутины/треды/буферы),
 	// с rate-limited логом — тем же приёмом, что DNS-обмен на udpnat-пути.
 	if !tryAcquireDial() {
+		// Слот бюджета взят, а глобального слота нет — вернуть, иначе бюджет
+		// утечёт и outbound залипнет в shed навсегда.
+		if health != nil {
+			health.releaseSlot()
+		}
 		dropped := dialsDropped.Add(1)
 		now := time.Now().Unix()
 		last := dialLastLogSec.Load()
@@ -309,13 +339,15 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	} else {
 		remoteConn, err = this.DialContext(ctx, N.NetworkTCP, metadata.Destination)
 	}
-	// Слот держим только на время самого блокирующего dial — соединение уже
-	// установлено (или упало), дальше копи-горутины тред не держат.
+	// Слоты (глобальный и бюджетный) держим только на время самого
+	// блокирующего dial — соединение уже установлено (или упало), дальше
+	// копи-горутины тред не держат.
 	releaseDial()
-	// Circuit-breaker: обновляем здоровье outbound'а по исходу дайла. Отмена по
-	// ctx (юзер закрыл сокет) здоровьем не считается.
 	if health != nil {
-		m.updateHealthAfterDial(ctx, health, healthTag, isProbe, err)
+		health.releaseSlot()
+		// Обновляем здоровье outbound'а по исходу дайла. Отмена по ctx
+		// (юзер закрыл сокет) здоровьем не считается.
+		m.updateHealthAfterDial(ctx, health, healthTag, err)
 	}
 	if err != nil {
 		var remoteString string
@@ -354,49 +386,37 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
 }
 
-// updateHealthAfterDial — переходы состояния брейкера по исходу дайла. Вынесено
-// из NewConnection по тому же принципу, что tryClaimProbe: юнит-тест
-// (conn_test.go) обязан проверять ТУ ЖЕ логику переходов и логирования, а не её
-// копию. Логируются только ПЕРЕХОДЫ (trip / probe-фейл / recovery) — они редкие
-// по построению, в отличие от самих дайлов; см. комментарий у cbFastFails.
-func (m *ConnectionManager) updateHealthAfterDial(ctx context.Context, health *outboundHealth, tag string, isProbe bool, err error) {
+// updateHealthAfterDial — переходы состояния дегрейда по исходу дайла.
+// Вынесено из NewConnection ради юнит-теста (conn_test.go): тест обязан
+// проверять ТУ ЖЕ логику переходов и логирования, а не её копию. Логируются
+// только ПЕРЕХОДЫ (degraded / recovered) — они редкие по построению, в
+// отличие от самих дайлов; см. комментарий у cbShedDials.
+func (m *ConnectionManager) updateHealthAfterDial(ctx context.Context, health *outboundHealth, tag string, err error) {
 	switch {
 	case err == nil:
-		// Успех (обычный дайл или probe) → сервер жив/ожил, полный сброс.
-		// Swap вместо Store: ловим переход true→false ровно один раз для лога
-		// (снять down может и обычный дайл, стартовавший до trip'а, не только probe).
+		// Успех → сервер жив/ожил, полный сброс. Дегрейд снимается МГНОВЕННО
+		// первым же успешным дайлом — никакого probe-окна ждать не нужно,
+		// попытки и так постоянно в полёте (в этом весь смысл бюджетной
+		// схемы). Swap вместо Store: ловим переход true→false ровно один раз
+		// для лога.
 		health.consecFails.Store(0)
-		health.probeInterval.Store(0)
-		if health.down.Swap(false) {
-			m.logger.WarnContext(ctx, "outbound [", tag, "] circuit-breaker: recovered after ",
-				time.Duration(time.Now().UnixNano()-health.downSince.Load()).Round(time.Second), " down")
+		if health.degraded.Swap(false) {
+			m.logger.WarnContext(ctx, "outbound [", tag, "] recovered after ",
+				time.Duration(time.Now().UnixNano()-health.degradedSince.Load()).Round(time.Second), " degraded")
 		}
 	case errors.Is(err, context.Canceled):
 		// отмена юзером — не сигнал здоровья, игнор
-	case isProbe:
-		// probe упал — сервер всё ещё мёртв, backoff (×2, потолок cbProbeMax).
-		next := health.probeInterval.Load() * 2
-		if next < int64(cbProbeBase) {
-			next = int64(cbProbeBase)
-		}
-		if next > int64(cbProbeMax) {
-			next = int64(cbProbeMax)
-		}
-		health.probeInterval.Store(next)
-		m.logger.WarnContext(ctx, "outbound [", tag, "] circuit-breaker: probe failed, next probe in ",
-			time.Duration(next))
 	default:
-		// обычный dial-фейл (timeout/refused) на живом-считающемся outbound →
-		// счётчик; порог → trip: пометить down, стартовать probe-часы.
-		// CompareAndSwap вместо Load+Store: переход false→true клеймится ровно
-		// одним дайлом — и probe-часы/downSince/лог не перетираются конкурентом.
+		// dial-фейл (timeout/refused) → счётчик; порог → дегрейд: урезать
+		// бюджет одновременных попыток. Это НЕ вердикт «сервер мёртв» —
+		// дайлы продолжают идти (до degradedDialBudget одновременных).
+		// CompareAndSwap вместо Load+Store: переход false→true клеймится
+		// ровно одним дайлом — degradedSince/лог не перетираются конкурентом.
 		fails := health.consecFails.Add(1)
-		if fails >= cbFailThreshold && health.down.CompareAndSwap(false, true) {
-			health.probeInterval.Store(int64(cbProbeBase))
-			health.lastProbe.Store(time.Now().UnixNano())
-			health.downSince.Store(time.Now().UnixNano())
-			m.logger.WarnContext(ctx, "outbound [", tag, "] circuit-breaker: tripped after ",
-				fails, " consecutive dial failures")
+		if fails >= cbFailThreshold && health.degraded.CompareAndSwap(false, true) {
+			health.degradedSince.Store(time.Now().UnixNano())
+			m.logger.WarnContext(ctx, "outbound [", tag, "] degraded after ", fails,
+				" consecutive dial failures (concurrent dial budget capped at ", degradedDialBudget, ")")
 		}
 	}
 }
