@@ -222,7 +222,8 @@ func NewUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	if len(certificate) > 0 {
 		certPool := x509.NewCertPool()
 		if !certPool.AppendCertsFromPEM(certificate) {
-			return nil, E.New("failed to parse certificate:\n\n", certificate)
+			// string(): E.New/format.ToString паникует «unknown value» на []byte.
+			return nil, E.New("failed to parse certificate:\n\n", string(certificate))
 		}
 		tlsConfig.RootCAs = certPool
 	}

@@ -2,7 +2,9 @@ package endpoint
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -10,6 +12,8 @@ import (
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/invalid"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -124,9 +128,30 @@ func (m *Manager) Remove(tag string) error {
 }
 
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
-	endpoint, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
+	// InHive: зеркало hinvalid-fallback'а аутбаундов (adapter/outbound/manager.go
+	// Create) — ошибка ИЛИ паника конструктора endpoint'а (битый base64-ключ,
+	// reserved не из 3 значений, кривые awg-параметры) деградирует в
+	// invalid-заглушку с читаемой причиной, а не валит box.New для всего профиля.
+	endpoint, err := func() (ep adapter.Endpoint, e error) {
+		defer func() {
+			if r := recover(); r != nil {
+				msg := fmt.Sprint(r) // fmt.Sprint не паникует, в отличие от format.ToString
+				m.logger.Error("endpoint[", tag, "] constructor panic: ", msg, "\n", string(debug.Stack()))
+				ep, e = nil, E.New("constructor panic: ", msg)
+			}
+		}()
+		return m.registry.Create(ctx, router, logger, tag, outboundType, options)
+	}()
 	if err != nil {
-		return err
+		err2 := E.New("parse endpoint[", tag, "] error: ", err)
+		m.logger.Error(err2)
+		endpoint, err = invalid.NewEndpoint(ctx, router, logger, tag, option.InvalidOptions{
+			InvalidConfig: options,
+			Err:           err2,
+		})
+		if err != nil {
+			return err
+		}
 	}
 	m.access.Lock()
 	defer m.access.Unlock()

@@ -78,6 +78,13 @@ func NewRealityClient(ctx context.Context, logger logger.ContextLogger, serverAd
 		return nil, E.New("invalid public_key")
 	}
 	var shortID [8]byte
+	// Пре-чек длины ОБЯЗАН стоять до hex.Decode: у hex.Decode нет проверки
+	// границ dst, sid ≥18 hex-символов паникует index-out-of-range прямо в
+	// создании аутбаунда (panic минует hinvalid-fallback и кладёт весь профиль);
+	// пост-чек decodedLen > 8 для такого входа недостижим.
+	if len(options.Reality.ShortID) > hex.EncodedLen(len(shortID)) {
+		return nil, E.New("invalid short_id: ", options.Reality.ShortID)
+	}
 	decodedLen, err := hex.Decode(shortID[:], []byte(options.Reality.ShortID))
 	if err != nil {
 		return nil, E.Cause(err, "decode short_id")

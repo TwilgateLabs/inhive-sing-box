@@ -108,7 +108,9 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		for _, hostKey := range options.HostKey {
 			key, _, _, _, err := ssh.ParseAuthorizedKey([]byte(hostKey))
 			if err != nil {
-				return nil, E.New("parse host key ", key)
+				// hostKey (входная строка), не key: key на ошибке всегда nil,
+				// и сообщение «parse host key nil» не давало диагностики.
+				return nil, E.Cause(err, "parse host key: ", hostKey)
 			}
 			outbound.hostKey = append(outbound.hostKey, key)
 		}

@@ -203,7 +203,10 @@ func (e *Endpoint) Start(resolve bool) error {
 	}
 	err = wgDevice.IpcSet(ipcConf)
 	if err != nil {
-		return E.Cause(err, "setup wireguard: \n", ipcConf)
+		// НЕ вкладывать ipcConf в ошибку: он несёт private_key/preshared_key
+		// hex, а этот текст уезжает в user-facing ошибку старта и логи.
+		// ipcErrorf из wireguard-go сам называет отвергнутый UAPI-ключ.
+		return E.Cause(err, "setup wireguard")
 	}
 	e.device = wgDevice
 	e.pause = service.FromContext[pause.Manager](e.options.Context)

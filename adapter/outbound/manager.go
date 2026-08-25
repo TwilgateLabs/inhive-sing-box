@@ -2,8 +2,10 @@ package outbound
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -311,7 +313,21 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if tag == "" {
 		return os.ErrInvalid
 	}
-	outbound, err := m.registry.CreateOutbound(ctx, router, logger, tag, inboundType, options)
+	// InHive: recover вокруг конструктора — паника из New* (index OOB, nil deref,
+	// E.New(не-строкового значения)) обязана деградировать в hinvalid для ОДНОГО
+	// аутбаунда, а не убивать box.New целиком. Инцидент packetEncoding=none
+	// 2026-08-24: ошибка конструктора паниковала и клала весь профиль, потому
+	// что fallback ниже ловит только возвращённые ошибки.
+	outbound, err := func() (o adapter.Outbound, e error) {
+		defer func() {
+			if r := recover(); r != nil {
+				msg := fmt.Sprint(r) // fmt.Sprint не паникует, в отличие от format.ToString
+				m.logger.Error("outbound[", tag, "] constructor panic: ", msg, "\n", string(debug.Stack()))
+				o, e = nil, E.New("constructor panic: ", msg)
+			}
+		}()
+		return m.registry.CreateOutbound(ctx, router, logger, tag, inboundType, options)
+	}()
 	if err != nil { // InHive: fallback to invalid config вместо жёсткого fail
 		err2 := E.New("parse outbound[", tag, "] error: ", err)
 		m.logger.Error(err2)

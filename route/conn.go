@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -710,10 +711,14 @@ func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.P
 	// udpnat2/conn.go:68 upstream (a sing bump 0.8.4->0.8.9 is WIP/risky).
 	defer func() {
 		if r := recover(); r != nil {
-			m.logger.ErrorContext(ctx, "packet connection copy panic recovered: ", r)
+			// fmt.Sprint: сырое r через format.ToString ре-паникует на
+			// не-примитивных panic-значениях — containment ловил бы только
+			// «удобные» паники.
+			msg := fmt.Sprint(r)
+			m.logger.ErrorContext(ctx, "packet connection copy panic recovered: ", msg)
 			if !done.Swap(true) {
 				if onClose != nil {
-					onClose(E.New("packet connection copy panic: ", r))
+					onClose(E.New("packet connection copy panic: ", msg))
 				}
 			}
 			common.Close(source, destination)

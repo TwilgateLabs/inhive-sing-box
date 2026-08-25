@@ -637,9 +637,15 @@ func (m *OutboundMonitoring) executeTask(task *testTask) {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					err = E.New("outbound ", task.outboundTag, " test panicked: ", r)
+					// fmt.Sprint вместо сырого r: E.New/логгер идут через
+					// format.ToString, который паникует на не-примитивных
+					// panic-значениях — ре-паника внутри recover убила бы
+					// процесс из мониторинг-горутины (ровно то, от чего
+					// эта сеть и защищает).
+					msg := fmt.Sprint(r)
+					err = E.New("outbound ", task.outboundTag, " test panicked: ", msg)
 					delay = adapter.URLTestHistory{Delay: TimeoutDelay}
-					m.logger.Error("outbound ", task.outboundTag, " test panic recovered: ", r)
+					m.logger.Error("outbound ", task.outboundTag, " test panic recovered: ", msg)
 				}
 			}()
 			delay, err = m.tester(m.ctx, task.outboundTag)

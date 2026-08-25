@@ -277,6 +277,57 @@ func New(options Options) (*Box, error) {
 			return nil, E.Cause(err, "initialize inbound[", i, "]")
 		}
 	}
+	// InHive: линт членов групп ДО создания аутбаундов. Висячий тег в
+	// selector/urltest проходит import-валидацию (CheckConfigOptions не зовёт
+	// Start), а на Start кладёт весь профиль («dependency not found» /
+	// «default outbound not found»). Чужие sing-box конфиги с опечаткой в
+	// группе — реальный вход universal-клиента: неизвестный член выкидываем с
+	// WARN, пустеющая группа — честная ошибка с именем группы.
+	{
+		knownTags := make(map[string]bool)
+		for i, o := range options.Outbounds {
+			if o.Tag != "" {
+				knownTags[o.Tag] = true
+			} else {
+				knownTags[F.ToString(i)] = true
+			}
+		}
+		for _, e := range options.Endpoints {
+			if e.Tag != "" {
+				knownTags[e.Tag] = true
+			}
+		}
+		lintLogger := logFactory.Logger()
+		for gi := range options.Outbounds {
+			g := &options.Outbounds[gi]
+			var members *[]string
+			var defaultTag *string
+			switch o := g.Options.(type) {
+			case *option.SelectorOutboundOptions:
+				members, defaultTag = &o.Outbounds, &o.Default
+			case *option.URLTestOutboundOptions:
+				members = &o.Outbounds
+			default:
+				continue
+			}
+			kept := (*members)[:0]
+			for _, member := range *members {
+				if knownTags[member] {
+					kept = append(kept, member)
+				} else {
+					lintLogger.Warn("group[", g.Tag, "]: dropping unknown member ", member)
+				}
+			}
+			if len(kept) == 0 {
+				return nil, E.New("group[", g.Tag, "] has no valid members")
+			}
+			*members = kept
+			if defaultTag != nil && *defaultTag != "" && !knownTags[*defaultTag] {
+				lintLogger.Warn("group[", g.Tag, "]: dropping unknown default ", *defaultTag)
+				*defaultTag = ""
+			}
+		}
+	}
 	for i, outboundOptions := range options.Outbounds {
 		var tag string
 		if outboundOptions.Tag != "" {

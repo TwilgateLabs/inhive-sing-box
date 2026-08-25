@@ -184,7 +184,11 @@ func registerStubForRemovedOutbounds(registry *outbound.Registry) {
 	// всего конфига, у пинга вечный blank, у туннеля невнятный отказ. Со стабом
 	// парс проходит, а create отдаёт детерминированную ошибку — пинг-классификатор
 	// мапит её в честный × (config_rejected), туннель — в понятный лог.
-	outbound.Register[option.StubOptions](registry, C.TypePsiphon, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.StubOptions) (adapter.Outbound, error) {
+	// Тип опций — НАСТОЯЩИЙ PsiphonOutboundOptions, не StubOptions: ray2sing
+	// эмитит egress_region и др. поля, а строгий unmarshal (DisallowUnknownFields)
+	// на StubOptions валил ВЕСЬ конфиг «unknown field» — то есть один
+	// psiphon://…?region=US убивал все сервера профиля ещё до create-фазы.
+	outbound.Register[option.PsiphonOutboundOptions](registry, C.TypePsiphon, func(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.PsiphonOutboundOptions) (adapter.Outbound, error) {
 		return nil, E.New("psiphon outbound is not available in this build")
 	})
 }

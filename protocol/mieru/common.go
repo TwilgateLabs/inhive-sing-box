@@ -79,6 +79,12 @@ func getMultiplexingLevel(multiplexingLevel string) *mierupb.MultiplexingLevel {
 	case "", "DEFAULT", "MULTIPLEXING_DEFAULT":
 		return mierupb.MultiplexingLevel_MULTIPLEXING_DEFAULT.Enum()
 
+	// OFF — first-class documented mieru value (client-install.md step 7);
+	// без этого case юзер, скопировавший свой рабочий mieru-конфиг в ссылку,
+	// получал вечный «invalid multiplexing level» на создании аутбаунда.
+	case "OFF", "MULTIPLEXING_OFF":
+		return mierupb.MultiplexingLevel_MULTIPLEXING_OFF.Enum()
+
 	case "LOW", "MULTIPLEXING_LOW":
 		return mierupb.MultiplexingLevel_MULTIPLEXING_LOW.Enum()
 
