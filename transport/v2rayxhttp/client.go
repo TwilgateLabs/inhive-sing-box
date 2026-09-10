@@ -781,3 +781,23 @@ func createHTTPClient(dest M.Socksaddr, dialer N.Dialer, options *option.V2RayXH
 	}
 	return client
 }
+
+// wakeProbePingTimeout — таймаут одного PING'а в пробе после сна. Равен
+// дефолтному http2 PingTimeout: короче нельзя (см. v2rayhttp.ProbeTransport —
+// ack идёт после DATA-фреймов и подъёма радио), длиннее незачем.
+const wakeProbePingTimeout = 15 * time.Second
+
+// ProbeAfterSleep реализует adapter.SleepProber для xhttp: PING по обоим
+// xmux-пулам, закрытие только не ответивших соединений. Живые стримы (в т.ч.
+// download-GET, который у packet-up живёт всю жизнь проксируемого conn) не
+// трогаются — ровно то, чего не умеет ни Close()/Reset(), ни апстримный
+// CloseIdleConnections (для xhttp conn почти никогда не idle).
+func (c *Client) ProbeAfterSleep(ctx context.Context) (probed int, closed int) {
+	probed, closed = c.xmuxManager.Probe(ctx, wakeProbePingTimeout)
+	if c.xmuxManager2 != nil {
+		p, cl := c.xmuxManager2.Probe(ctx, wakeProbePingTimeout)
+		probed += p
+		closed += cl
+	}
+	return probed, closed
+}

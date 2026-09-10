@@ -271,3 +271,42 @@ func (m *XmuxManager) getXmuxClientLocked() (*XmuxClient, []*XmuxClient) {
 	xmuxClient.handedOutAt = now
 	return xmuxClient, toClose
 }
+
+// connProber — DialerClient, умеющий проверить свой h2-пул (DefaultDialerClient).
+type connProber interface {
+	ProbeConns(ctx context.Context, timeout time.Duration) (probed int, closed int)
+}
+
+// Probe — InHive 2026-09-08: проверка ВСЕХ клиентов пула (активных и retired)
+// PING'ом по каждому их h2-соединению; закрываются только не ответившие.
+// Снимок списка — под m.mtx, проверки — параллельно и вне лока (проба длится
+// до timeout, держать под ней менеджер нельзя: GetXmuxClient встанет).
+// Замена Reset() для wake-пути: Reset рвёт и занятые соединения, Probe — нет.
+func (m *XmuxManager) Probe(ctx context.Context, timeout time.Duration) (probed int, closed int) {
+	m.mtx.Lock()
+	clients := make([]*XmuxClient, 0, len(m.xmuxClients)+len(m.retired))
+	clients = append(clients, m.xmuxClients...)
+	clients = append(clients, m.retired...)
+	m.mtx.Unlock()
+	var (
+		wg     sync.WaitGroup
+		sumMtx sync.Mutex
+	)
+	for _, xmuxClient := range clients {
+		prober, ok := xmuxClient.XmuxConn.(connProber)
+		if !ok {
+			continue
+		}
+		wg.Add(1)
+		go func(prober connProber) {
+			defer wg.Done()
+			p, c := prober.ProbeConns(ctx, timeout)
+			sumMtx.Lock()
+			probed += p
+			closed += c
+			sumMtx.Unlock()
+		}(prober)
+	}
+	wg.Wait()
+	return probed, closed
+}

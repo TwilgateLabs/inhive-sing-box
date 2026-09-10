@@ -10,6 +10,7 @@ import (
 	"net/http/httptrace"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/quic-go/http3"
 	common "github.com/sagernet/sing-box/common/xray"
@@ -364,4 +365,18 @@ func (w *WaitReadCloser) Close() error {
 	}()
 	close(w.Wait)
 	return nil
+}
+
+// ProbeConns — InHive 2026-09-08: проверка h2-пула этого клиента PING'ом после
+// сна девайса (см. v2rayhttp.ProbeTransport). h1 — пула idle-соединений нет
+// (DisableKeepAlives), h3 — QUIC сам держит keepalive/idle-таймер: для них
+// проверять нечего, (0, 0).
+func (c *DefaultDialerClient) ProbeConns(ctx context.Context, timeout time.Duration) (probed int, closed int) {
+	if c.client == nil {
+		return 0, 0
+	}
+	if transport, isH2 := c.client.Transport.(*http2.Transport); isH2 {
+		return v2rayhttp.ProbeTransport(ctx, transport, timeout)
+	}
+	return 0, 0
 }

@@ -238,3 +238,13 @@ func (h *vmessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 		return h.client.DialEarlyPacketConn(conn, destination), nil
 	}
 }
+
+// ProbeAfterSleep — adapter.SleepProber: делегирует транспорту (xhttp), если он
+// умеет проверять свои пулы; остальные транспорты/plain-TLS — нечего проверять.
+// InHive 2026-09-08, см. v2/hcore/pause.go.
+func (h *Outbound) ProbeAfterSleep(ctx context.Context) (probed int, closed int) {
+	if prober, ok := h.transport.(adapter.SleepProber); ok {
+		return prober.ProbeAfterSleep(ctx)
+	}
+	return 0, 0
+}
