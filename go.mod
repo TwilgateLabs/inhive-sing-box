@@ -251,3 +251,8 @@ replace github.com/sagernet/wireguard-go => ./replace/wireguard-go
 
 // inhive fork: h2 write-scratch cap 512KB→64KB (iOS NE jetsam). See core/go.mod.
 replace golang.org/x/net => ./replace/x-net
+
+// inhive fork of sing v0.8.11: backport of upstream ef37987 (Windows WSA errnos in
+// IsClosed). See core/go.mod + core/upstream.toml id="sing". Путь относительный
+// к submodule root, как у wireguard-go выше.
+replace github.com/sagernet/sing => ./replace/sing
