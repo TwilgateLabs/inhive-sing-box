@@ -48,11 +48,11 @@ func RegisterOutbound(registry *outbound.Registry) {
 // over the DNS tunnel and opens a new stream per connection.
 type Outbound struct {
 	outbound.Adapter
-	logger  log.ContextLogger
-	pubkey  []byte
-	domain  dns.Name
+	logger   log.ContextLogger
+	pubkey   []byte
+	domain   dns.Name
 	resolver string
-	sess    *smux.Session
+	sess     *smux.Session
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.DnsttOutboundOptions) (adapter.Outbound, error) {
@@ -219,4 +219,3 @@ func (o *Outbound) dial(ctx context.Context) (*smux.Session, error) {
 	o.logger.Info("dnstt session established (mtu=", mtu, ")")
 	return sess, nil
 }
-

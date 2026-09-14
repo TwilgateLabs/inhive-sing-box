@@ -18,7 +18,7 @@ type UTProtoInboundOptions struct {
 	// TLSDomain is informational on the server — the FakeTLS handshake
 	// only uses the per-user secret for HMAC, not the domain. Kept for
 	// parity with outbound options and future SNI-based fallback.
-	TLSDomain string              `json:"tls_domain,omitempty"`
+	TLSDomain string               `json:"tls_domain,omitempty"`
 	Users     []UTProtoInboundUser `json:"users"`
 	// Fallback configures a destination for TLS traffic that fails
 	// UTProto authentication (wrong/missing secret, malformed
