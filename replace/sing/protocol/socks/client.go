@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -99,7 +100,7 @@ func NewClientFromURL(dialer N.Dialer, rawURL string) (*Client, error) {
 	return &client, nil
 }
 
-func (c *Client) DialContext(ctx context.Context, network string, address M.Socksaddr) (net.Conn, error) {
+func (c *Client) DialContext(ctx context.Context, network string, address M.Socksaddr) (result net.Conn, err error) {
 	network = N.NetworkName(network)
 	var command byte
 	switch network {
@@ -117,8 +118,22 @@ func (c *Client) DialContext(ctx context.Context, network string, address M.Sock
 	if err != nil {
 		return nil, err
 	}
+	if ctx.Done() != nil {
+		handshakeConn := tcpConn
+		stopContext := context.AfterFunc(ctx, func() {
+			_ = handshakeConn.Close()
+		})
+		defer func() {
+			if !stopContext() {
+				common.Close(result)
+				result = nil
+				err = ctx.Err()
+			}
+		}()
+	}
 	if c.version == Version4 && address.IsDomain() {
-		tcpAddr, err := net.ResolveTCPAddr(network, address.String())
+		var tcpAddr *net.TCPAddr
+		tcpAddr, err = net.ResolveTCPAddr(network, address.String())
 		if err != nil {
 			tcpConn.Close()
 			return nil, err
@@ -134,7 +149,8 @@ func (c *Client) DialContext(ctx context.Context, network string, address M.Sock
 		}
 		return tcpConn, nil
 	case Version5:
-		response, err := ClientHandshake5(tcpConn, command, address, c.username, c.password)
+		var response socks5.Response
+		response, err = ClientHandshake5(tcpConn, command, address, c.username, c.password)
 		if err != nil {
 			tcpConn.Close()
 			return nil, err
@@ -142,7 +158,8 @@ func (c *Client) DialContext(ctx context.Context, network string, address M.Sock
 		if command == socks5.CommandConnect {
 			return tcpConn, nil
 		}
-		udpConn, err := c.dialer.DialContext(ctx, N.NetworkUDP, response.Bind)
+		var udpConn net.Conn
+		udpConn, err = c.dialer.DialContext(ctx, N.NetworkUDP, response.Bind)
 		if err != nil {
 			tcpConn.Close()
 			return nil, err

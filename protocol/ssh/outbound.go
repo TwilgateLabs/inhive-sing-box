@@ -135,7 +135,7 @@ func randomVersion() string {
 	return version
 }
 
-func (s *Outbound) connect() (*ssh.Client, error) {
+func (s *Outbound) connect(ctx context.Context) (client *ssh.Client, err error) {
 	if s.client != nil {
 		return s.client, nil
 	}
@@ -147,9 +147,23 @@ func (s *Outbound) connect() (*ssh.Client, error) {
 		return s.client, nil
 	}
 
-	conn, err := s.dialer.DialContext(s.ctx, N.NetworkTCP, s.serverAddr)
+	conn, err := s.dialer.DialContext(ctx, N.NetworkTCP, s.serverAddr)
 	if err != nil {
 		return nil, err
+	}
+	if ctx.Done() != nil {
+		handshakeConn := conn
+		stopContext := context.AfterFunc(ctx, func() {
+			_ = handshakeConn.Close()
+		})
+		defer func() {
+			if !stopContext() {
+				s.client = nil
+				s.clientConn = nil
+				client = nil
+				err = ctx.Err()
+			}
+		}()
 	}
 	config := &ssh.ClientConfig{
 		User:              s.user,
@@ -176,7 +190,7 @@ func (s *Outbound) connect() (*ssh.Client, error) {
 		return nil, E.Cause(err, "connect to ssh server")
 	}
 
-	client := ssh.NewClient(clientConn, chans, reqs)
+	client = ssh.NewClient(clientConn, chans, reqs)
 
 	s.clientConn = conn
 	s.client = client
@@ -194,7 +208,7 @@ func (s *Outbound) connect() (*ssh.Client, error) {
 }
 
 func (s *Outbound) PostStart() error {
-	s.connect()
+	s.connect(s.ctx)
 	if s.IsReady() {
 		monitoring.Get(s.ctx).TestNow(s.Tag())
 	}
@@ -213,7 +227,7 @@ func (s *Outbound) DialContext(ctx context.Context, network string, destination 
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = s.Tag()
 	metadata.Destination = destination
-	client, err := s.connect()
+	client, err := s.connect(ctx)
 	if err != nil {
 		s.connectionErr = err.Error()
 		return nil, err

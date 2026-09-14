@@ -142,6 +142,7 @@ func (c *Client) dialContext(ctx context.Context, requestURL *url.URL, headers h
 		!strings.EqualFold(response.Header.Get("Connection"), "upgrade") ||
 		!strings.EqualFold(response.Header.Get("Upgrade"), "websocket") {
 		conn.Close()
+		response.Body.Close()
 		return nil, E.New("v2ray-http-upgrade: unexpected status: ", response.Status)
 	}
 	// Clear the handshake deadline before handing the conn to the caller for streaming.

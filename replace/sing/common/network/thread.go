@@ -135,6 +135,30 @@ func CalculateRearHeadroom(writer any) int {
 	return headroom
 }
 
+type ReaderOverhead interface {
+	ReaderOverhead() int
+}
+
+func CalculateReaderOverhead(reader any) int {
+	var overhead int
+	for reader != nil {
+		if lazyRoom, isLazy := reader.(LazyHeadroom); isLazy && lazyRoom.LazyHeadroom() {
+			return DefaultHeadroom
+		}
+		if overheadReader, hasOverhead := reader.(ReaderOverhead); hasOverhead {
+			overhead += overheadReader.ReaderOverhead()
+		}
+		if upstreamReader, hasUpstreamReader := reader.(WithUpstreamReader); hasUpstreamReader {
+			reader = upstreamReader.UpstreamReader()
+		} else if upstream, hasUpstream := reader.(common.WithUpstream); hasUpstream {
+			reader = upstream.Upstream()
+		} else {
+			break
+		}
+	}
+	return overhead
+}
+
 type ReaderWithMTU interface {
 	ReaderMTU() int
 }

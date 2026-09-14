@@ -2,30 +2,45 @@ package srs
 
 import (
 	"encoding/binary"
+	"io"
 	"net/netip"
+	"os"
 
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/varbin"
 )
 
 func readPrefix(reader varbin.Reader) (netip.Prefix, error) {
-	addrSlice, err := varbin.ReadValue[[]byte](reader, binary.BigEndian)
+	addrLen, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return netip.Prefix{}, err
 	}
-	prefixBits, err := varbin.ReadValue[uint8](reader, binary.BigEndian)
+	if addrLen != 4 && addrLen != 16 {
+		return netip.Prefix{}, os.ErrInvalid
+	}
+	var addrBytes [16]byte
+	_, err = io.ReadFull(reader, addrBytes[:addrLen])
 	if err != nil {
 		return netip.Prefix{}, err
 	}
-	return netip.PrefixFrom(M.AddrFromIP(addrSlice), int(prefixBits)), nil
+	prefixBits, err := reader.ReadByte()
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	return netip.PrefixFrom(M.AddrFromIP(addrBytes[:addrLen]), int(prefixBits)), nil
 }
 
 func writePrefix(writer varbin.Writer, prefix netip.Prefix) error {
-	err := varbin.Write(writer, binary.BigEndian, prefix.Addr().AsSlice())
+	addrSlice := prefix.Addr().AsSlice()
+	_, err := varbin.WriteUvarint(writer, uint64(len(addrSlice)))
 	if err != nil {
 		return err
 	}
-	err = binary.Write(writer, binary.BigEndian, uint8(prefix.Bits()))
+	_, err = writer.Write(addrSlice)
+	if err != nil {
+		return err
+	}
+	err = writer.WriteByte(uint8(prefix.Bits()))
 	if err != nil {
 		return err
 	}

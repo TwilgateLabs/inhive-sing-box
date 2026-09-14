@@ -81,7 +81,7 @@ func (c *natConn) WaitReadPacket() (buffer *buf.Buffer, destination M.Socksaddr,
 func (c *natConn) SetHandler(handler N.UDPHandlerEx) {
 	c.handlerAccess.Lock()
 	c.handler = handler
-	c.readWaitOptions = N.NewReadWaitOptions(c.writer, handler)
+	c.readWaitOptions = N.NewReadWaitOptions(nil, handler)
 	c.handlerAccess.Unlock()
 fetch:
 	for {

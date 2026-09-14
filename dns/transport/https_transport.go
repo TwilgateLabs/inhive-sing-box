@@ -5,12 +5,14 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/url"
 	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/common/tls"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 
 	"golang.org/x/net/http2"
 )
@@ -57,8 +59,12 @@ type HTTPSTransportWrapper struct {
 	fallback       *atomic.Bool
 }
 
-func NewHTTPSTransportWrapper(dialer tls.Dialer, serverAddr M.Socksaddr) *HTTPSTransportWrapper {
+func NewHTTPSTransportWrapper(dialer N.Dialer, serverAddr M.Socksaddr, destination *url.URL) *HTTPSTransportWrapper {
 	var fallback atomic.Bool
+	if destination.Scheme == "http" {
+		// plain HTTP DoH used by Tailscale
+		fallback.Store(true)
+	}
 	return &HTTPSTransportWrapper{
 		http2Transport: &http2.Transport{
 			// Health-check мёртвого коннекта после сна девайса — см. константы выше.
@@ -66,22 +72,27 @@ func NewHTTPSTransportWrapper(dialer tls.Dialer, serverAddr M.Socksaddr) *HTTPST
 			PingTimeout:     dohPingTimeout,
 			IdleConnTimeout: dohIdleConnTimeout,
 			DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.STDConfig) (net.Conn, error) {
-				tlsConn, err := dialer.DialTLSContext(ctx, serverAddr)
+				resultConn, err := dialer.DialContext(ctx, N.NetworkTCP, serverAddr)
 				if err != nil {
 					return nil, err
 				}
-				state := tlsConn.ConnectionState()
-				if state.NegotiatedProtocol == http2.NextProtoTLS {
-					return tlsConn, nil
+				if tlsConn, isTLSConn := resultConn.(tls.Conn); isTLSConn {
+					state := tlsConn.ConnectionState()
+					if state.NegotiatedProtocol != http2.NextProtoTLS {
+						tlsConn.Close()
+						fallback.Store(true)
+						return nil, errFallback
+					}
 				}
-				tlsConn.Close()
-				fallback.Store(true)
-				return nil, errFallback
+				return resultConn, nil
 			},
 		},
 		httpTransport: &http.Transport{
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, N.NetworkTCP, serverAddr)
+			},
 			DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return dialer.DialTLSContext(ctx, serverAddr)
+				return dialer.DialContext(ctx, N.NetworkTCP, serverAddr)
 			},
 		},
 		fallback: &fallback,
@@ -91,16 +102,15 @@ func NewHTTPSTransportWrapper(dialer tls.Dialer, serverAddr M.Socksaddr) *HTTPST
 func (h *HTTPSTransportWrapper) RoundTrip(request *http.Request) (*http.Response, error) {
 	if h.fallback.Load() {
 		return h.httpTransport.RoundTrip(request)
-	} else {
-		response, err := h.http2Transport.RoundTrip(request)
-		if err != nil {
-			if errors.Is(err, errFallback) {
-				return h.httpTransport.RoundTrip(request)
-			}
-			return nil, err
-		}
-		return response, nil
 	}
+	response, err := h.http2Transport.RoundTrip(request)
+	if err != nil {
+		if errors.Is(err, errFallback) {
+			return h.httpTransport.RoundTrip(request)
+		}
+		return nil, err
+	}
+	return response, nil
 }
 
 func (h *HTTPSTransportWrapper) CloseIdleConnections() {

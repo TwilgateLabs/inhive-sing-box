@@ -86,6 +86,10 @@ func (h *Outbound) Start(stage adapter.StartStage) error {
 	return nil
 }
 
+func (h *Outbound) Close() error {
+	return nil
+}
+
 func (h *Outbound) fetchMyAddresses() {
 	if len(h.myAddresses.Load()) > 0 {
 		return
@@ -108,7 +112,10 @@ func (h *Outbound) fetchMyAddresses() {
 func (h *Outbound) isMyLoopbackAddress(addresses ...netip.Addr) bool {
 	for _, prefix := range h.myAddresses.Load() {
 		for _, address := range addresses {
-			if prefix.Addr() != address && prefix.Contains(address) {
+			if !C.IsDarwin && prefix.Addr() == address {
+				continue
+			}
+			if prefix.Contains(address) {
 				return true
 			}
 		}

@@ -99,10 +99,11 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 		if savedSet := s.cacheFile.LoadRuleSet(s.options.Tag); savedSet != nil {
 			err := s.loadBytes(savedSet.Content)
 			if err != nil {
-				return E.Cause(err, "restore cached rule-set")
+				s.logger.Warn(E.Cause(err, "restore cached rule-set, will refetch"))
+			} else {
+				s.lastUpdated = savedSet.LastUpdated
+				s.lastEtag = savedSet.LastEtag
 			}
-			s.lastUpdated = savedSet.LastUpdated
-			s.lastEtag = savedSet.LastEtag
 		}
 	}
 	// if s.lastUpdated.IsZero() {
@@ -341,11 +342,13 @@ func (s *RemoteRuleSet) matchStates(metadata *adapter.InboundContext) ruleMatchS
 }
 
 func (s *RemoteRuleSet) matchStatesWithBase(metadata *adapter.InboundContext, base ruleMatchState) ruleMatchStateSet {
-	var stateSet ruleMatchStateSet
+	var stateSet, definitiveStateSet ruleMatchStateSet
 	for _, rule := range s.rules {
 		nestedMetadata := *metadata
 		nestedMetadata.ResetRuleMatchCache()
 		stateSet = stateSet.merge(matchHeadlessRuleStatesWithBase(rule, &nestedMetadata, base))
+		definitiveStateSet = definitiveStateSet.merge(ruleMatchStateSet(nestedMetadata.DefinitiveMatchStates))
 	}
+	metadata.DefinitiveMatchStates = uint16(definitiveStateSet)
 	return stateSet
 }
