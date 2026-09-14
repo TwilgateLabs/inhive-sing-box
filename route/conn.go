@@ -15,6 +15,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/sniff"
 	"github.com/sagernet/sing-box/common/tlsfragment"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common"
@@ -380,9 +381,14 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	if metadata.TLSFragment || metadata.TLSRecordFragment {
 		remoteConn = tf.NewConn(remoteConn, ctx, metadata.TLSFragment, metadata.TLSRecordFragment, metadata.TLSFragmentFallbackDelay)
 	}
+	serverFirst := sniff.Skip(&metadata)
 	var done atomic.Bool
-	m.preConnectionCopy(ctx, conn, remoteConn, false, &done, onClose)
-	m.preConnectionCopy(ctx, remoteConn, conn, true, &done, onClose)
+	if m.kickWriteHandshake(ctx, conn, remoteConn, serverFirst, false, &done, onClose) {
+		return
+	}
+	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &done, onClose) {
+		return
+	}
 	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
 	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
 }
@@ -545,81 +551,8 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 	go m.packetConnectionCopy(ctx, destination, conn, true, &done, onClose)
 }
 
-func (m *ConnectionManager) preConnectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
-	readHandshake := N.NeedHandshakeForRead(source)
-	writeHandshake := N.NeedHandshakeForWrite(destination)
-	if readHandshake || writeHandshake {
-		var err error
-		for {
-			err = m.connectionCopyEarlyWrite(source, destination, readHandshake, writeHandshake)
-			if err == nil && N.NeedHandshakeForRead(source) {
-				continue
-			} else if isBenignPreConnError(err) {
-				// inhive: fast-path замена E.IsMulti (reflection). На hot path
-				// одно TCP соединение = один этот вызов, errors.As жрал ~10% CPU.
-				err = nil
-			}
-			break
-		}
-		if err != nil {
-			if done.Swap(true) {
-				if onClose != nil {
-					onClose(err)
-				}
-			}
-			common.Close(source, destination)
-			if !direction {
-				m.logger.ErrorContext(ctx, "connection upload handshake: ", err)
-			} else {
-				m.logger.ErrorContext(ctx, "connection download handshake: ", err)
-			}
-			return
-		}
-	}
-}
-
 func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn, destination net.Conn, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
-	var (
-		sourceReader      io.Reader = source
-		destinationWriter io.Writer = destination
-	)
-	var readCounters, writeCounters []N.CountFunc
-	for {
-		sourceReader, readCounters = N.UnwrapCountReader(sourceReader, readCounters)
-		destinationWriter, writeCounters = N.UnwrapCountWriter(destinationWriter, writeCounters)
-		if cachedSrc, isCached := sourceReader.(N.CachedReader); isCached {
-			cachedBuffer := cachedSrc.ReadCached()
-			if cachedBuffer != nil {
-				dataLen := cachedBuffer.Len()
-				_, err := destination.Write(cachedBuffer.Bytes())
-				cachedBuffer.Release()
-				if err != nil {
-					if done.Swap(true) {
-						if onClose != nil {
-							onClose(err)
-						}
-					}
-					common.Close(source, destination)
-					if !direction {
-						m.logger.ErrorContext(ctx, "connection upload payload: ", err)
-					} else {
-						m.logger.ErrorContext(ctx, "connection download payload: ", err)
-					}
-					return
-				}
-				for _, counter := range readCounters {
-					counter(int64(dataLen))
-				}
-				for _, counter := range writeCounters {
-					counter(int64(dataLen))
-				}
-			}
-			continue
-		}
-		break
-	}
-
-	_, err := bufio.CopyWithCounters(destinationWriter, sourceReader, source, readCounters, writeCounters, bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
+	_, err := bufio.CopyWithIncreateBuffer(destination, source, bufio.DefaultIncreaseBufferAfter, bufio.DefaultBatchSize)
 	if err != nil {
 		common.Close(source, destination)
 	} else if duplexDst, isDuplex := destination.(N.WriteCloser); isDuplex {
@@ -636,6 +569,8 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
 		}
 		common.Close(source, destination)
 	}
+	// inhive/hiddify: h2 «NO_ERROR» stream-close и xhttp «response body closed» —
+	// штатный teardown, не ERROR (апстрим фильтрует только IsClosedOrCanceled).
 	if !direction {
 		if err == nil {
 			m.logger.DebugContext(ctx, "connection upload finished")
@@ -655,60 +590,84 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
 	}
 }
 
-func (m *ConnectionManager) connectionCopyEarlyWrite(source net.Conn, destination io.Writer, readHandshake bool, writeHandshake bool) error {
-	payload := buf.NewPacket()
-	defer payload.Release()
-	err := source.SetReadDeadline(time.Now().Add(C.ReadPayloadTimeout))
-	if err != nil {
-		if err == os.ErrInvalid {
-			if writeHandshake {
-				return common.Error(destination.Write(nil))
-			}
-		}
-		return err
+// kickWriteHandshake — апстрим как есть (sing-box e11dbf3a8 «bufio: Refactor
+// copy» + 6475a5e03 «Skip kickWriteHandshake for server first protocols»),
+// принят на merge v1.13.14 (2026-09-14). Заменил форковую пару
+// preConnectionCopy/connectionCopyEarlyWrite вместе с zero-reflection
+// хелперами isNetTimeout/isBenignPreConnError: они удешевляли старый
+// read-retry цикл, а цикла больше нет — здесь один прямой вызов на
+// направление, E.IsMulti/E.IsTimeout считаются только на ветке ошибки.
+// Класс «500% CPU на failed VLESS handshake» (2026-04-19, d57c2ef50)
+// здесь невозможен по построению. Держать синхронно с апстримом, не
+// восстанавливать хелперы при следующем merge.
+func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.Conn, destination net.Conn, serverFirst bool, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) bool {
+	if !N.NeedHandshakeForWrite(destination) {
+		return false
 	}
-	// inhive Fix v3: возвращаем timeout/EOF наружу, НЕ проглатываем.
-	// Иначе preConnectionCopy видит err=nil + handshake still pending → hot loop.
-	// Upstream sing-box 12b05598 (Fix preConnectionCopy, sekai.icu, 2025-09-14).
-	// Регрессия в коммите 80908859 случайно откатила этот fix → 500% CPU burn
-	// при failed VLESS handshake (сервер закрыл сокет на partial read).
 	var (
-		isTimeout bool
-		isEOF     bool
+		err          error
+		wrotePayload bool
 	)
-	_, err = payload.ReadOnceFrom(source)
-	if err != nil {
-		if isNetTimeout(err) {
-			// inhive: isNetTimeout вместо E.IsTimeout — избегаем errors.As reflection.
-			isTimeout = true
-		} else if errors.Is(err, io.EOF) {
-			isEOF = true
+	if serverFirst {
+		_ = destination.SetWriteDeadline(time.Now().Add(C.ReadPayloadTimeout))
+		_, err = destination.Write(nil)
+		_ = destination.SetWriteDeadline(time.Time{})
+	} else {
+		var cachedBuffer *buf.Buffer
+		sourceReader, readCounters := N.UnwrapCountReader(source, nil)
+		destinationWriter, writeCounters := N.UnwrapCountWriter(destination, nil)
+		if cachedReader, ok := sourceReader.(N.CachedReader); ok {
+			cachedBuffer = cachedReader.ReadCached()
+		}
+		if cachedBuffer != nil {
+			wrotePayload = true
+			dataLen := cachedBuffer.Len()
+			_, err = destinationWriter.Write(cachedBuffer.Bytes())
+			cachedBuffer.Release()
+			if err == nil {
+				for _, counter := range readCounters {
+					counter(int64(dataLen))
+				}
+				for _, counter := range writeCounters {
+					counter(int64(dataLen))
+				}
+			}
 		} else {
-			return E.Cause(err, "read payload")
+			_ = destination.SetWriteDeadline(time.Now().Add(C.ReadPayloadTimeout))
+			_, err = destinationWriter.Write(nil)
+			_ = destination.SetWriteDeadline(time.Time{})
 		}
 	}
-	_ = source.SetReadDeadline(time.Time{})
-	if !payload.IsEmpty() || writeHandshake {
-		_, err = destination.Write(payload.Bytes())
-		if err != nil {
-			return E.Cause(err, "write payload")
+	if err == nil {
+		return false
+	}
+	if !wrotePayload && (E.IsMulti(err, os.ErrInvalid, context.DeadlineExceeded, io.EOF) || E.IsTimeout(err)) {
+		return false
+	}
+	if !done.Swap(true) {
+		if onClose != nil {
+			onClose(err)
 		}
 	}
-	if isTimeout {
-		return context.DeadlineExceeded
-	} else if isEOF {
-		return io.EOF
+	common.Close(source, destination)
+	if !direction {
+		m.logger.ErrorContext(ctx, "connection upload handshake: ", err)
+	} else {
+		m.logger.ErrorContext(ctx, "connection download handshake: ", err)
 	}
-	return nil
+	return true
 }
 
 func (m *ConnectionManager) packetConnectionCopy(ctx context.Context, source N.PacketReader, destination N.PacketWriter, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) {
-	// inhive: containment for a racy/nil select fault observed inside
-	// sing@v0.8.4 udpnat2.(*natConn).WaitReadPacket (sigpanic 0xc0000005 via
-	// runtime.selectgo). A UDP-NAT fault must drop this single packet conn, not
-	// crash the whole process + VPN service. Recover converts the fault into a
-	// normal closed-conn teardown. Follow-up: confirm the nil channel in
-	// udpnat2/conn.go:68 upstream (a sing bump 0.8.4->0.8.9 is WIP/risky).
+	// inhive: containment for a racy/nil select fault once observed inside
+	// sing udpnat2.(*natConn).WaitReadPacket (sigpanic 0xc0000005 via
+	// runtime.selectgo, first seen on sing v0.8.4). A UDP-NAT fault must drop
+	// this single packet conn, not crash the whole process + VPN service.
+	// Recover converts the fault into a normal closed-conn teardown. sing is
+	// now vendored at v0.8.11 (sing-box/replace/sing, merge 1.13.14 2026-09-14);
+	// the containment stays regardless of the pin — the fault has no upstream
+	// fix that we could point to, so it is a guard, not a workaround for a
+	// known version.
 	defer func() {
 		if r := recover(); r != nil {
 			// fmt.Sprint: сырое r через format.ToString ре-паникует на
@@ -798,55 +757,4 @@ func (c *trackedPacketConn) ReaderReplaceable() bool {
 
 func (c *trackedPacketConn) WriterReplaceable() bool {
 	return true
-}
-
-// isNetTimeout — zero-reflection timeout check. Ручной walk Unwrap chain
-// с type switch. Прошлая версия через err.(interface{Timeout() bool}) не
-// ловила wrapped *net.OpError (inbound источник завёрнут через trackedConn
-// и bufio layers), и fallback errors.As возвращал 12s CPU (17% cum по pprof).
-// Теперь цепочку разворачиваем вручную — выявленно через профайль HOT_061047.
-func isNetTimeout(err error) bool {
-	for cur := err; cur != nil; {
-		switch e := cur.(type) {
-		case *net.OpError:
-			return e.Timeout()
-		case interface{ Timeout() bool }:
-			return e.Timeout()
-		case interface{ Unwrap() error }:
-			cur = e.Unwrap()
-			continue
-		case interface{ Unwrap() []error }:
-			for _, sub := range e.Unwrap() {
-				if isNetTimeout(sub) {
-					return true
-				}
-			}
-			return false
-		}
-		break
-	}
-	return false
-}
-
-// isBenignPreConnError — zero-reflection проверка benign error sentinels.
-// Вместо errors.Is (который тоже проходит через Unwrap с interface dispatch)
-// раскручиваем вручную и сравниваем по значению.
-func isBenignPreConnError(err error) bool {
-	for cur := err; cur != nil; {
-		if cur == os.ErrInvalid || cur == context.DeadlineExceeded || cur == io.EOF {
-			return true
-		}
-		// Пробуем метод Is() если есть (net.errDeadlineExceeded implements Is).
-		if ie, ok := cur.(interface{ Is(error) bool }); ok {
-			if ie.Is(os.ErrInvalid) || ie.Is(context.DeadlineExceeded) || ie.Is(io.EOF) {
-				return true
-			}
-		}
-		if u, ok := cur.(interface{ Unwrap() error }); ok {
-			cur = u.Unwrap()
-			continue
-		}
-		break
-	}
-	return false
 }

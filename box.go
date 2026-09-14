@@ -624,16 +624,15 @@ func (s *Box) Close() error {
 	})
 	return err
 }
-func (s *Box) closeWithTimeout(name string, timeout time.Duration, closeFn func() error) (err error) {
-	s.logger.Trace("closeing ", name)
+
+// closeWithTimeout runs closeFn in its own goroutine and abandons it after
+// timeout so a wedged service cannot hang Box.Close() (InHive: bounded
+// teardown, see adapter/outbound.Manager.Close for the same rationale).
+// Elapsed-time tracing goes through upstream adapter.LogElapsed (silent for
+// fast closes, "close X..." after 1s, "completed (Ns)" when done).
+func (s *Box) closeWithTimeout(name string, timeout time.Duration, closeFn func() error) error {
 	startTime := time.Now()
-	defer func() {
-		if err != nil {
-			s.logger.Error("close ", name, " error (", F.Seconds(time.Since(startTime).Seconds()), "s)"+": "+err.Error())
-		} else {
-			s.logger.Trace("close ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
-		}
-	}()
+	logDone := adapter.LogElapsed(s.logger, "close ", name)
 	done := make(chan error, 1)
 
 	go func() {
@@ -641,13 +640,21 @@ func (s *Box) closeWithTimeout(name string, timeout time.Duration, closeFn func(
 	}()
 
 	select {
-	case err = <-done:
+	case err := <-done:
+		logDone()
+		if err != nil {
+			s.logger.Error("close ", name, " error (", F.Seconds(time.Since(startTime).Seconds()), "s): ", err)
+		}
 		return err
 	case <-time.After(timeout):
-		return fmt.Errorf("close %s timed out after %s", name, timeout)
+		// logDone() intentionally not called: closeFn never completed, so a
+		// "completed" line would lie; the pending "close X..." trace is truthful.
+		err := fmt.Errorf("close %s timed out after %s", name, timeout)
+		s.logger.Error("close ", name, " error (", F.Seconds(time.Since(startTime).Seconds()), "s): ", err)
+		return err
 	}
-
 }
+
 func (s *Box) Network() adapter.NetworkManager {
 	return s.network
 }

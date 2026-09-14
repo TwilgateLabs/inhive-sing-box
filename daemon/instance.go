@@ -68,20 +68,43 @@ type OverrideOptions struct {
 	ExcludePackage []string
 }
 
-func (s *StartedService) newInstance(profileContent string, overrideOptions *OverrideOptions) (*Instance, error) {
-	ctx := s.ctx
+// newInstanceContext — InHive: общий пролог для ОБОИХ путей создания инстанса
+// (profileContent → newInstance; option.Options → newInstanceOptions через
+// StartOrReloadServiceOptions — hcore ходит только вторым). Merge v1.13.14
+// (2026-09-14): апстрим ca76c5637 «daemon: Fix registry leak» добавил
+// service.ExtendContext только в newInstance, и auto-merge оставил наш
+// Options-путь на общем реестре s.ctx.
+//  1. ExtendContext — box.New регистрирует router/managers/cache в реестр
+//     контекста. Без клона это общий реестр s.ctx (libbox.BaseContext), и
+//     каждый следующий box (reload, warm-probe на том же BaseContext)
+//     перезаписывает сервисы предыдущего.
+//  2. include.Context — если у s.ctx реестра нет (context.Background в
+//     тестах), создаёт его, иначе no-op (box.Context регистрирует только
+//     отсутствующие). Без него MustRegister ниже паникует «missing service
+//     registry».
+//  3. deprecated.Manager — раньше регистрировался только в newInstance, а
+//     GetDeprecatedWarnings делает .(*deprecatedManager) без comma-ok →
+//     nil interface → паника на Options-пути.
+func (s *StartedService) newInstanceContext() context.Context {
+	ctx := service.ExtendContext(s.ctx)
+	ctx = include.Context(ctx)
 	service.MustRegister[deprecated.Manager](ctx, new(deprecatedManager))
-	// ctx, cancel := context.WithCancel(include.Context(ctx))
+	return ctx
+}
+
+func (s *StartedService) newInstance(profileContent string, overrideOptions *OverrideOptions) (*Instance, error) {
+	ctx := s.newInstanceContext()
 	options, err := parseConfig(ctx, profileContent)
 	if err != nil {
-		// cancel()
 		return nil, err
 	}
-	return s.newInstanceOptions(options, overrideOptions)
+	return s.newInstanceOptions(ctx, options, overrideOptions)
 }
-func (s *StartedService) newInstanceOptions(options option.Options, overrideOptions *OverrideOptions) (*Instance, error) {
-	ctx := s.ctx
-	ctx, cancel := context.WithCancel(include.Context(ctx))
+
+// newInstanceOptions — ctx обязан приходить из newInstanceContext (свой клон
+// реестра + include-реестры + deprecated.Manager), см. комментарий выше.
+func (s *StartedService) newInstanceOptions(ctx context.Context, options option.Options, overrideOptions *OverrideOptions) (*Instance, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	if overrideOptions != nil {
 		for _, inbound := range options.Inbounds {
 			if tunInboundOptions, isTUN := inbound.Options.(*option.TunInboundOptions); isTUN {

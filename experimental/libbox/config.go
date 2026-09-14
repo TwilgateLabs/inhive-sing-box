@@ -3,6 +3,7 @@ package libbox
 import (
 	"bytes"
 	"context"
+	"net/netip"
 	"os"
 
 	box "github.com/sagernet/sing-box"
@@ -159,6 +160,10 @@ func (s *platformInterfaceStub) SendNotification(notification *adapter.Notificat
 	return nil
 }
 
+func (s *platformInterfaceStub) MyInterfaceAddress() []netip.Addr {
+	return nil
+}
+
 func (s *platformInterfaceStub) UsePlatformLocalDNSTransport() bool {
 	return false
 }
@@ -199,8 +204,6 @@ func (s *interfaceMonitorStub) UnregisterCallback(element *list.Element[tun.Defa
 func (s *interfaceMonitorStub) RegisterMyInterface(interfaceName string) {
 }
 
-// InHive 2026-07-19: контракт sing-tun 0.8.11 — `MyInterfaces() []string`. Заглушка,
-// используется при разборе конфига вне рантайма (интерфейсов там нет по определению).
 func (s *interfaceMonitorStub) MyInterfaces() []string {
 	return nil
 }

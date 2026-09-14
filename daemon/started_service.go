@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/memlite"
 	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/experimental/clashapi"
 	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
@@ -18,7 +19,6 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/batch"
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing-box/common/memlite"
 	"github.com/sagernet/sing/common/memory"
 	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/common/x/list"
@@ -69,10 +69,10 @@ type StartedService struct {
 type ServiceOptions struct {
 	Context context.Context
 	// Platform           adapter.PlatformInterface
-	Handler             PlatformHandler
-	Debug               bool
-	LogMaxLines         int
-	OOMKiller           bool
+	Handler     PlatformHandler
+	Debug       bool
+	LogMaxLines int
+	OOMKiller   bool
 	// NoPlatformLogWriter disables passing s as box.Options.PlatformLogWriter.
 	// When false (default), box enables CacheFile because PlatformLogWriter!=nil.
 	// Set true for side-instances that must NOT share data/clash.db with the
@@ -203,7 +203,7 @@ func (s *StartedService) startOrReloadServiceImp(profileOptions *option.Options,
 	var err error
 	var instance *Instance
 	if profileContent == "" && profileOptions != nil {
-		instance, err = s.newInstanceOptions(*profileOptions, options)
+		instance, err = s.newInstanceOptions(s.newInstanceContext(), *profileOptions, options)
 	} else {
 		instance, err = s.newInstance(profileContent, options)
 
@@ -646,10 +646,7 @@ func (s *StartedService) URLTest(ctx context.Context, request *URLTestRequest) (
 				return false
 			}
 			_, isGroup := it.(adapter.OutboundGroup)
-			if isGroup {
-				return false
-			}
-			return true
+			return !isGroup
 		})
 		b, _ := batch.New(boxService.ctx, batch.WithConcurrencyNum[any](10))
 		for _, detour := range outbounds {

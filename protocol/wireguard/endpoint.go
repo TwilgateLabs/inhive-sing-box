@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -43,7 +44,14 @@ type Endpoint struct {
 	logger         logger.ContextLogger
 	localAddresses []netip.Prefix
 	endpoint       *wireguard.Endpoint
-	started        bool
+	// started — апстримная семантика (1.13.14): endpoint.Start(true) отработал,
+	// устройство поднято; гейтит DialContext/ListenPacket/PrepareConnection.
+	started atomic.Bool
+	// ready — InHive-семантика: readyChecker прогнал URLTest СКВОЗЬ туннель и
+	// получил ответ; питает IsReady()/DisplayType(). Два флага намеренно:
+	// readyChecker дозванивается через w.DialContext, который гейтится по
+	// started — один общий флаг дал бы дедлок («not ready» навсегда).
+	ready atomic.Bool
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.WireGuardEndpointOptions) (adapter.Endpoint, error) {
@@ -77,12 +85,13 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 
 	wgEndpoint, err := wireguard.NewEndpoint(wireguard.EndpointOptions{
-		Context:    ctx,
-		Logger:     logger,
-		System:     options.System,
-		Handler:    ep,
-		UDPTimeout: udpTimeout,
-		Dialer:     outboundDialer,
+		Context:     ctx,
+		Logger:      logger,
+		System:      options.System,
+		Handler:     ep,
+		UDPTimeout:  udpTimeout,
+		ICMPTimeout: C.ICMPTimeout,
+		Dialer:      outboundDialer,
 		CreateDialer: func(interfaceName string) N.Dialer {
 			return common.Must1(dialer.NewDefault(ctx, option.DialerOptions{
 				BindInterface: interfaceName,
@@ -127,8 +136,14 @@ func (w *Endpoint) Start(stage adapter.StartStage) error {
 	case adapter.StartStateStart:
 		return w.endpoint.Start(false)
 	case adapter.StartStatePostStart:
+		err := w.endpoint.Start(true)
+		if err != nil {
+			return err
+		}
+		w.started.Store(true)
+		// Пробник запускаем только после started=true — иначе его URLTest
+		// упрётся в гейт DialContext и «Connecting…» не снимется никогда.
 		go w.readyChecker()
-		return w.endpoint.Start(true)
 	}
 	return nil
 }
@@ -149,7 +164,7 @@ func (w *Endpoint) readyChecker() {
 			// 	return
 			// case <-time.After(time.Second):
 			// }
-			w.started = true
+			w.ready.Store(true)
 			monitoring.Get(w.ctx).TestNow(w.Tag())
 			return
 		}
@@ -157,14 +172,19 @@ func (w *Endpoint) readyChecker() {
 
 }
 func (w *Endpoint) IsReady() bool {
-	return w.started
+	return w.ready.Load()
 }
 
 func (w *Endpoint) Close() error {
+	w.started.Store(false)
+	w.ready.Store(false)
 	return w.endpoint.Close()
 }
 
 func (w *Endpoint) PrepareConnection(network string, source M.Socksaddr, destination M.Socksaddr, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
+	if !w.started.Load() {
+		return nil, E.New("WireGuard is not ready yet")
+	}
 	var ipVersion uint8
 	if !destination.IsIPv6() {
 		ipVersion = 4
@@ -245,6 +265,9 @@ func (w *Endpoint) DialContext(ctx context.Context, network string, destination 
 	case N.NetworkUDP:
 		w.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
+	if !w.started.Load() {
+		return nil, E.New("WireGuard is not ready yet")
+	}
 	if destination.IsDomain() {
 		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
 		if err != nil {
@@ -259,6 +282,9 @@ func (w *Endpoint) DialContext(ctx context.Context, network string, destination 
 
 func (w *Endpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {
 	w.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+	if !w.started.Load() {
+		return nil, netip.Addr{}, E.New("WireGuard is not ready yet")
+	}
 	if destination.IsDomain() {
 		destinationAddresses, err := w.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
 		if err != nil {
@@ -292,10 +318,16 @@ func (w *Endpoint) PreferredDomain(domain string) bool {
 }
 
 func (w *Endpoint) PreferredAddress(address netip.Addr) bool {
+	if !w.started.Load() {
+		return false
+	}
 	return w.endpoint.Lookup(address) != nil
 }
 
 func (w *Endpoint) NewDirectRouteConnection(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
+	if !w.started.Load() {
+		return nil, E.New("WireGuard is not ready yet")
+	}
 	return w.endpoint.NewDirectRouteConnection(metadata, routeContext, timeout)
 }
 

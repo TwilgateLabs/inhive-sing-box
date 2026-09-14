@@ -117,7 +117,10 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		// существовала только на бумаге, а 4 jetsam'а за день 2026-07-14 прошли
 		// без единого срабатывания. Интервал адаптивный (min→max, service_timer.go),
 		// в покое разрежается сам; цена тика — один task_info.
-		s.adaptiveTimer.start(0)
+		// Апстрим v1.13.14 пришёл к тому же (start в Start()); сигнатура теперь
+		// start(immediate bool): false = взвести таймер на minInterval без
+		// немедленного poll — ровно то, что делал наш start(0).
+		s.adaptiveTimer.start(false)
 		if s.memoryLimit > 0 {
 			s.logger.Info("started memory monitor with limit: ", s.memoryLimit/(1024*1024), " MiB")
 		} else {
@@ -186,7 +189,7 @@ func goMemoryPressureCallback(status C.ulong) {
 			if isCritical {
 				s.logger.Warn("memory pressure: ", level, ", usage: ", usage/(1024*1024), " MiB")
 				if s.adaptiveTimer != nil {
-					s.adaptiveTimer.startNow()
+					s.adaptiveTimer.start(true)
 				}
 			} else if isWarning {
 				s.logger.Warn("memory pressure: ", level, ", usage: ", usage/(1024*1024), " MiB")

@@ -90,7 +90,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			outbound.xudp = true
 		default:
 			// Deref: E.New/format.ToString panics on a *string ("unknown value"),
-			// masking the actual bad value (upstream bug too).
+			// masking the actual bad value (upstream fixed the same way in 1.13.14).
 			return nil, E.New("unknown packet encoding: ", *options.PacketEncoding)
 		}
 	}

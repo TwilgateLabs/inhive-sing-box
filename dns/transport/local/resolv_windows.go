@@ -78,12 +78,9 @@ func dnsReadConfig(ctx context.Context, _ string) *dnsConfig {
 			}{ifName: windows.UTF16PtrToString(address.FriendlyName), Addr: dnsServerAddr})
 		}
 	}
-	// InHive 2026-07-19: sing-tun 0.8.11 сменил `MyInterface() string` на
-	// `MyInterfaces() []string` — монитор теперь помнит ВСЕ зарегистрированные нами
-	// интерфейсы, а не только последний. Порт дословно повторяет апстрим sing-box
-	// 1.13.14 (dns/transport/local/resolv_windows.go:81-89). Смысл прежний: не брать
-	// в резолверы DNS-серверы, объявленные НАШИМ ЖЕ tun-интерфейсом, иначе резолвер
-	// спрашивает сам себя.
+	// InHive: DNS-серверы, объявленные НАШИМИ ЖЕ tun-интерфейсами (все, что монитор
+	// зарегистрировал через RegisterMyInterface), в резолвер не берём — иначе он
+	// спрашивает сам себя. Апстрим этого не комментирует; код побайтно апстримный.
 	var myInterfaces []string
 	if networkManager := service.FromContext[adapter.NetworkManager](ctx); networkManager != nil {
 		myInterfaces = networkManager.InterfaceMonitor().MyInterfaces()

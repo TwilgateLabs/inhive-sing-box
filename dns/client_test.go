@@ -139,11 +139,11 @@ func testResponse(message *dns.Msg) *dns.Msg {
 
 // waitForFlight — дождаться, пока лидер зарегистрирует single-flight запись
 // (иначе «ждун» в тесте может сам стать лидером).
-func waitForFlight(t *testing.T, client *Client, question dns.Question) *exchangeFlight {
+func waitForFlight(t *testing.T, client *Client, transport adapter.DNSTransport, question dns.Question) *exchangeFlight {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if flight, loaded := client.cacheLock.Load(question); loaded {
+		if flight, loaded := client.cacheLock.Load(transportCacheKey{Question: question, transportTag: transport.Tag()}); loaded {
 			return flight
 		}
 		time.Sleep(time.Millisecond)
@@ -169,7 +169,7 @@ func TestExchangeWaiterBoundedByLeaderDeadline(t *testing.T) {
 
 	leaderStart := time.Now()
 	go client.Exchange(context.Background(), transport, testQuery("example.org"), adapter.DNSQueryOptions{}, nil)
-	waitForFlight(t, client, testQuery("example.org").Question[0])
+	waitForFlight(t, client, transport, testQuery("example.org").Question[0])
 
 	// Ждун приходит на середине окна лидера.
 	time.Sleep(timeout / 2)
@@ -206,7 +206,7 @@ func TestExchangeWaiterAfterLeaderDeadlineFailsImmediately(t *testing.T) {
 	client := NewClient(ClientOptions{Timeout: timeout})
 
 	go client.Exchange(context.Background(), transport, testQuery("late.example.org"), adapter.DNSQueryOptions{}, nil)
-	waitForFlight(t, client, testQuery("late.example.org").Question[0])
+	waitForFlight(t, client, transport, testQuery("late.example.org").Question[0])
 
 	time.Sleep(timeout + 100*time.Millisecond) // дедлайн лидера прошёл
 	waiterStart := time.Now()
@@ -237,7 +237,7 @@ func TestExchangeWaiterGetsCachedResponseOnLeaderSuccess(t *testing.T) {
 		_, err := client.Exchange(context.Background(), transport, testQuery("ok.example.org"), adapter.DNSQueryOptions{}, nil)
 		leaderDone <- err
 	}()
-	waitForFlight(t, client, testQuery("ok.example.org").Question[0])
+	waitForFlight(t, client, transport, testQuery("ok.example.org").Question[0])
 
 	waiterDone := make(chan error, 1)
 	var waiterResponse *dns.Msg
@@ -275,7 +275,7 @@ func TestExchangeWaiterCtxCancel(t *testing.T) {
 	client := NewClient(ClientOptions{Timeout: 5 * time.Second})
 
 	go client.Exchange(context.Background(), transport, testQuery("cancel.example.org"), adapter.DNSQueryOptions{}, nil)
-	waitForFlight(t, client, testQuery("cancel.example.org").Question[0])
+	waitForFlight(t, client, transport, testQuery("cancel.example.org").Question[0])
 
 	ctx, cancel := context.WithCancel(context.Background())
 	waiterDone := make(chan error, 1)
@@ -390,7 +390,7 @@ func TestExchangeCircuitOpenWaiterFastFail(t *testing.T) {
 	client := NewClient(ClientOptions{Timeout: 5 * time.Second})
 
 	go client.Exchange(ctx, transport, testQuery("cb-wait.example.org"), adapter.DNSQueryOptions{}, nil)
-	waitForFlight(t, client, testQuery("cb-wait.example.org").Question[0])
+	waitForFlight(t, client, transport, testQuery("cb-wait.example.org").Question[0])
 
 	down.Store(true) // брейкер узнал о смерти outbound'а, пока лидер в полёте
 	start := time.Now()

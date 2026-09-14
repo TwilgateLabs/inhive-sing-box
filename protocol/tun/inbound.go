@@ -140,6 +140,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if ruleIndex == 0 {
 		ruleIndex = tun.DefaultIPRoute2RuleIndex
 	}
+	autoRedirectFallbackRuleIndex := options.AutoRedirectFallbackRuleIndex
+	if autoRedirectFallbackRuleIndex == 0 {
+		autoRedirectFallbackRuleIndex = tun.DefaultIPRoute2AutoRedirectFallbackRuleIndex
+	}
 	inputMark := uint32(options.AutoRedirectInputMark)
 	if inputMark == 0 {
 		inputMark = tun.DefaultAutoRedirectInputMark
@@ -165,35 +169,36 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		networkManager: networkManager,
 		logger:         logger,
 		tunOptions: tun.Options{
-			Name:                     options.InterfaceName,
-			MTU:                      tunMTU,
-			GSO:                      enableGSO,
-			Inet4Address:             inet4Address,
-			Inet6Address:             inet6Address,
-			AutoRoute:                options.AutoRoute,
-			IPRoute2TableIndex:       tableIndex,
-			IPRoute2RuleIndex:        ruleIndex,
-			AutoRedirectInputMark:    inputMark,
-			AutoRedirectOutputMark:   outputMark,
-			AutoRedirectResetMark:    resetMark,
-			AutoRedirectNFQueue:      nfQueue,
-			ExcludeMPTCP:             options.ExcludeMPTCP,
-			Inet4LoopbackAddress:     common.Filter(options.LoopbackAddress, netip.Addr.Is4),
-			Inet6LoopbackAddress:     common.Filter(options.LoopbackAddress, netip.Addr.Is6),
-			StrictRoute:              options.StrictRoute,
-			IncludeInterface:         options.IncludeInterface,
-			ExcludeInterface:         options.ExcludeInterface,
-			Inet4RouteAddress:        inet4RouteAddress,
-			Inet6RouteAddress:        inet6RouteAddress,
-			Inet4RouteExcludeAddress: inet4RouteExcludeAddress,
-			Inet6RouteExcludeAddress: inet6RouteExcludeAddress,
-			IncludeUID:               includeUID,
-			ExcludeUID:               excludeUID,
-			IncludeAndroidUser:       options.IncludeAndroidUser,
-			IncludePackage:           options.IncludePackage,
-			ExcludePackage:           options.ExcludePackage,
-			InterfaceMonitor:         networkManager.InterfaceMonitor(),
-			EXP_MultiPendingPackets:  multiPendingPackets,
+			Name:                                  options.InterfaceName,
+			MTU:                                   tunMTU,
+			GSO:                                   enableGSO,
+			Inet4Address:                          inet4Address,
+			Inet6Address:                          inet6Address,
+			AutoRoute:                             options.AutoRoute,
+			IPRoute2TableIndex:                    tableIndex,
+			IPRoute2RuleIndex:                     ruleIndex,
+			IPRoute2AutoRedirectFallbackRuleIndex: autoRedirectFallbackRuleIndex,
+			AutoRedirectInputMark:                 inputMark,
+			AutoRedirectOutputMark:                outputMark,
+			AutoRedirectResetMark:                 resetMark,
+			AutoRedirectNFQueue:                   nfQueue,
+			ExcludeMPTCP:                          options.ExcludeMPTCP,
+			Inet4LoopbackAddress:                  common.Filter(options.LoopbackAddress, netip.Addr.Is4),
+			Inet6LoopbackAddress:                  common.Filter(options.LoopbackAddress, netip.Addr.Is6),
+			StrictRoute:                           options.StrictRoute,
+			IncludeInterface:                      options.IncludeInterface,
+			ExcludeInterface:                      options.ExcludeInterface,
+			Inet4RouteAddress:                     inet4RouteAddress,
+			Inet6RouteAddress:                     inet6RouteAddress,
+			Inet4RouteExcludeAddress:              inet4RouteExcludeAddress,
+			Inet6RouteExcludeAddress:              inet6RouteExcludeAddress,
+			IncludeUID:                            includeUID,
+			ExcludeUID:                            excludeUID,
+			IncludeAndroidUser:                    options.IncludeAndroidUser,
+			IncludePackage:                        options.IncludePackage,
+			ExcludePackage:                        options.ExcludePackage,
+			InterfaceMonitor:                      networkManager.InterfaceMonitor(),
+			EXP_MultiPendingPackets:               multiPendingPackets,
 		},
 		udpTimeout:        udpTimeout,
 		stack:             options.Stack,
@@ -370,18 +375,18 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			forwarderBindInterface = true
 			includeAllNetworks = t.platformInterface.NetworkExtensionIncludeAllNetworks()
 		}
+		// InHive 2026-07-19: StackOptions.ICMPTimeout ОБЯЗАТЕЛЬНО заполнять начиная с
+		// sing-tun 0.8.11: там `NewDirectRouteMapping` перестал брать udpTimeout и берёт
+		// это поле. Оставить его незаполненным — тихо передать НОЛЬ: записи маппинга
+		// перестают истекать по времени (вытесняются только по ёмкости LRU), а сам ноль
+		// ещё и протекает в конструктор назначения. Ошибки при этом нет ни одной.
+		// Комментарий вынесен НАД литералом, чтобы сам литерал оставался побайтово
+		// апстримным (gofmt-выравнивание) и не конфликтовал на следующих мержах.
 		tunStack, err := tun.NewStack(t.stack, tun.StackOptions{
-			Context:    t.ctx,
-			Tun:        tunInterface,
-			TunOptions: t.tunOptions,
-			UDPTimeout: t.udpTimeout,
-			// InHive 2026-07-19: ОБЯЗАТЕЛЬНО к заполнению начиная с sing-tun 0.8.11.
-			// Там `NewDirectRouteMapping` перестал брать udpTimeout и берёт это новое
-			// поле. Оставить его незаполненным — тихо передать НОЛЬ: записи маппинга
-			// перестают истекать по времени (вытесняются только по ёмкости LRU), а сам
-			// ноль ещё и протекает в конструктор назначения. Ошибки при этом нет ни
-			// одной — ровно тот класс, который мы этой волной и вычищаем.
-			// Значение — апстримная константа sing-box 1.13.14 (inbound.go:383).
+			Context:                t.ctx,
+			Tun:                    tunInterface,
+			TunOptions:             t.tunOptions,
+			UDPTimeout:             t.udpTimeout,
 			ICMPTimeout:            C.ICMPTimeout,
 			Handler:                t,
 			Logger:                 t.logger,

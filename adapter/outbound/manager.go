@@ -87,13 +87,12 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 		m.access.Unlock()
 		for _, outbound := range outbounds {
 			name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
-			m.logger.Trace(stage, " ", name)
-			startTime := time.Now()
+			done := adapter.LogElapsed(m.logger, stage, " ", name)
 			err := adapter.LegacyStart(outbound, stage)
+			done()
 			if err != nil {
 				return E.Cause(err, stage, " ", name)
 			}
-			m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 		}
 	}
 	return nil
@@ -120,27 +119,25 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
 			canContinue = true
 			name := "outbound/" + outboundToStart.Type() + "[" + outboundTag + "]"
 			if starter, isStarter := outboundToStart.(adapter.Lifecycle); isStarter {
-				m.logger.Trace("start ", name)
-				startTime := time.Now()
+				done := adapter.LogElapsed(m.logger, "start ", name)
 				monitor.Start("start ", name)
 				err := starter.Start(adapter.StartStateStart)
 				monitor.Finish()
+				done()
 				if err != nil {
 					return E.Cause(err, "start ", name)
 				}
-				m.logger.Trace("start ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 			} else if starter, isStarter := outboundToStart.(interface {
 				Start() error
 			}); isStarter {
-				m.logger.Trace("start ", name)
-				startTime := time.Now()
+				done := adapter.LogElapsed(m.logger, "start ", name)
 				monitor.Start("start ", name)
 				err := starter.Start()
 				monitor.Finish()
+				done()
 				if err != nil {
 					return E.Cause(err, "start ", name)
 				}
-				m.logger.Trace("start ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 			}
 		}
 		if len(started) == len(outbounds) {
@@ -222,21 +219,26 @@ func (m *Manager) Close() error {
 			continue
 		}
 
-		m.logger.Trace("close ", name)
+		// Upstream LogElapsed: silent for fast closes, "close X..." after 1s,
+		// "completed (Ns)" on logDone().
+		logDone := adapter.LogElapsed(m.logger, "close ", name)
 		startTime := time.Now()
 		monitor.Start("close ", name)
 		select {
 		case closeErr := <-done:
 			monitor.Finish()
+			logDone()
 			err = E.Append(err, closeErr, func(err error) error {
 				return E.Cause(err, "close ", name)
 			})
-			m.logger.Trace("close ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 		case <-time.After(remaining):
 			monitor.Finish()
 			// This outbound wedged. Abandon its goroutine (leak accepted),
 			// log which one, and keep going — the shared deadline is now
 			// effectively expired, so subsequent outbounds take the fast path.
+			// logDone() is intentionally NOT called here: it would print
+			// "completed" for a Close() that never completed; the pending
+			// "close X..." trace stays truthful for an abandoned close.
 			m.logger.Warn("close ", name, " timed out after ", F.Seconds(time.Since(startTime).Seconds()), "s, abandoning")
 		}
 	}
@@ -343,13 +345,12 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if m.started {
 		name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
 		for _, stage := range adapter.ListStartStages {
-			m.logger.Trace(stage, " ", name)
-			startTime := time.Now()
+			done := adapter.LogElapsed(m.logger, stage, " ", name)
 			err = adapter.LegacyStart(outbound, stage)
+			done()
 			if err != nil {
 				return E.Cause(err, stage, " ", name)
 			}
-			m.logger.Trace(stage, " ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 		}
 	}
 	m.access.Lock()

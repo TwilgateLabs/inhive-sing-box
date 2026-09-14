@@ -33,18 +33,24 @@ var (
 var _ adapter.DNSClient = (*Client)(nil)
 
 type Client struct {
-	timeout            time.Duration
-	disableCache       bool
-	disableExpire      bool
-	independentCache   bool
-	clientSubnet       netip.Prefix
-	rdrc               adapter.RDRCStore
-	initRDRCFunc       func() adapter.RDRCStore
-	logger             logger.ContextLogger
-	cache              freelru.Cache[dns.Question, *dns.Msg]
-	cacheLock          compatible.Map[dns.Question, *exchangeFlight]
+	timeout          time.Duration
+	disableCache     bool
+	disableExpire    bool
+	independentCache bool
+	clientSubnet     netip.Prefix
+	rdrc             adapter.RDRCStore
+	initRDRCFunc     func() adapter.RDRCStore
+	logger           logger.ContextLogger
+	cache            freelru.Cache[dns.Question, *dns.Msg]
+	// cacheLock/transportCacheLock — single-flight по (question, transport), а не по
+	// голому question: с общим ключом вложенный резолв (transport при дайле
+	// резолвит свой server-hostname через ДРУГОЙ transport) того же question
+	// вставал в очередь за лидером, внутри дайла которого сам и выполнялся, —
+	// апстримный «DNS query loopback deadlock» (72a8723e1, v1.13.14). Значение —
+	// наш *exchangeFlight (дедлайн лидера), см. ниже.
+	cacheLock          compatible.Map[transportCacheKey, *exchangeFlight]
 	transportCache     freelru.Cache[transportCacheKey, *dns.Msg]
-	transportCacheLock compatible.Map[dns.Question, *exchangeFlight]
+	transportCacheLock compatible.Map[transportCacheKey, *exchangeFlight]
 	// negFail — короткоживущий negative-cache на СЕТЕВЫЕ фейлы (timeout/reset),
 	// а не Rcode-ответы. Когда активный сервер сдох, DNS-через-туннель отваливается
 	// и каждый повтор идентичного запроса жёг полные c.timeout (10s) + держал слот
@@ -57,7 +63,7 @@ type Client struct {
 // negFailTTL — как долго идентичный DNS-запрос fast-fail'ит после сетевого фейла.
 const negFailTTL = 5 * time.Second
 
-// exchangeFlight — запись single-flight'а по question. Раньше это был голый
+// exchangeFlight — запись single-flight'а по (question, transport). Раньше это был голый
 // chan struct{}, и каждый ждун ждал СВОИ полные c.timeout (10s), хотя лидер
 // стартовал раньше и упадёт раньше: при мёртвом транспорте каждое имя стояло
 // ~10s × волна ждунов (инцидент 2026-08-10 — «cache wait timeout» 1080 из
@@ -174,10 +180,7 @@ func NewClient(options ClientOptions) *Client {
 	if client.timeout == 0 {
 		client.timeout = C.DNSTimeout
 	}
-	cacheCapacity := options.CacheCapacity
-	if cacheCapacity < 1024 {
-		cacheCapacity = 1024
-	}
+	cacheCapacity := max(options.CacheCapacity, 1024)
 	if !client.disableCache {
 		if !client.independentCache {
 			client.cache = common.Must1(freelru.NewSharded[dns.Question, *dns.Msg](cacheCapacity, maphash.NewHasher[dns.Question]().Hash32))
@@ -248,15 +251,19 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 			len(message.Extra[0].(*dns.OPT).Option) == 0) &&
 		!options.ClientSubnet.IsValid()
 	disableCache := !isSimpleRequest || c.disableCache || options.DisableCache
+	// cacheKey — общий per-transport ключ single-flight'а (см. cacheLock) и
+	// negFail; строится один раз, чтобы обе структуры гарантированно ключевались
+	// одинаково.
+	cacheKey := transportCacheKey{Question: question, transportTag: transport.Tag()}
 	if !disableCache {
-		var flightLock *compatible.Map[dns.Question, *exchangeFlight]
+		var flightLock *compatible.Map[transportCacheKey, *exchangeFlight]
 		if c.cache != nil {
 			flightLock = &c.cacheLock
 		} else if c.transportCache != nil {
 			flightLock = &c.transportCacheLock
 		}
 		if flightLock != nil {
-			flight, loaded := flightLock.LoadOrStore(question, &exchangeFlight{
+			flight, loaded := flightLock.LoadOrStore(cacheKey, &exchangeFlight{
 				done:     make(chan struct{}),
 				deadline: time.Now().Add(c.timeout),
 			})
@@ -275,7 +282,7 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 			} else {
 				// Лидер. Идемпотентность прежняя: Delete до close, ровно один раз.
 				defer func() {
-					flightLock.Delete(question)
+					flightLock.Delete(cacheKey)
 					close(flight.done)
 				}()
 			}
@@ -302,9 +309,9 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 	}
 	// Negative-cache сетевых фейлов: если недавно этот запрос упал по timeout/
 	// reset на этом transport'е — fast-fail мгновенно, не жжём c.timeout (10s) и
-	// не держим exchange-слот, пока сервер мёртв. См. поле negFail.
-	negFailKey := transportCacheKey{Question: question, transportTag: transport.Tag()}
-	if _, failed := c.negFail.Get(negFailKey); failed {
+	// не держим exchange-слот, пока сервер мёртв. См. поле negFail. Ключ — тот же
+	// cacheKey (per-transport), что и у single-flight'а.
+	if _, failed := c.negFail.Get(cacheKey); failed {
 		return nil, E.New("dns: recent network failure cached for ", question.Name)
 	}
 	// Короткое замыкание по брейкеру для лидера и для запросов мимо кеша
@@ -325,7 +332,7 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 		} else {
 			// Сетевой фейл (timeout/reset), НЕ Rcode-ответ → кладём короткую
 			// negative-запись, чтобы погасить флуд идентичных повторов.
-			c.negFail.AddWithLifetime(negFailKey, struct{}{}, negFailTTL)
+			c.negFail.AddWithLifetime(cacheKey, struct{}{}, negFailTTL)
 			return nil, err
 		}
 	}
@@ -462,9 +469,10 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 	if options.LookupStrategy != C.DomainStrategyAsIS {
 		lookupOptions.Strategy = strategy
 	}
-	if strategy == C.DomainStrategyIPv4Only {
+	switch strategy {
+	case C.DomainStrategyIPv4Only:
 		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, lookupOptions, responseChecker)
-	} else if strategy == C.DomainStrategyIPv6Only {
+	case C.DomainStrategyIPv6Only:
 		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
 	}
 	var response4 []netip.Addr
@@ -628,10 +636,7 @@ func (c *Client) loadResponse(question dns.Question, transport adapter.DNSTransp
 				}
 			}
 		}
-		nowTTL := int(expireAt.Sub(timeNow).Seconds())
-		if nowTTL < 0 {
-			nowTTL = 0
-		}
+		nowTTL := max(int(expireAt.Sub(timeNow).Seconds()), 0)
 		response = response.Copy()
 		if originTTL > 0 {
 			duration := uint32(originTTL - nowTTL)
@@ -677,18 +682,6 @@ func MessageToAddresses(response *dns.Msg) []netip.Addr {
 		}
 	}
 	return addresses
-}
-
-func wrapError(err error) error {
-	switch dnsErr := err.(type) {
-	case *net.DNSError:
-		if dnsErr.IsNotFound {
-			return RcodeNameError
-		}
-	case *net.AddrError:
-		return RcodeNameError
-	}
-	return err
 }
 
 type transportKey struct{}
