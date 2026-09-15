@@ -971,21 +971,31 @@ func testStreamReadFromClosedStream(t *testing.T) {
 }
 
 func TestStreamCloseReadWithAllDataReceived(t *testing.T) {
-	synctest.Test(t, testStreamCloseReadWithAllDataReceived)
-}
-func testStreamCloseReadWithAllDataReceived(t *testing.T) {
-	tc, s := newTestConnAndRemoteStream(t, serverSide, bidiStream, permissiveTransportParameters)
-	tc.writeFrames(packetType1RTT, debugFrameStream{
-		id:   s.id,
-		data: []byte{1, 2, 3},
-		fin:  true,
-	})
-	s.CloseRead()
-	tc.wantIdle("CloseRead in Data Recvd state doesn't need to send STOP_SENDING")
-	// We had all the data for the stream, but CloseRead discarded it.
-	wantErr := "read from closed stream"
-	if n, err := s.Read(make([]byte, 16)); err == nil || !strings.Contains(err.Error(), wantErr) {
-		t.Errorf("s.Read() = %v, %v; want error %q", n, err, wantErr)
+	for _, read := range []bool{true, false} {
+		name := "with partial read"
+		if !read {
+			name = "without partial read"
+		}
+		synctestSubtest(t, name, func(t *testing.T) {
+			tc, s := newTestConnAndRemoteStream(t, serverSide, bidiStream, permissiveTransportParameters)
+			tc.writeFrames(packetType1RTT, debugFrameStream{
+				id:   s.id,
+				data: []byte{1, 2, 3},
+				fin:  true,
+			})
+			if read {
+				if _, err := s.Read(make([]byte, 1)); err != nil {
+					t.Fatalf("s.Read() = %v", err)
+				}
+			}
+			s.CloseRead()
+			tc.wantIdle("CloseRead in Data Recvd state doesn't need to send STOP_SENDING")
+			// We had all the data for the stream, but CloseRead discarded it.
+			wantErr := "read from closed stream"
+			if n, err := s.Read(make([]byte, 16)); err == nil || !strings.Contains(err.Error(), wantErr) {
+				t.Errorf("s.Read() = %v, %v; want error %q", n, err, wantErr)
+			}
+		})
 	}
 }
 
@@ -1006,6 +1016,20 @@ func testStreamWriteToClosedStream(t *testing.T) {
 	if n, err := s.Write([]byte{}); err == nil || !strings.Contains(err.Error(), wantErr) {
 		t.Errorf("s.Write() = %v, %v; want error %q", n, err, wantErr)
 	}
+}
+
+func TestStreamStopSendingSendErrorCode(t *testing.T) {
+	synctest.Test(t, testStreamStopSendingSendErrorCode)
+}
+func testStreamStopSendingSendErrorCode(t *testing.T) {
+	tc, s := newTestConnAndRemoteStream(t, serverSide, bidiStream, permissiveTransportParameters)
+	wantCode := uint64(42)
+	s.StopSending(wantCode)
+	tc.wantFrame("StopSending sends a STOP_SENDING frame",
+		packetType1RTT, debugFrameStopSending{
+			id:   s.id,
+			code: wantCode,
+		})
 }
 
 func TestStreamResetBlockedStream(t *testing.T) {
@@ -1284,9 +1308,9 @@ func TestStreamPeerResetsWithUnreadAndUnsentData(t *testing.T) {
 			finalSize: 20,
 			code:      sentCode,
 		})
-		wantErr := StreamErrorCode(sentCode)
-		if _, err := io.ReadAll(s); !errors.Is(err, wantErr) {
-			t.Fatalf("Read reset stream: ReadAll got error %v; want %v", err, wantErr)
+		wantErr := StreamError(sentCode)
+		if unread, err := io.ReadAll(s); !errors.Is(err, wantErr) || len(unread) != 0 {
+			t.Fatalf("Read reset stream: ReadAll got %x, error %v; want empty, %v", unread, err, wantErr)
 		}
 	})
 }
@@ -1305,7 +1329,7 @@ func TestStreamPeerResetWakesBlockedRead(t *testing.T) {
 			finalSize: 20,
 			code:      sentCode,
 		})
-		wantErr := StreamErrorCode(sentCode)
+		wantErr := StreamError(sentCode)
 		if n, err := reader.result(); n != 0 || !errors.Is(err, wantErr) {
 			t.Fatalf("Read reset stream: got %v, %v; want 0, %v", n, err, wantErr)
 		}
@@ -1330,7 +1354,7 @@ func TestStreamPeerResetFollowedByData(t *testing.T) {
 			finalSize: 4,
 			code:      2,
 		})
-		wantErr := StreamErrorCode(1)
+		wantErr := StreamError(1)
 		if n, err := s.Read(make([]byte, 16)); n != 0 || !errors.Is(err, wantErr) {
 			t.Fatalf("Read from reset stream: got %v, %v; want 0, %v", n, err, wantErr)
 		}
@@ -1342,14 +1366,10 @@ func TestStreamResetInvalidCode(t *testing.T) {
 }
 func testStreamResetInvalidCode(t *testing.T) {
 	tc, s := newTestConnAndLocalStream(t, serverSide, uniStream, permissiveTransportParameters)
-	s.Reset(1 << 62)
-	tc.wantFrame("reset with invalid code sends a RESET_STREAM anyway",
-		packetType1RTT, debugFrameResetStream{
-			id: s.id,
-			// The code we send here isn't specified,
-			// so this could really be any value.
-			code: (1 << 62) - 1,
-		})
+	if err := s.Reset(1 << 62); err == nil {
+		t.Errorf("s.Reset with an invalid code succeeded; want error")
+	}
+	tc.wantIdle("reset with an invalid code has no effect")
 }
 
 func TestStreamResetReceiveOnly(t *testing.T) {
@@ -1387,8 +1407,9 @@ func TestStreamPeerStopSendingForActiveStream(t *testing.T) {
 				code:      42,
 				finalSize: 4,
 			})
-		if n, err := s.Write([]byte{0}); err == nil {
-			t.Errorf("s.Write() after STOP_SENDING = %v, %v; want error", n, err)
+		wantErr := StreamError(42)
+		if n, err := s.Write([]byte{0}); n != 0 || !errors.Is(err, wantErr) {
+			t.Errorf("s.Write() after STOP_SENDING = %v, %v; want error %v", n, err, wantErr)
 		}
 		// This ack will result in some of the previous frames being marked as lost.
 		tc.writeAckForLatest()
@@ -1486,7 +1507,7 @@ func TestStreamErrorsAfterConnectionClosed(t *testing.T) {
 func testStreamErrorsAfterConnectionClosed(t *testing.T) {
 	tc, s := newTestConnAndLocalStream(t, clientSide, bidiStream,
 		permissiveTransportParameters)
-	wantErr := &ApplicationError{Code: 42}
+	wantErr := &ConnectionCloseError{Code: 42}
 	tc.writeFrames(packetType1RTT, debugFrameConnectionCloseApplication{
 		code: wantErr.Code,
 	})

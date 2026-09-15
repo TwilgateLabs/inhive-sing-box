@@ -7,19 +7,72 @@ package http3
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"math"
+	"net"
 	"net/http"
 	"reflect"
 	"slices"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"golang.org/x/net/internal/quic/quicwire"
 	"golang.org/x/net/quic"
 )
+
+// unusablePacketConn is a net.PacketConn whose LocalAddr is not a valid
+// UDP address, which makes quic.NewEndpoint fail.
+type unusablePacketConn struct {
+	net.PacketConn
+	closed bool
+}
+
+func (c *unusablePacketConn) LocalAddr() net.Addr {
+	return &net.UnixAddr{Name: "unusable", Net: "unix"}
+}
+
+func (c *unusablePacketConn) Close() error {
+	c.closed = true
+	return nil
+}
+
+// TestTransportInitEndpointError verifies that a transport which fails to
+// create its QUIC endpoint reports the error, rather than proceeding with a
+// nil endpoint.
+func TestTransportInitEndpointError(t *testing.T) {
+	conn := &unusablePacketConn{}
+	tr := &transport{
+		tr1: new(http.Transport), // TLSClientConfig is nil, as by default
+		opts: TransportOpts{
+			ListenPacket: func(network, addr string) (net.PacketConn, error) {
+				return conn, nil
+			},
+		},
+		activeConns: make(map[*clientConn]struct{}),
+	}
+
+	if err := tr.initEndpoint(); err == nil {
+		t.Fatal("initEndpoint() = nil, want error")
+	}
+	if tr.endpoint != nil {
+		t.Errorf("after failed initEndpoint, transport.endpoint = %v, want nil", tr.endpoint)
+	}
+	if !conn.closed {
+		t.Errorf("after failed initEndpoint, the net.PacketConn was not closed")
+	}
+
+	// dial must report the error rather than panicking on the nil endpoint.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := tr.dial(ctx, "127.0.0.1:443", &tls.Config{}, nil); err == nil {
+		t.Fatal("dial() = nil error, want error")
+	}
+}
 
 func TestTransportServerCreatesBidirectionalStream(t *testing.T) {
 	// "Clients MUST treat receipt of a server-initiated bidirectional
@@ -31,6 +84,111 @@ func TestTransportServerCreatesBidirectionalStream(t *testing.T) {
 		st := tc.newStream(streamTypeRequest)
 		st.Flush()
 		tc.wantClosed("after server creates bidi stream", errH3StreamCreationError)
+	})
+}
+
+func TestClientConnMethods(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var called bool
+		hook := func() {
+			if called {
+				t.Error("state hook was unexpectedly called")
+			}
+			called = true
+		}
+		verifyHookWasCalled := func() {
+			if !called {
+				t.Error("state hook was unexpectedly not called")
+			}
+			called = false
+		}
+		tc := newTestClientConnWithHook(t, hook)
+		tc.greet()
+
+		// Initial state after establishing connection.
+		if err := tc.cc.Err(); err != nil {
+			t.Errorf("cc.Err() = %v, want nil", err)
+		}
+		if avail := tc.cc.Available(); avail != math.MaxInt {
+			t.Errorf("cc.Available() = %v, want %v", avail, math.MaxInt)
+		}
+		if inFlight := tc.cc.InFlight(); inFlight != 0 {
+			t.Errorf("cc.InFlight() = %v, want 0", inFlight)
+		}
+
+		// Release, with Reserve before and without.
+		for _, reserveBefore := range []bool{true, false} {
+			if reserveBefore {
+				if err := tc.cc.Reserve(); err != nil {
+					t.Fatalf("cc.Reserve() failed: %v", err)
+				}
+				if avail := tc.cc.Available(); avail != math.MaxInt {
+					t.Errorf("after Reserve, cc.Available() = %v, want %v", avail, math.MaxInt)
+				}
+				if inFlight := tc.cc.InFlight(); inFlight != 1 {
+					t.Errorf("after Reserve, cc.InFlight() = %v, want 1", inFlight)
+				}
+			}
+			tc.cc.Release()
+			if avail := tc.cc.Available(); avail != math.MaxInt {
+				t.Errorf("after Release, cc.Available() = %v, want %v", avail, math.MaxInt)
+			}
+			if inFlight := tc.cc.InFlight(); inFlight != 0 {
+				t.Errorf("after Release, cc.InFlight() = %v, want 0", inFlight)
+			}
+		}
+
+		// RoundTrip, with Reserve before and without.
+		for _, reserveBefore := range []bool{true, false} {
+			if reserveBefore {
+				if err := tc.cc.Reserve(); err != nil {
+					t.Fatalf("cc.Reserve() failed: %v", err)
+				}
+				if avail := tc.cc.Available(); avail != math.MaxInt {
+					t.Errorf("after Reserve, cc.Available() = %v, want %v", avail, math.MaxInt)
+				}
+				if inFlight := tc.cc.InFlight(); inFlight != 1 {
+					t.Errorf("after Reserve, cc.InFlight() = %v, want 1", inFlight)
+				}
+			}
+			req, _ := http.NewRequest("GET", "https://example.com/", nil)
+			rt := tc.roundTrip(req)
+			if avail := tc.cc.Available(); avail != math.MaxInt {
+				t.Errorf("after RoundTrip, cc.Available() = %v, want %v", avail, math.MaxInt)
+			}
+			st := tc.wantStream(streamTypeRequest)
+			st.wantHeaders(nil)
+			st.writeHeaders(http.Header{":status": []string{"200"}})
+			resp := rt.response()
+			if resp.StatusCode != 200 {
+				t.Errorf("resp.StatusCode = %v, want 200", resp.StatusCode)
+			}
+			if inFlight := tc.cc.InFlight(); inFlight != 1 { // InFlight should decrement only after the body is closed.
+				t.Errorf("before body close, cc.InFlight() = %v, want 1", inFlight)
+			}
+			resp.Body.Close()
+			if inFlight := tc.cc.InFlight(); inFlight != 0 {
+				t.Errorf("after body close, cc.InFlight() = %v, want 0", inFlight)
+			}
+			verifyHookWasCalled()
+		}
+
+		// Connection closure.
+		if err := tc.cc.Reserve(); err != nil {
+			t.Fatalf("cc.Reserve() failed: %v", err)
+		}
+		tc.cc.Close()
+		synctest.Wait()
+		verifyHookWasCalled()
+		if err := tc.cc.Err(); err == nil {
+			t.Error("after connection is closed, cc.Err() = nil, want err")
+		}
+		if avail := tc.cc.Available(); avail != 0 {
+			t.Errorf("after connection is closed, cc.Available() = %v, want 0", avail)
+		}
+		if inFlight := tc.cc.InFlight(); inFlight != 0 {
+			t.Errorf("after connection is closed, cc.InFlight() = %v, want 0", inFlight)
+		}
 	})
 }
 
@@ -117,7 +275,7 @@ func (tq *testQUICConn) wantClosed(reason string, want error) {
 	synctest.Wait()
 
 	if e, ok := want.(http3Error); ok {
-		want = &quic.ApplicationError{Code: uint64(e)}
+		want = &quic.ConnectionCloseError{Code: uint64(e)}
 	}
 	got := tq.qconn.Wait(canceledCtx)
 	if errors.Is(got, context.Canceled) {
@@ -164,7 +322,7 @@ func (ts *testQUICStream) wantIdle(reason string) {
 	if _, err := qs.Read(make([]byte, 1)); !errors.Is(err, context.Canceled) {
 		ts.t.Fatalf("%v: want stream to be idle, but stream has content", reason)
 	}
-	qs.SetReadContext(nil)
+	qs.SetReadContext(context.Background())
 }
 
 // wantFrameHeader calls readFrameHeader and asserts that the frame is of a given type.
@@ -350,14 +508,14 @@ func (ts *testQUICStream) wantClosed(reason string) {
 	}
 }
 
-func (ts *testQUICStream) wantError(want quic.StreamErrorCode) {
+func (ts *testQUICStream) wantError(want quic.StreamError) {
 	ts.t.Helper()
 	synctest.Wait()
-	_, err := ts.stream.stream.ReadByte()
+	_, err := ts.ReadByte()
 	if err == nil {
 		ts.t.Fatalf("successfully read from stream; want stream error code %v", want)
 	}
-	var got quic.StreamErrorCode
+	var got quic.StreamError
 	if !errors.As(err, &got) {
 		ts.t.Fatalf("stream error = %v; want %v", err, want)
 	}
@@ -440,17 +598,15 @@ type testClientConn struct {
 	control *testQUICStream
 }
 
-func newTestClientConn(t testing.TB) *testClientConn {
+func newTestClientConnWithHook(t testing.TB, stateHook func()) *testClientConn {
 	e1, e2 := newQUICEndpointPair(t)
 	tr := &transport{
-		endpoint: e1,
-		config: &quic.Config{
-			TLSConfig: testTLSConfig,
-		},
+		endpoint:    e1,
+		tr1:         new(http.Transport),
 		activeConns: make(map[*clientConn]struct{}),
 	}
 
-	cc, err := tr.dial(t.Context(), e2.LocalAddr().String())
+	cc, err := tr.dial(t.Context(), e2.LocalAddr().String(), testTLSConfig, stateHook)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,6 +625,10 @@ func newTestClientConn(t testing.TB) *testClientConn {
 	}
 	synctest.Wait()
 	return tc
+}
+
+func newTestClientConn(t testing.TB) *testClientConn {
+	return newTestClientConnWithHook(t, nil)
 }
 
 // greet performs initial connection handshaking with the client.

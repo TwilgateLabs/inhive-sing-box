@@ -152,9 +152,6 @@ func (a sortedAttributes) Len() int {
 }
 
 func (a sortedAttributes) Less(i, j int) bool {
-	if a[i].Namespace != a[j].Namespace {
-		return a[i].Namespace < a[j].Namespace
-	}
 	return a[i].Key < a[j].Key
 }
 
@@ -242,7 +239,7 @@ func dump(n *Node) (string, error) {
 	return b.String(), nil
 }
 
-var testDataDirs = []string{"testdata/webkit/", "testdata/go/"}
+var testDataDirs = []string{"testdata/html5lib-tests/tree-construction/", "testdata/go/"}
 
 func TestParser(t *testing.T) {
 	for _, testDataDir := range testDataDirs {
@@ -251,35 +248,33 @@ func TestParser(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, tf := range testFiles {
-			t.Run(tf, func(t *testing.T) {
-				f, err := os.Open(tf)
+			f, err := os.Open(tf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			r := bufio.NewReader(f)
+
+			for i := 0; ; i++ {
+				ta, err := readParseTest(r)
+				if err == io.EOF {
+					break
+				}
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer f.Close()
-				r := bufio.NewReader(f)
-
-				for i := 0; ; i++ {
-					ta, err := readParseTest(r)
-					if err == io.EOF {
-						break
-					}
-					if err != nil {
-						t.Fatal(err)
-					}
-					if parseTestBlacklist[ta.text] {
-						continue
-					}
-
-					t.Run(fmt.Sprint(i), func(t *testing.T) {
-						err = testParseCase(ta.text, ta.want, ta.context, ParseOptionEnableScripting(ta.scripting))
-
-						if err != nil {
-							t.Errorf("%s test #%d %q, %s", tf, i, ta.text, err)
-						}
-					})
+				if parseTestBlacklist[ta.text] {
+					continue
 				}
-			})
+
+				testId := fmt.Sprintf("%s/%d", strings.ReplaceAll(tf, string(os.PathSeparator), "/"), i)
+				t.Run(testId, func(t *testing.T) {
+					err = testParseCase(ta.text, ta.want, ta.context, ParseOptionEnableScripting(ta.scripting))
+					if err != nil {
+						t.Errorf("%s test #%d %q, %s", tf, i, ta.text, err)
+					}
+				})
+			}
 		}
 	}
 }
@@ -391,6 +386,11 @@ var parseTestBlacklist = map[string]bool{
 	// See the a.Template TODO in inHeadIM.
 	`<math><template><mo><template>`:                                     true,
 	`<template><svg><foo><template><foreignObject><div></template><div>`: true,
+	// We don't support "element insertion steps"
+	`<select><button><selectedcontent></button><option>X`:                   true,
+	`<select><button><selectedcontent></button><option>x<i>i<b>ib</i>b`:     true,
+	`<select><button><selectedcontent></button><option>X<option>Y`:          true,
+	`<select><button><selectedcontent></button><option>X<option selected>Y`: true,
 }
 
 // Some test input result in parse trees are not 'well-formed' despite
@@ -451,6 +451,8 @@ var renderTestBlacklist = map[string]bool{
 	`<!doctype html><svg><plaintext>a</plaintext>b`:           true,
 	// Due to fostering, parsing the rendered output produces a different tree.
 	`<math><mtext><table><mglyph><style><img>`: true,
+	// Confusing plaintext behavior
+	`<!doctype html><table><select><plaintext>a<caption>b`: true,
 }
 
 func TestNodeConsistency(t *testing.T) {

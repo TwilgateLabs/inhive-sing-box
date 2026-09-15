@@ -11,10 +11,12 @@ import (
 	"net/http/httptrace"
 	"net/textproto"
 	"strconv"
+	"strings"
 	"sync"
 
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/internal/httpcommon"
+	"golang.org/x/net/quic"
 )
 
 type roundTripState struct {
@@ -41,15 +43,21 @@ type roundTripState struct {
 func (rt *roundTripState) abort(err error) error {
 	rt.errOnce.Do(func() {
 		rt.err = err
+
+		rt.cc.mu.Lock()
+		rt.cc.active--
+		rt.cc.mu.Unlock()
+		rt.cc.maybeCallStateHook()
+
 		switch e := err.(type) {
 		case *connectionError:
 			rt.cc.abort(e)
 		case *streamError:
-			rt.st.stream.CloseRead()
-			rt.st.stream.Reset(uint64(e.code))
+			rt.st.CloseRead(uint64(e.code))
+			rt.st.Reset(uint64(e.code))
 		default:
-			rt.st.stream.CloseRead()
-			rt.st.stream.Reset(uint64(errH3NoError))
+			rt.st.CloseRead(uint64(errH3NoError))
+			rt.st.Reset(uint64(errH3NoError))
 		}
 	})
 	return rt.err
@@ -88,9 +96,20 @@ func (rt *roundTripState) maybeCallWait100Continue() {
 
 // RoundTrip sends a request on the connection.
 func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error) {
+	cc.mu.Lock()
+	if cc.reserved > 0 {
+		cc.reserved--
+	}
+	cc.active++
+	cc.mu.Unlock()
+
 	// Each request gets its own QUIC stream.
 	st, err := newConnStream(req.Context(), cc.qconn, streamTypeRequest)
 	if err != nil {
+		cc.mu.Lock()
+		cc.active--
+		cc.mu.Unlock()
+		cc.maybeCallStateHook()
 		return nil, err
 	}
 	rt := &roundTripState{
@@ -102,9 +121,26 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 	if rt.reqBody == nil {
 		rt.reqBody = http.NoBody
 	}
+	// wg tracks the writeBodyAndTrailer goroutine, if we start one.
+	var wg sync.WaitGroup
 	defer func() {
 		if err != nil {
 			err = rt.abort(err)
+
+			// Close the request body, and wait for writeBodyAndTrailer to
+			// finish with it, before returning.
+			//
+			// Closing the body here wakes up writeBodyAndTrailer if it is
+			// blocked reading from it; abort has already reset the stream,
+			// so a blocked write fails rather than hanging.
+			//
+			// net/http inspects the request body as soon as RoundTrip returns,
+			// to see whether it was read from or closed, so the close has to
+			// happen before we return rather than concurrently with the
+			// caller. The HTTP/2 transport does the same thing;
+			// see golang/go#60041.
+			rt.closeReqBody()
+			wg.Wait()
 		}
 	}()
 
@@ -112,6 +148,7 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 	st.stream.SetReadContext(req.Context())
 	st.stream.SetWriteContext(req.Context())
 
+	addedGzip := httpcommon.IsRequestGzip(req.Method, req.Header, cc.tr.tr1.DisableCompression)
 	headers := cc.enc.encode(func(yield func(itype indexType, name, value string)) {
 		_, err = httpcommon.EncodeHeaders(req.Context(), httpcommon.EncodeHeadersParam{
 			Request: httpcommon.Request{
@@ -122,9 +159,9 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 				Trailer:             req.Trailer,
 				ActualContentLength: actualContentLength(req),
 			},
-			AddGzipHeader:         false, // TODO: add when appropriate
+			AddGzipHeader:         addedGzip,
 			PeerMaxHeaderListSize: 0,
-			DefaultUserAgent:      "Go-http-client/3",
+			DefaultUserAgent:      "Go-http-client/3.0",
 		}, func(name, value string) {
 			// Issue #71374: Consider supporting never-indexed fields.
 			yield(mayIndex, name, value)
@@ -148,7 +185,7 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 		rt.maybeCallWait100Continue()
 	} else {
 		bodyAndTrailerWritten = true
-		go cc.writeBodyAndTrailer(rt, req)
+		wg.Go(func() { cc.writeBodyAndTrailer(rt, req) })
 	}
 
 	// Read the response headers.
@@ -164,25 +201,18 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 				return nil, err
 			}
 
-			// TODO: Handle 1xx responses.
 			if isInfoStatus(statusCode) {
 				if err := rt.maybeCallGot1xxResponse(statusCode, h); err != nil {
 					return nil, err
 				}
-				switch statusCode {
-				case 100:
+				if statusCode == 100 {
 					rt.maybeCallGot100Continue()
 					if is100ContinueReq && !bodyAndTrailerWritten {
 						bodyAndTrailerWritten = true
-						go cc.writeBodyAndTrailer(rt, req)
-						continue
+						wg.Go(func() { cc.writeBodyAndTrailer(rt, req) })
 					}
-					// If we did not send "Expect: 100-continue" request but
-					// received status 100 anyways, just continue per usual and
-					// let the caller decide what to do with the response.
-				default:
-					continue
 				}
+				continue
 			}
 
 			// We have the response headers.
@@ -215,7 +245,13 @@ func (cc *clientConn) RoundTrip(req *http.Request) (_ *http.Response, err error)
 				Trailer:       trailer,
 				Body:          (*transportResponseBody)(rt),
 			}
-			// TODO: Automatic Content-Type: gzip decoding.
+			if addedGzip && strings.EqualFold(h.Get("Content-Encoding"), "gzip") {
+				resp.Body = &gzipReader{body: resp.Body}
+				h.Del("Content-Encoding")
+				h.Del("Content-Length")
+				resp.ContentLength = -1
+				resp.Uncompressed = true
+			}
 			return resp, nil
 		case frameTypePushPromise:
 			if err := cc.handlePushPromise(st); err != nil {
@@ -241,6 +277,19 @@ func actualContentLength(req *http.Request) int64 {
 	return -1
 }
 
+// reqBodyIgnored reports whether err is an error caused by the server
+// requesting that the client stop sending the request body. Per RFC 9114
+// Section 4.1, a server can send a complete response prior to the client
+// sending an entire request if the response does not depend on any portion of
+// the unsent request. When this happens, the server will use the H3_NO_ERROR
+// code, and the client MUST NOT discard the response.
+func reqBodyIgnored(err error) bool {
+	if streamErr, ok := errors.AsType[quic.StreamError](err); ok {
+		return http3Error(streamErr) == errH3NoError
+	}
+	return false
+}
+
 // writeBodyAndTrailer handles writing the body and trailer for a given
 // request, if any. This function will close the write direction of the stream.
 func (cc *clientConn) writeBodyAndTrailer(rt *roundTripState, req *http.Request) {
@@ -256,7 +305,11 @@ func (cc *clientConn) writeBodyAndTrailer(rt *roundTripState, req *http.Request)
 	rt.reqBodyWriter.enc = &cc.enc
 
 	if _, err := io.Copy(&rt.reqBodyWriter, rt.reqBody); err != nil {
+		if reqBodyIgnored(err) {
+			return
+		}
 		rt.abort(err)
+		return
 	}
 	// Get rid of any trailer that was not declared beforehand, before we
 	// close the request body which will cause the trailer headers to be
@@ -285,18 +338,15 @@ var errRespBodyClosed = errors.New("response body closed")
 // Closing the response body is how the caller signals that they're done with a request.
 func (b *transportResponseBody) Close() error {
 	rt := (*roundTripState)(b)
-	// Close the request body, which should wake up copyRequestBody if it's
-	// currently blocked reading the body.
-	rt.closeReqBody()
-	// Close the request stream, since we're done with the request.
-	// Reset closes the sending half of the stream.
-	rt.st.stream.Reset(uint64(errH3NoError))
 	// respBody.Close is responsible for closing the receiving half.
 	err := rt.respBody.Close()
 	if err == nil {
 		err = errRespBodyClosed
 	}
 	err = rt.abort(err)
+	// Close the request body, which should wake up writeBodyAndTrailer if it's
+	// currently blocked reading the body.
+	rt.closeReqBody()
 	if err == errRespBodyClosed {
 		// No other errors occurred before closing Response.Body,
 		// so consider this a successful request.

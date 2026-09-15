@@ -366,28 +366,102 @@ func TestSVCBWireFormat(t *testing.T) {
 	testRecord(bytes, parsed)
 }
 
-func TestSVCBPackLongValue(t *testing.T) {
-	b := NewBuilder(nil, Header{})
-	b.StartQuestions()
-	b.StartAnswers()
-
-	res := SVCBResource{
-		Target: MustNewName("example.com."),
-		Params: []SVCParam{
-			{
-				Key:   SVCParamMandatory,
-				Value: make([]byte, math.MaxUint16+1),
+func TestSVCBPackErrors(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		r    SVCBResource
+	}{
+		{
+			name: "long value",
+			r: SVCBResource{
+				Target: MustNewName("example.com."),
+				Params: []SVCParam{
+					{
+						Key:   SVCParamMandatory,
+						Value: make([]byte, math.MaxUint16+1),
+					},
+				},
 			},
 		},
+		{
+			name: "out-of-order keys",
+			r: SVCBResource{
+				Target: MustNewName("example.com."),
+				Params: []SVCParam{
+					{
+						Key:   SVCParamPort, // 3
+						Value: []byte("443"),
+					},
+					{
+						Key:   SVCParamALPN, // 1
+						Value: []byte("h2"),
+					},
+				},
+			},
+		},
+		{
+			name: "duplicate keys",
+			r: SVCBResource{
+				Target: MustNewName("example.com."),
+				Params: []SVCParam{
+					{
+						Key:   SVCParamALPN,
+						Value: []byte("h3"),
+					},
+					{
+						Key:   SVCParamALPN,
+						Value: []byte("h2"),
+					},
+				},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			b := NewBuilder(nil, Header{})
+			b.StartQuestions()
+			b.StartAnswers()
+			if err := b.SVCBResource(ResourceHeader{
+				Name: MustNewName("example.com."),
+			}, test.r); err == nil {
+				t.Errorf("b.SVCBResource() succeeded; want error")
+			}
+
+			b = NewBuilder(nil, Header{})
+			b.StartQuestions()
+			b.StartAnswers()
+			if err := b.HTTPSResource(ResourceHeader{
+				Name: MustNewName("example.com."),
+			}, HTTPSResource{test.r}); err == nil {
+				t.Errorf("b.HTTPSResource() succeeded; want error")
+			}
+		})
+	}
+}
+
+func TestSVCBUnpackOutOfBounds(t *testing.T) {
+	// A minimal DNS message with an SVCB record where the header Length
+	// field (65535) maliciously exceeds the physical bounds of the buffer.
+	msg := []byte{
+		0x00, 0x01, // ID
+		0x00, 0x00, // Flags
+		0x00, 0x00, // QDCount = 0
+		0x00, 0x01, // ANCount = 1
+		0x00, 0x00, // NSCount = 0
+		0x00, 0x00, // ARCount = 0
+		0x00,       // Name: "."
+		0x00, 0x40, // Type: SVCB
+		0x00, 0x01, // Class: INET
+		0x00, 0x00, 0x00, 0x00, // TTL
+		0xff, 0xff, // Length: 65535 (Spoofed)
+		0x00, 0x01, // Priority
+		0x00,       // Target
+		0x00, 0x01, // Param Key
+		0xff, 0xf8, // Param Length
 	}
 
-	err := b.SVCBResource(ResourceHeader{Name: MustNewName("example.com.")}, res)
-	if err == nil || err.Error() != "ResourceBody: SVCBResource.Params: value too long (>65535 bytes)" {
-		t.Fatalf(`b.SVCBResource() = %v; want = "ResourceBody: SVCBResource.Params: value too long (>65535 bytes)"`, err)
-	}
-
-	err = b.HTTPSResource(ResourceHeader{Name: MustNewName("example.com.")}, HTTPSResource{res})
-	if err == nil || err.Error() != "ResourceBody: SVCBResource.Params: value too long (>65535 bytes)" {
-		t.Fatalf(`b.HTTPSResource() = %v; want = "ResourceBody: SVCBResource.Params: value too long (>65535 bytes)"`, err)
+	var m Message
+	err := m.Unpack(msg)
+	if err == nil {
+		t.Fatal("expected error parsing malformed message, got nil")
 	}
 }
