@@ -45,8 +45,8 @@ type Client struct {
 	// InHive 2026-07-31: прокидывается через v2ray.NewClientTransport от outbound'а
 	// ради детектора глухого download (deafwatch.go) — до этого у client-транспорта
 	// логгера не было вовсе и весь этот класс отказов был неозвучиваем.
-	logger logger.ContextLogger
-	mode   string // resolved dial mode ("auto" is resolved at construction, per Xray semantics)
+	logger         logger.ContextLogger
+	mode           string // resolved dial mode ("auto" is resolved at construction, per Xray semantics)
 	getRequestURL  func(sessionId string) url.URL
 	getRequestURL2 func(sessionId string) url.URL
 	getHTTPClient  func() (DialerClient, *XmuxClient)
@@ -225,26 +225,53 @@ func NewClient(ctx context.Context, ctxLogger logger.ContextLogger, dialer N.Dia
 // начинает рубить стримы (INTERNAL_ERROR) — отдача стартует сотнями Мбит/с и
 // схлопывается до ~0.5 в пределах одного спидтеста.
 //
-// ⚠️ Значения сверены с Xray 26.7.11 (актуальный апстрим, из которого собран
-// референсный клиент Happ), а НЕ с 26.1.13, по которому делалась первая версия
-// этой правки. Апстрим сменил дефолт между этими версиями:
+// ⚠️ Значения сверены по САМОМУ апстриму, а не по памяти и не по реестру:
+// XTLS/Xray-core, тег v26.9.9, infra/conf/transport_method.go,
+// SplitHTTPConfig.Build, блок `if c.Xmux == (XmuxConfig{})` — а НЕ по
+// 26.1.13/26.7.11, по которым делались предыдущие версии этой правки.
+// Инвариант: запись `xhttp` в core/upstream.toml обязана держать ref РАВНЫМ
+// тегу, названному строкой выше. Разъехались — значит check-upstream-drift.py
+// резолвит не тот эталон, и следующий diff-аудит снова сверится с прошлым
+// (ровно цена инцидента 2026-07-19, ради которого реестр и заведён).
+// Апстрим менял дефолт дважды:
 //
-//	26.1.13: MaxConcurrency = 1..1     ← было у нас; соединение НА КАЖДЫЙ стрим
-//	26.7.11: MaxConnections = 6..6     ← сейчас; пул из 6 соединений, стримы
+//	26.1.13: MaxConcurrency = 1..1     ← соединение НА КАЖДЫЙ стрим
+//	26.7.11: MaxConnections = 6..6     ← пул из 6 соединений, стримы
 //	                                     распределяются по ним (concurrency=0)
+//	26.9.9:  MaxConnections = 3..3     ← сейчас; тот же пул, но вдвое уже
 //
-// Разница принципиальная для стабильности: при concurrency=1 каждое проксируемое
-// TCP-соединение тянет СВОЙ TLS-хендшейк через CDN (спидтест открывает их
-// десятками → шторм хендшейков, каждое соединение стартует с холодного
-// congestion window), при connections=6 работает тёплый пул фиксированного
-// размера в устоявшемся режиме. Именно это отличает ровный Happ от нашей
-// «метастабильности» (приём гулял 222→47 при отдаче 0.5-0.75).
+// Первый переход (concurrency→connections) — про стабильность: при
+// concurrency=1 каждое проксируемое TCP-соединение тянет СВОЙ TLS-хендшейк
+// через CDN (спидтест открывает их десятками → шторм хендшейков, каждое
+// соединение стартует с холодного congestion window), при пуле фиксированного
+// размера работает тёплый набор соединений в устоявшемся режиме. Именно это
+// отличает ровный Happ от нашей «метастабильности» (приём гулял 222→47 при
+// отдаче 0.5-0.75).
 //
-// maxConnections и maxConcurrency у Xray взаимоисключающие
-// (infra/conf/transport_method.go:449 — конфиг с обоими отвергается), поэтому
-// здесь выставляется РОВНО одно из них.
+// Второй переход (6→3) — про ТСПУ, и он про НАШИХ пользователей буквально:
+// XTLS/Xray-core 18e28390 «XHTTP client: Reduce default maxConnections from 6
+// to 3 for anti-TSPU» (по обсуждению в issue #6376), где ТСПУ — российский DPI.
+// Шесть одновременных длинных TLS/H2-сессий на один хост — сам по себе
+// различимый профиль; апстрим срезал его вдвое, оставив пул тёплым. Мы этот
+// дефолт не «наследуем за компанию»: целевая популяция ТСПУ и есть наша
+// аудитория, так что расхождение здесь стоило бы дороже, чем апстриму.
+//
+// Точная семантика апстрима (infra/conf/transport_method.go, SplitHTTPConfig.Build):
+//
+//   - дефолты подставляются ТОЛЬКО если блок `xmux` пуст ЦЕЛИКОМ
+//     (`if c.Xmux == (XmuxConfig{})`). Задал пользователь хоть одно поле —
+//     дефолтов не подставляется НИ ОДНОГО, включая maxConnections; остальные
+//     поля остаются нулями (= «безлимит»). Наши два вызова ниже сравнивают
+//     ровно так же — со всей структурой, а не по полям;
+//   - maxConnections и maxConcurrency взаимоисключающие (там же, проверка
+//     `MaxConnections.To > 0 && MaxConcurrency.To > 0` → конфиг отвергается),
+//     поэтому здесь выставляется РОВНО одно из них. Саму проверку мы не
+//     портируем: у нас нет конфиг-парсера Xray, а отказ грузить конфиг сделал
+//     бы клиент менее «всеядным» — рантайм (mux.go getXmuxClientLocked) при
+//     обоих заданных ведёт себя детерминированно: сперва кэп по connections,
+//     затем фильтр по concurrency.
 func applyXmuxDefaults(x *option.V2RayXHTTPXmuxOptions) {
-	x.MaxConnections = Xbadoption.Range{From: 6, To: 6}
+	x.MaxConnections = Xbadoption.Range{From: 3, To: 3}
 	x.HMaxRequestTimes = Xbadoption.Range{From: 600, To: 900}
 	x.HMaxReusableSecs = Xbadoption.Range{From: 1800, To: 3000}
 }
@@ -501,6 +528,12 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 			// работать с тем клиентом, который был актуален на момент её запуска, а
 			// не с тем, на который переменную успела перезаписать ротация.
 			go func(hClient DialerClient, hXmuxClient *XmuxClient) {
+				// Тело здесь ОДНОРАЗОВОЕ: MultiBufferContainer сливается по мере
+				// чтения и возвращает буферы в пул. Переигрываемость после GOAWAY
+				// (h2) / H3_REQUEST_REJECTED (h3) обеспечивает сам PostPacket —
+				// он материализует чанк и ставит req.GetBody; обоснование и
+				// разбор безопасности при строгом seq — в dialer.go (порт Xray
+				// dffc7ada, 26.9.9). Меняешь тип тела — перечитай тот комментарий.
 				err := hClient.PostPacket(
 					ctx,
 					url.String(),
@@ -574,7 +607,7 @@ func (c *Client) DialContext(ctx context.Context) (retConn net.Conn, retErr erro
 // route/network.go зовёт ResetNetwork() → InterfaceUpdated() у outbound'ов →
 // vless/vmess/trojan зовут transport.Close(), чтобы транспорт передиалился
 // свежим. Наш порт Xray splithttp этот контракт не реализовал (`return nil`):
-// XmuxManager с тёплым пулом (дефолт 26.7.11 — maxConnections 6..6) переживал
+// XmuxManager с тёплым пулом (дефолт 26.9.9 — maxConnections 3..3) переживал
 // сброс с мёртвым TCP под собой, и после пробуждения туннель висел до
 // аварийных таймеров (h2 ReadIdleTimeout 45с + ping 15с; h3 QUIC
 // MaxIdleTimeout — до 300с), тогда как остальные протоколы оживали сразу.

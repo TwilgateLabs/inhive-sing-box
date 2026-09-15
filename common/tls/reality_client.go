@@ -44,13 +44,16 @@ import (
 
 var _ ConfigCompat = (*RealityClientConfig)(nil)
 
-// Версия клиента, объявляемая REALITY-серверу в SessionId[0:3]. Совпадает с
-// Xray-эталоном (core/upstream.toml, запись `xhttp`: ref = v26.7.11) — сервер
-// сверяет её с minClientVer/maxClientVer. Подробности — в ClientHandshake.
+// Версия клиента, объявляемая REALITY-серверу в SessionId[0:3]. Держится РАВНОЙ
+// Xray-эталону из core/upstream.toml (записи `xhttp`/`xray-common`/`xray2sing`,
+// сейчас v26.9.9) — сервер сверяет её с minClientVer/maxClientVer, и застывшая
+// версия молча отбрасывалась серверами, которые пускают настоящий Xray
+// (замер 2026-08-03: 1.8.1 → VERIFIED=false, реальная версия → true, 3/3).
+// Двигать ОДНОВРЕМЕННО с бампом эталона. Подробности — в ClientHandshake.
 const (
 	realityClientVerX = 26
-	realityClientVerY = 7
-	realityClientVerZ = 11
+	realityClientVerY = 9
+	realityClientVerZ = 9
 )
 
 type RealityClientConfig struct {
@@ -146,6 +149,32 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	if err != nil {
 		return nil, err
 	}
+	// X25519MLKEM768 вырезается из ClientHello. Это апстримный код sing-box
+	// (есть и в v1.13.21); mihomo держит то же с формулировкой «X25519MLKEM768
+	// does not work properly with the old reality server».
+	//
+	// 🔬 ИЗМЕРЕНО 2026-09-15 — вырезание СЕЙЧАС ОБЯЗАТЕЛЬНО, и вот почему его
+	// нельзя просто снять «ради паритета с Xray»:
+	// Снятие было написано и собрано, потому что XTLS/REALITY 8cdf7bf9
+	// (2026-09-08, Xray >= 26.9.8) переключил СЕРВЕР на обратное правило —
+	// ClientHello БЕЗ MLKEM отвергается. На живых серверах Никиты вышло так:
+	//   yandex.ru      (3 аутбаунда) — 129/267/145 мс, работают;
+	//   disk.yandex.ru (1 аутбаунд)  — `remote error: tls: illegal parameter`,
+	//                                  5 попыток из 5, стабильно.
+	// Разница между ними ровно одна — TARGET (server_name). REALITY отдаёт наш
+	// ClientHello на target-сайт, и если target не умеет X25519MLKEM768, он
+	// рвёт хендшейк алертом. То есть допустимость MLKEM определяется НЕ версией
+	// REALITY-сервера, а TLS-стеком чужого сайта, под который мы маскируемся.
+	//
+	// ИТОГ: два требования противоречат друг другу, и «правильного» глобального
+	// значения нет —
+	//   вырезать   → отвергнут серверы на Xray >= 26.9.8 (их будет больше);
+	//   не вырезать → отвергнут все конфиги, чей target не умеет MLKEM.
+	// Поэтому оставляем прежнее поведение (вырезаем) и заводим отдельную задачу
+	// на адаптивную стратегию: пробовать без MLKEM, а при REALITY-фейле
+	// повторить с MLKEM (или наоборот), с запоминанием результата per-server.
+	// Менять это вслепую нельзя — проверка возможна только на живых серверах
+	// обоих поколений. Детали: memory/debug_reality_mlkem_target_conflict.
 	for _, extension := range uConn.Extensions {
 		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
 			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {

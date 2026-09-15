@@ -137,7 +137,7 @@ func (m *XmuxManager) newXmuxClient() *XmuxClient {
 // это опора контракта sing-box V2RayClientTransport.Close(). При событии
 // сна/пробуждения Windows route/network.go зовёт ResetNetwork() →
 // InterfaceUpdated() у outbound'ов → transport.Close(); без сброса тёплый пул
-// xmux (дефолт 26.7.11 — maxConnections 6..6) переживал сброс с мёртвым TCP
+// xmux (дефолты — см. applyXmuxDefaults в client.go, единственное место) переживал сброс с мёртвым TCP
 // под собой, и туннель после пробуждения висел до аварийных таймеров
 // (h2 ReadIdleTimeout 45с + ping 15с, h3 — до 300с). Тот же путь закрывает
 // утечку живых H2-сессий при каждом перезапуске конфига (Outbound.Close()).

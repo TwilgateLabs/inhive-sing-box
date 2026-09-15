@@ -826,6 +826,14 @@ type V2RayXHTTPXmuxOptions struct {
 	HKeepAlivePeriod int64            `json:"hKeepAlivePeriod"`
 }
 
+// Нормализаторы xmux — parity с Xray splithttp/config.go (26.9.9, сверено
+// 2026-09-15): все они ПРОПУСКАЮТ значение как есть и отдают 0..0 для
+// незаданного поля. Никаких «дефолтов» здесь нет и быть не должно — у Xray
+// дефолтный блок xmux подставляется ОДИН раз в конфиг-парсере
+// (infra/conf/transport_method.go, только если блок `xmux` пуст целиком), а у
+// нас — в transport/v2rayxhttp/client.go:applyXmuxDefaults. Продублировать их
+// здесь значит получить два источника истины и разойтись на следующем же
+// апстримном изменении дефолта (26.1.13 → 26.7.11 → 26.9.9 — уже трижды).
 func (m *V2RayXHTTPXmuxOptions) GetNormalizedMaxConcurrency() Xbadoption.Range {
 	return m.MaxConcurrency
 }

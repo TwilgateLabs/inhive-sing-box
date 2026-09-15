@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/xray/buf"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -345,5 +346,100 @@ func TestXmuxManagerResetLazyRecreate(t *testing.T) {
 	}
 	if second == first {
 		t.Fatal("GetXmuxClient returned the closed client after Reset")
+	}
+}
+
+// capturingRoundTripper перехватывает запрос, не отправляя его в сеть, и
+// отвечает пустым 200 — ровно то, что нужно PostPacket'у на h2-ветке
+// (io.Copy(io.Discard, resp.Body) + проверка кода). Тело запроса он НЕ читает и
+// НЕ закрывает, поэтому тест может прочитать его после возврата.
+type capturingRoundTripper struct {
+	req *http.Request
+}
+
+func (rt *capturingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.req = req
+	return &http.Response{
+		StatusCode: 200,
+		Status:     "200 OK",
+		Proto:      "HTTP/2.0",
+		ProtoMajor: 2,
+		ProtoMinor: 0,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("")),
+		Request:    req,
+	}, nil
+}
+
+// TestPostPacketDefinesGetBody — порт Xray dffc7ada (PR #6632, вошёл в 26.9.9):
+// packet-up POST обязан быть ПЕРЕИГРЫВАЕМЫМ. Без req.GetBody h2 на GOAWAY
+// (ротация соединения у CDN, graceful shutdown origin'а) отказывается повторять
+// запрос — shouldRetryRequest возвращает «define Request.GetBody to avoid this
+// error», PostPacket отдаёт ошибку, а client.go на ошибку POST'а делает
+// uploadPipeReader.Interrupt(), то есть теряет ВСЮ upload-половину сессии.
+// Симптом у пользователя — «тормозит», а не «сломалось», поэтому регрессия
+// молчаливая и нужен именно тест на свойство.
+//
+// Тело здесь — *buf.MultiBufferContainer, ровно тот тип, что передаёт цикл
+// отправки packet-up (client.go). Это принципиально: для *strings.Reader,
+// *bytes.Reader и *bytes.Buffer net/http ставит GetBody САМ, поэтому на
+// существующем хелпере postOnce (strings.NewReader) свойство выполняется даром
+// и ничего не проверяет.
+func TestPostPacketDefinesGetBody(t *testing.T) {
+	payload := []byte("hello xhttp")
+
+	dest := M.ParseSocksaddr("127.0.0.1:443")
+	baseOptions := &option.V2RayXHTTPBaseOptions{Path: "/upload"}
+	tlsConfig := insecureH2TLS(t)
+
+	dc := createHTTPClient(dest, &trackingDialer{}, baseOptions, tlsConfig, nil)
+	ddc, isDefault := dc.(*DefaultDialerClient)
+	if !isDefault {
+		t.Fatalf("createHTTPClient returned %T, want *DefaultDialerClient", dc)
+	}
+	if ddc.httpVersion == "1.1" {
+		t.Fatalf("httpVersion = %q, want the non-1.1 branch (GOAWAY replay is an h2/h3 property)", ddc.httpVersion)
+	}
+	rt := &capturingRoundTripper{}
+	ddc.client.Transport = rt
+
+	requestURL, err := getBaseRequestURL(baseOptions, dest, tlsConfig)
+	if err != nil {
+		t.Fatalf("getBaseRequestURL: %v", err)
+	}
+
+	body := &buf.MultiBufferContainer{MultiBuffer: buf.MergeBytes(nil, payload)}
+	if err := ddc.PostPacket(context.Background(), requestURL.String(), body, int64(len(payload))); err != nil {
+		t.Fatalf("PostPacket: %v", err)
+	}
+
+	if rt.req == nil {
+		t.Fatal("round tripper saw no request")
+	}
+	if rt.req.GetBody == nil {
+		t.Fatal("req.GetBody == nil: h2 cannot replay this POST after GOAWAY, the whole upload half dies with it")
+	}
+	if rt.req.ContentLength != int64(len(payload)) {
+		t.Fatalf("ContentLength = %d, want %d", rt.req.ContentLength, len(payload))
+	}
+
+	first, err := io.ReadAll(rt.req.Body)
+	if err != nil {
+		t.Fatalf("read req.Body: %v", err)
+	}
+	if string(first) != string(payload) {
+		t.Fatalf("req.Body = %q, want %q", first, payload)
+	}
+
+	replay, err := rt.req.GetBody()
+	if err != nil {
+		t.Fatalf("GetBody: %v", err)
+	}
+	second, err := io.ReadAll(replay)
+	if err != nil {
+		t.Fatalf("read replayed body: %v", err)
+	}
+	if string(second) != string(payload) {
+		t.Fatalf("replayed body = %q, want %q (replay must resend the same chunk, same seq)", second, payload)
 	}
 }

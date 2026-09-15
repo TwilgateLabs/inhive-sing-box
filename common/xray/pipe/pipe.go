@@ -45,6 +45,9 @@ func New(opts ...Option) (*Reader, *Writer) {
 		opt(&(p.option))
 	}
 
+	// NB: Xray v26.9.9 de-indents this literal (transport/pipe/pipe.go +4/-4), but
+	// that layout is whitespace-only AND our gofmt (go1.26.5) rewrites it straight
+	// back to the form below. Do not "sync" it; the repo gate is gofmt, not upstream.
 	return &Reader{
 			pipe: p,
 		}, &Writer{

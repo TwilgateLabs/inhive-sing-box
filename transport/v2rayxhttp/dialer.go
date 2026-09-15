@@ -42,8 +42,19 @@ type DefaultDialerClient struct {
 	// → вкладка «Логи»). InHive 2026-08-03: до этого у дозвонщика логгера не
 	// было вовсе, и ВЕСЬ класс отказов открытия стрима был немым — см. logDial.
 	// nil допустим (тесты, download-detour без логгера); все вызовы nil-safe.
-	logger      logger.ContextLogger
-	closed      bool
+	logger logger.ContextLogger
+	// closed — «этот клиент больше не годен для переиспользования».
+	//
+	// InHive 2026-09-15, порт Xray 77f98eba (PR #6665, вошёл в 26.9.9): было
+	// голое `bool`, и это настоящая гонка данных, а не формальность. ПИШУТ его
+	// три разные горутины: горутина ответа OpenStream (отказ client.Do), любая
+	// из параллельных POST-горутин packet-up (PostPacket, их десятки в полёте) и
+	// Close() из пула xmux. ЧИТАЕТ его IsClosed() — из XmuxManager
+	// (mux.go getXmuxClientLocked, под СВОИМ mtx, который с этими писателями
+	// никакого happens-before не создаёт) и из Probe/Sweep-путей. То есть
+	// каждый prune пула читает флаг, который в этот момент пишет чужая горутина.
+	// Апстрим закрыл это тем же способом — atomic.Bool.
+	closed      atomic.Bool
 	httpVersion string
 	// pool of net.Conn, created using dialUploadConn
 	uploadRawPool  *sync.Pool
@@ -51,7 +62,7 @@ type DefaultDialerClient struct {
 }
 
 func (c *DefaultDialerClient) IsClosed() bool {
-	return c.closed
+	return c.closed.Load()
 }
 
 // logDial озвучивает отказ ДОЗВОНА (открытия HTTP-стрима) в пользовательский лог.
@@ -94,7 +105,7 @@ func (c *DefaultDialerClient) logDial(ctx context.Context, message string) {
 //     transport непереиспользуем ("A Transport cannot be used after it has
 //     been closed") — не проблема, см. выше: клиент одноразовый.
 func (c *DefaultDialerClient) Close() error {
-	c.closed = true
+	c.closed.Store(true)
 	if c.client == nil {
 		return nil
 	}
@@ -122,11 +133,58 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 	// this is done when the TCP/UDP connection to the server was established,
 	// and we can unblock the Dial function and print correct net addresses in
 	// logs
+	//
+	// InHive 2026-09-15: колбэк GotConn исполняется в ЧУЖОЙ горутине (внутри
+	// client.Do) и может сработать НЕ ОДИН РАЗ за один вызов Do. Это не теория,
+	// а устройство всех трёх наших транспортов:
+	//   - вендоренный x/net/http2 зовёт traceGotConn на КАЖДОЙ итерации цикла
+	//     повтора (replace/x-net/http2/transport_common.go:338-345 — повтор на
+	//     GOAWAY / errClientConnUnusable / REFUSED_STREAM). У stream-down GET
+	//     тело == nil, поэтому shouldRetryRequest отдаёт тот же запрос назад
+	//     безусловно — это ровно тот запрос, который повторяется чаще всего;
+	//   - net/http Transport.roundTrip так же переспрашивает getConn (а тот
+	//     зовёт trace.GotConn), когда взятое из пула keep-alive-соединение
+	//     оказалось уже мёртвым — обычное дело за CDN и после сна девайса;
+	//   - quic-go http3.Transport делает то же в doRoundTripOpt;
+	//   - и сверх того client.Do идёт по редиректам, а каждый редирект — новый
+	//     RoundTrip с тем же ClientTrace.
+	//
+	// gotConn — done.Instance (sync.Once), поэтому родителя освобождает только
+	// ПЕРВОЕ срабатывание. Значит колбэк, пишущий в общие переменные, пишет их
+	// уже ПОСЛЕ того, как родитель проснулся и читает, — незасинхронизированный
+	// read/write двух интерфейсных значений по два машинных слова каждое, то
+	// есть тот же класс torn read, что мы чинили в WaitReadCloser. Прежняя
+	// правка (писать в локальные переменные вместо именованных результатов)
+	// гонку не убирала, а только переносила: окно на повторах оставалось
+	// открытым, и комментарий здесь утверждал happens-before, которого для
+	// второго и последующих срабатываний нет. Воспроизводится под
+	// `go test -race` — см. TestOpenStreamGotConnFiresPerAttempt.
+	//
+	// Публикуем пару одним atomic.Pointer на НЕИЗМЕНЯЕМУЮ структуру и ставим её
+	// через CompareAndSwap: побеждает первая попытка — ровно та, по которой
+	// родитель и разблокировался, — а все последующие срабатывания становятся
+	// no-op. Мутации на месте нет вовсе, поэтому сколько бы раз колбэк ни
+	// сработал, читателю нечего рвать.
+	//
+	// Это СОЗНАТЕЛЬНОЕ усиление против апстрима: Xray v26.9.9
+	// (transport/internet/splithttp/client.go) по-прежнему пишет из колбэка
+	// прямо в именованные результаты и несёт ту же гонку. Побочно это закрывает
+	// и унаследованную от hiddify ветку `<-ctx.Done()` в select ниже (коммит
+	// f356a2972 2026-01-30), которой у апстрима нет вовсе: сегодня она
+	// недостижима (client.go передаёт сюда uploadCtx, не отменяемый до возврата
+	// из DialContext), но «недостижимо» — не «безопасно».
+	type tracedAddrs struct {
+		remote net.Addr
+		local  net.Addr
+	}
+	var tracedAddr atomic.Pointer[tracedAddrs]
 	gotConn := done.New()
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 		GotConn: func(connInfo httptrace.GotConnInfo) {
-			remoteAddr = connInfo.Conn.RemoteAddr()
-			localAddr = connInfo.Conn.LocalAddr()
+			tracedAddr.CompareAndSwap(nil, &tracedAddrs{
+				remote: connInfo.Conn.RemoteAddr(),
+				local:  connInfo.Conn.LocalAddr(),
+			})
 			gotConn.Close()
 		},
 	})
@@ -156,7 +214,23 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 	// не уезжал на провод, сервер отвергал каждый такой запрос, и в нашем логе не было
 	// ни строчки.
 	header, effectiveURL := c.options.GetRequestHeader(url)
-	req, _ := http.NewRequestWithContext(ctx, method, effectiveURL, body)
+	// InHive 2026-09-15: ошибку построения запроса НЕЛЬЗЯ глотать — раньше здесь
+	// стояло `req, _ :=`, а следующая же строка разыменовывала req.
+	//
+	// Это не гигиена, а падение процесса от ЧУЖОГО конфига: на пути
+	// stream-up/stream-one method берётся из GetNormalizedUplinkHTTPMethod()
+	// (option/v2ray_transport.go), то есть напрямую из подписки, без валидации.
+	// Любой метод с пробелом или управляющим символом («POST X») даёт
+	// `net/http: invalid method`, req == nil и nil pointer dereference в ядре
+	// VPN. PostPacket ниже эту ошибку обрабатывает корректно — файл расходился
+	// сам с собой. Апстрим (Xray v26.9.9 splithttp/client.go) проверяет её здесь
+	// точно так же. Все три вызова OpenStream в client.go возвращаемую ошибку
+	// пробрасывают, так что отказ вырождается в неудачный диал.
+	req, err := http.NewRequestWithContext(ctx, method, effectiveURL, body)
+	if err != nil {
+		c.logDial(ctx, F.ToString("xhttp: cannot build ", method, " request for ", effectiveURL, ": ", err))
+		return nil, nil, nil, err
+	}
 	req.Header = header
 	if body != nil && !c.options.NoGRPCHeader {
 		req.Header.Set("Content-Type", "application/grpc")
@@ -178,13 +252,13 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 		query.Set(c.options.GetNormalizedDownFrameKey(), "1")
 		req.URL.RawQuery = query.Encode()
 	}
-	wrc = &WaitReadCloser{Wait: make(chan struct{})}
+	wrc = &WaitReadCloser{wait: done.New()}
 	go func() {
 		resp, err := c.client.Do(req)
 		if err != nil {
 			c.logDial(ctx, F.ToString("xhttp: ", method, " stream failed: ", err))
 			if !uploadOnly { // stream-down is enough
-				c.closed = true
+				c.closed.Store(true)
 			}
 			gotConn.Close()
 			wrc.Close()
@@ -210,6 +284,15 @@ func (c *DefaultDialerClient) OpenStream(ctx context.Context, url string, body i
 	}()
 	select {
 	case <-gotConn.Wait():
+		// Единственное место, где адреса читаются. Публикация — atomic.Pointer,
+		// поэтому чтение корректно независимо от того, сколько ещё раз колбэк
+		// сработает после нашего пробуждения (см. разбор повторов выше).
+		// На путях отказа client.Do gotConn закрывает сама горутина ответа, и
+		// колбэк мог не сработать вовсе — тогда Load() даёт nil и адреса
+		// остаются нулевыми, ровно как и раньше.
+		if addrs := tracedAddr.Load(); addrs != nil {
+			remoteAddr, localAddr = addrs.remote, addrs.local
+		}
 	case <-ctx.Done():
 	}
 	return
@@ -233,10 +316,57 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 	}
 	req.ContentLength = contentLength
 	req.Header = header
+	// InHive 2026-09-15, порт Xray dffc7ada (PR #6632, вошёл в 26.9.9): тело
+	// packet-up POST'а обязано быть ПЕРЕИГРЫВАЕМЫМ, иначе h2/h3 теряет запрос на
+	// GOAWAY. Апстрим ставит GetBody в Config.FillPacketRequest (материализует
+	// payload в []byte); у нас тело приходит параметром, поэтому делаем это здесь
+	// — PostPacket единственная точка сборки packet-up запроса, так что свойство
+	// принадлежит транспорту, а не вызывающему коду.
+	//
+	// Механика отказа, который это чинит (вендоренный x/net/http2,
+	// replace/x-net/http2): setGoAway() обрывает ровно те стримы, у которых ID >
+	// LastStreamID — то есть те, которые сервер ГАРАНТИРОВАННО не обработал, —
+	// ошибкой errClientConnGotGoAway. roundTripViaPool ловит её и зовёт
+	// shouldRetryRequest (transport_common.go:395): тело есть, GetBody нет →
+	// «cannot retry err [...] after Request.Body was written; define
+	// Request.GetBody to avoid this error». Телом у нас был одноразовый
+	// buf.MultiBufferContainer, для которого net/http GetBody не выводит (он
+	// умеет только *bytes.Reader/*bytes.Buffer/*strings.Reader), — значит КАЖДЫЙ
+	// GOAWAY (ротация h2-соединения на CDN, graceful shutdown origin'а,
+	// hMaxRequestTimes на той стороне) ронял POST, а client.go на ошибку POST'а
+	// делает uploadPipeReader.Interrupt() — то есть убивал ВСЮ upload-половину
+	// сессии, а не один чанк. Тот же механизм и в h3 (quic-go http3
+	// canRetryRequest, повтор только на H3_REQUEST_REJECTED).
+	//
+	// Почему повтор безопасен при нашей строгой нумерации seq:
+	//   - переигрывается ТОТ ЖЕ req (shouldRetryRequest делает поверхностную
+	//     копию — тот же URL, тот же seq, тот же padding), дубля seq не возникает;
+	//   - и h2, и h3 повторяют ТОЛЬКО то, что сервер по протоколу не обрабатывал
+	//     (ID > LastStreamID / REFUSED_STREAM / H3_REQUEST_REJECTED), значит
+	//     оригинал до upload_queue не доехал и дырки в нумерации тоже не будет;
+	//   - если повтор разъедется по времени с соседним POST'ом, upload_queue на
+	//     сервере пересобирает по seq (heap до scMaxBufferedPosts) — ровно тот
+	//     случай, ради которого он написан.
+	// Альтернатива «не переигрывать» — не «чуть хуже», а обрыв сессии.
+	//
+	// Цена: одна копия чанка на POST (у апстрима такая же). Пулевые буферы
+	// отдаём в пул сразу — иначе чанк держался бы до конца запроса.
+	if req.Body != nil && req.GetBody == nil && contentLength >= 0 {
+		data := make([]byte, contentLength)
+		if _, readErr := io.ReadFull(req.Body, data); readErr != nil {
+			req.Body.Close()
+			return readErr
+		}
+		req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewReader(data))
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(data)), nil
+		}
+	}
 	if c.httpVersion != "1.1" {
 		resp, err := c.client.Do(req)
 		if err != nil {
-			c.closed = true
+			c.closed.Store(true)
 			return err
 		}
 		io.Copy(io.Discard, resp.Body)
@@ -279,7 +409,7 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 				if h1UploadConn.UnreadedResponsesCount > 0 {
 					resp, err := http.ReadResponse(h1UploadConn.RespBufReader, req)
 					if err != nil {
-						c.closed = true
+						c.closed.Store(true)
 						return fmt.Errorf("error while reading response: %s", err.Error())
 					}
 					io.Copy(io.Discard, resp.Body)
@@ -313,39 +443,64 @@ func (c *DefaultDialerClient) PostPacket(ctx context.Context, url string, body i
 // сессии: приём падал с `context canceled` / `read/write on closed pipe`, а
 // upload-горутина продолжала жить — сессия наполовину мертва, порядок seq
 // нарушен, сервер встаёт головой очереди.
-// InHive 2026-08-01: НАМЕРЕННОЕ расхождение с апстримом (упомянуто в
-// core/upstream.toml). У Xray поле — голое встроенное `io.ReadCloser`:
+// InHive 2026-08-01: у Xray поле было голым встроенным `io.ReadCloser`:
 // Set() пишет его из горутины ответа OpenStream, а Read()/Close() читают из
 // горутины читателя БЕЗ синхронизации. Интерфейсное значение — это два
 // машинных слова, так что это не «ложный шум детектора», а настоящий torn
 // read: читатель может увидеть type-слово от нового значения с data-словом
 // от старого. Подтверждено go test -race (гонка воспроизводится и с
 // downFrame:false — к фреймингу отношения не имеет, это общий reader всех
-// режимов xhttp). Чиним atomic.Pointer'ом: Set атомарно публикует, горячий
-// путь Read платит один атомарный Load (обычная загрузка + барьер
-// компилятора — деградации нет). Семантика Wait/Close сохранена бит-в-бит,
-// включая recover на двойное close(Wait) при гонке Set против Close.
-// У апстрима гонка тоже есть — кандидат в отдельный PR к XTLS.
+// режимов xhttp). Мы закрыли её atomic.Pointer'ом.
+//
+// InHive 2026-09-15: апстрим независимо починил ТУ ЖЕ гонку — Xray eef6e63b
+// (PR #6694, вошёл в 26.9.9) — и пришёл к той же atomic.Pointer-форме. Берём
+// апстримную целиком, потому что она СИЛЬНЕЕ нашей в трёх местах, и каждое
+// из трёх у нас реально достижимо:
+//
+//   - `reader.Swap(nil)` вместо `Load()` ⇒ нижележащий Body закрывается РОВНО
+//     ОДИН раз. У нас двойной Close был штатным сценарием, а не экзотикой:
+//     conn.Close() (conn.go) зовёт reader.Close(), а горутина ответа на non-200
+//     зовёт wrc.Close() — оба раза по одному и тому же resp.Body. Для h2-тела
+//     это сходило с рук, для нашего framedReader (framer.go) — тоже, но
+//     свойство «закрыть ровно один раз» держится структурой, а не везением.
+//   - Close() теперь ВСЕГДА закрывает wait ⇒ читатель, стоящий в `<-wait`,
+//     гарантированно освобождается и получает io.ErrClosedPipe. В нашей версии
+//     ветка `rc != nil` возвращалась, не трогая wait, и корректность держалась
+//     на рассуждении «Set всё равно закроет канал следом» — рассуждение верное,
+//     но лишнее.
+//   - Read после Close возвращает io.ErrClosedPipe, а не лезет читать из уже
+//     закрытого Body (Swap(nil) обнуляет указатель) — детерминированная ошибка
+//     вместо «что вернёт закрытое тело».
+//
+// done.Instance вместо `chan struct{}` + recover: двойное закрытие у него
+// идемпотентно (sync.Once), поэтому гонка Set-против-Close ловится честной
+// проверкой wait.Done(), а не паникой как сигналом. Панику мы держали только
+// ради parity с 26.7.11 — теперь parity ровно наоборот.
+//
+// НАШЕ расхождение, которое здесь сохраняется: Set может получить не голый
+// resp.Body, а framedReader поверх него (stream-down keepalive, framer.go) —
+// это по-прежнему обычный io.ReadCloser, и вся механика выше работает с ним
+// без изменений.
 type WaitReadCloser struct {
-	Wait chan struct{}
-	rc   atomic.Pointer[io.ReadCloser]
+	wait   *done.Instance
+	reader atomic.Pointer[io.ReadCloser]
 }
 
 func (w *WaitReadCloser) Set(rc io.ReadCloser) {
-	w.rc.Store(&rc)
-	defer func() {
-		if recover() != nil {
-			rc.Close()
+	w.reader.Store(&rc)
+	if w.wait.Done() {
+		if p := w.reader.Swap(nil); p != nil {
+			(*p).Close()
 		}
-	}()
-	close(w.Wait)
+	}
+	w.wait.Close()
 }
 
 func (w *WaitReadCloser) Read(b []byte) (int, error) {
-	rc := w.rc.Load()
+	rc := w.reader.Load()
 	if rc == nil {
-		<-w.Wait
-		if rc = w.rc.Load(); rc == nil {
+		<-w.wait.Wait()
+		if rc = w.reader.Load(); rc == nil {
 			return 0, io.ErrClosedPipe
 		}
 	}
@@ -353,17 +508,10 @@ func (w *WaitReadCloser) Read(b []byte) (int, error) {
 }
 
 func (w *WaitReadCloser) Close() error {
-	if rc := w.rc.Load(); rc != nil {
-		return (*rc).Close()
+	w.wait.Close()
+	if p := w.reader.Swap(nil); p != nil {
+		return (*p).Close()
 	}
-	defer func() {
-		if recover() != nil {
-			if rc := w.rc.Load(); rc != nil {
-				(*rc).Close()
-			}
-		}
-	}()
-	close(w.Wait)
 	return nil
 }
 

@@ -118,7 +118,11 @@ func (w *BufferedWriter) Write(b []byte) (int, error) {
 
 		nBytes, err := w.buffer.Write(b)
 		totalBytes += nBytes
-		if err != nil {
+
+		// ErrBufferFull means a partial write, so flush below and continue
+		// (Xray v26.9.9 common/buf/writer.go; before that a write larger than
+		// the 8 KiB buffer aborted with ErrBufferFull instead of flushing).
+		if err != nil && err != ErrBufferFull {
 			return totalBytes, err
 		}
 		if !w.buffered || w.buffer.IsFull() {

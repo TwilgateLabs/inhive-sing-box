@@ -272,11 +272,24 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			Reader:         request.Body,
 			ResponseWriter: writer,
 		}
+		// Xray 26.9.9 (4aba687d, "XHTTP & gRPC servers: Get accurate
+		// localAddr"): s.localAddr — это адрес СЛУШАТЕЛЯ, и при listen на
+		// wildcard (0.0.0.0 / ::) он не говорит, на какой из локальных IP
+		// реально пришло соединение. Точный адрес кладёт в контекст сам
+		// HTTP-сервер: net/http делает это в conn.serve (server.go:1901,
+		// уже ПОСЛЕ нашего ConnContext, так что log.ContextWithNewID его не
+		// затирает), а http3 — в newRawServerConn (quic-go http3/server.go:441,
+		// оттуда же наследуется контекст запроса). Работает на обеих ветках,
+		// s.localAddr остаётся фоллбэком.
+		localAddr := s.localAddr
+		if la, ok := request.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && la != nil {
+			localAddr = la
+		}
 		conn := splitConn{
 			writer:     httpSC,
 			reader:     httpSC,
 			remoteAddr: remoteAddr,
-			localAddr:  s.localAddr,
+			localAddr:  localAddr,
 		}
 		if sessionId != "" { // if not stream-one
 			conn.reader = currentSession.uploadQueue
@@ -346,6 +359,15 @@ func (s *Server) ServePacket(listener net.PacketConn) error {
 			return err
 		}
 		s.localAddr = quicListener.Addr()
+		// Xray 26.9.9 (hub.go): после выхода из ServeListener апстрим закрывает
+		// и quic.Transport, и PacketConn. У нас PacketConn принадлежит
+		// listener-менеджеру sing-box (он его и закроет) — наше тут только то,
+		// что вернул ListenEarly. Без этого Close() внутреннего quic.Transport
+		// (quic.ListenEarly ставит isSingleUse) не происходит и его read-loop
+		// живёт до закрытия сокета. http3.Server.Close() чужой листенер не
+		// трогает (закрывает только createdLocally), но отменяет graceCtx —
+		// значит ServeListener возвращается и defer отрабатывает.
+		defer quicListener.Close()
 		return s.http3Server.ServeListener(quicListener)
 	}
 	return os.ErrInvalid

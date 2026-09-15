@@ -31,11 +31,24 @@ func (w uploadWriter) Write(b []byte) (int, error) {
 
 	var writed int
 	for _, buff := range buffer.MultiBuffer {
+		// InHive 2026-09-15, порт Xray 26.9.9 (изменение в
+		// transport/internet/splithttp/dialer.go, тот же файл апстрима, что и
+		// GetBody-фикс; у нас uploadWriter вынесен сюда): длину читаем ДО
+		// WriteMultiBuffer. После него буфер принадлежит пайпу, и его в любой
+		// момент может вычитать и Release'нуть горутина цикла отправки
+		// packet-up (client.go, uploadPipeReader.ReadMultiBuffer). Release()
+		// обнуляет буфер и возвращает срез в пул — то есть buff.Len() после
+		// передачи это чтение чужой памяти: либо 0, либо длина, записанная уже
+		// другим владельцем. Итог — нарушенный контракт io.Writer в обе
+		// стороны: n < len(b) при err == nil (вызывающий получает
+		// io.ErrShortWrite или дошлёт хвост, продублировав байты в туннеле)
+		// или n > len(b) (паника в копирующих циклах stdlib).
+		n := int(buff.Len())
 		err := w.WriteMultiBuffer(buf.MultiBuffer{buff})
 		if err != nil {
 			return writed, err
 		}
-		writed += int(buff.Len())
+		writed += n
 	}
 	return writed, nil
 }
