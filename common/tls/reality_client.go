@@ -143,54 +143,28 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
 	uConfig.InsecureSkipVerify = true
 	uConfig.SessionTicketsDisabled = true
 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
-	uConn := utls.UClient(conn, uConfig, e.uClient.id)
+	uConn, err := newRealityUConn(conn, uConfig, e.uClient.id)
+	if err != nil {
+		return nil, err
+	}
 	verifier.UConn = uConn
-	err := uConn.BuildHandshakeState()
-	if err != nil {
-		return nil, err
-	}
-	// X25519MLKEM768 вырезается из ClientHello. Это апстримный код sing-box
-	// (есть и в v1.13.21); mihomo держит то же с формулировкой «X25519MLKEM768
-	// does not work properly with the old reality server».
+	// X25519MLKEM768 — ГАРАНТИРОВАТЬ, а не вырезать (InHive 2026-09-18).
 	//
-	// 🔬 ИЗМЕРЕНО 2026-09-15 — вырезание СЕЙЧАС ОБЯЗАТЕЛЬНО, и вот почему его
-	// нельзя просто снять «ради паритета с Xray»:
-	// Снятие было написано и собрано, потому что XTLS/REALITY 8cdf7bf9
-	// (2026-09-08, Xray >= 26.9.8) переключил СЕРВЕР на обратное правило —
-	// ClientHello БЕЗ MLKEM отвергается. На живых серверах Никиты вышло так:
-	//   yandex.ru      (3 аутбаунда) — 129/267/145 мс, работают;
-	//   disk.yandex.ru (1 аутбаунд)  — `remote error: tls: illegal parameter`,
-	//                                  5 попыток из 5, стабильно.
-	// Разница между ними ровно одна — TARGET (server_name). REALITY отдаёт наш
-	// ClientHello на target-сайт, и если target не умеет X25519MLKEM768, он
-	// рвёт хендшейк алертом. То есть допустимость MLKEM определяется НЕ версией
-	// REALITY-сервера, а TLS-стеком чужого сайта, под который мы маскируемся.
+	// Апстримный sing-box (и v1.13.21) вырезает MLKEM из SupportedCurves и
+	// KeyShare; mihomo делал так же. XTLS/REALITY 8cdf7bf9 (2026-09-08,
+	// Xray >= 26.9.8) перевернул правило: сервер ТРЕБУЕТ keyShare X25519MLKEM768
+	// перед опциональным X25519, иначе `break` -> fallback на target. Сломаны
+	// все sing-box (#4520), karing, Exclave, Shadowrocket; mihomo v1.19.30 и
+	// Xray-клиенты (Happ и др.) шлют гибридный share и работают. Старый сервер
+	// (родитель e1986a4d31ca) предпочитает X25519 и MLKEM рядом игнорирует —
+	// значит гибридный share совместим с обоими поколениями.
 	//
-	// ИТОГ: два требования противоречат друг другу, и «правильного» глобального
-	// значения нет —
-	//   вырезать   → отвергнут серверы на Xray >= 26.9.8 (их будет больше);
-	//   не вырезать → отвергнут все конфиги, чей target не умеет MLKEM.
-	// Поэтому оставляем прежнее поведение (вырезаем) и заводим отдельную задачу
-	// на адаптивную стратегию: пробовать без MLKEM, а при REALITY-фейле
-	// повторить с MLKEM (или наоборот), с запоминанием результата per-server.
-	// Менять это вслепую нельзя — проверка возможна только на живых серверах
-	// обоих поколений. Детали: memory/debug_reality_mlkem_target_conflict.
-	for _, extension := range uConn.Extensions {
-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
-				return curveID != utls.X25519MLKEM768
-			})
-		}
-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
-				return share.Group != utls.X25519MLKEM768
-			})
-		}
-	}
-	err = uConn.BuildHandshakeState()
-	if err != nil {
-		return nil, err
-	}
+	// Первая гипотеза 2026-09-15 «target disk.yandex.ru не умеет MLKEM»
+	// ОПРОВЕРГНУТА прямым замером: ни disk.yandex.ru, ни yandex.ru MLKEM не
+	// согласуют, а REALITY при успешной аутентификации отвечает сам — target
+	// ему для этого не нужен. Реальная причина 3-из-4 — лотерея отпечатка
+	// `randomized`, см. newRealityUConn и его гард.
+	// (нормализация MLKEM и пересев randomized — внутри newRealityUConn выше)
 
 	if len(uConfig.NextProtos) > 0 {
 		for _, extension := range uConn.Extensions {
@@ -405,4 +379,87 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
 
 func (c *realityClientConnWrapper) WriterReplaceable() bool {
 	return true
+}
+
+// realityReseedAttempts — сколько раз пересеивать randomized-отпечаток, если
+// он вдруг дал spec без TLS 1.3 key_share. С ПРОД-весами (utls_client.go:
+// TLSVersMax_Set_VersionTLS13 = 1) такого не бывает — это страховка на случай
+// чужих весов или смены поведения utls, а не боевой путь.
+const realityReseedAttempts = 8
+
+// newRealityUConn строит uTLS-клиент для REALITY и доводит его ClientHello до
+// формы, которую понимает REALITY-сервер любого поколения (InHive 2026-09-18).
+//
+// Отпечатки Randomized/RandomizedNoALPN в metacubex/utls v1.8.7 кладут
+// X25519MLKEM768 в supported_groups и в key_shares двумя НЕЗАВИСИМЫМИ бросками
+// монетки (u_parrots.go:3058 и :3117), а Xray >= 26.9.8 (REALITY 8cdf7bf9)
+// требует MLKEM-share ПЕРВЫМ и отвергает всё остальное. Гард
+// TestRealityClientHello_MLKEMFirst с прод-весами: заметная доля seed'ов
+// голого randomized не проходит. Seed у нас один на процесс (utls_client.go),
+// то есть неудачный старт ядра клал бы ВСЕ REALITY-аутбаунды с randomized до
+// перезапуска — отказ, которого юзер не видит и не может отрепортить.
+// (Слой «TLS 1.2-only spec» существует только при DefaultWeights; прод-веса
+// его исключают — сюда добавлен пересев как страховка, не как фикс.)
+//
+// ПОЧЕМУ ПРАВИТСЯ SPEC, А НЕ uConn.Extensions ПОСЛЕ BuildHandshakeState (укусило
+// 2026-09-18, 0/4 серверов, `tls: error decoding message`): ключи для key_share
+// с пустым Data генерирует ApplyPreset, а его повторный BuildHandshakeState не
+// зовёт (clientHelloBuildStatus уже BuildByUtls). Вставленный после сборки
+// share уходил на провод пустым. Поэтому: UTLSIdToSpec -> нормализовать ->
+// HelloCustom + ApplyPreset (генерирует ключи) -> BuildHandshakeState.
+// SNI в spec пустой намеренно — ApplyPreset подставляет config.ServerName;
+// ALPN ниже по коду подменяется на config.NextProtos как и раньше.
+// Для chrome-пресетов с гибридным share нормализация — no-op.
+func newRealityUConn(conn net.Conn, uConfig *utls.Config, id utls.ClientHelloID) (*utls.UConn, error) {
+	isRandomized := id.Client == utls.HelloRandomized.Client || id.Client == utls.HelloRandomizedNoALPN.Client
+	for attempt := 0; ; attempt++ {
+		spec, err := utls.UTLSIdToSpec(id)
+		if err != nil {
+			return nil, E.Cause(err, "REALITY: fingerprint ", id.Str())
+		}
+		if specHasKeyShare(&spec) {
+			ensureMLKEMFirst(spec.Extensions)
+			uConn := utls.UClient(conn, uConfig, utls.HelloCustom)
+			if err := uConn.ApplyPreset(&spec); err != nil {
+				return nil, E.Cause(err, "REALITY: apply fingerprint ", id.Str())
+			}
+			if err := uConn.BuildHandshakeState(); err != nil {
+				return nil, err
+			}
+			return uConn, nil
+		}
+		if !isRandomized || attempt+1 >= realityReseedAttempts {
+			return nil, E.New("REALITY: fingerprint ", id.Str(), " produced a ClientHello without TLS 1.3 key_share; REALITY needs TLS 1.3 (use fingerprint chrome)")
+		}
+		seed, err := utls.NewPRNGSeed()
+		if err != nil {
+			return nil, E.Cause(err, "REALITY: reseed randomized fingerprint")
+		}
+		id.Seed = seed
+	}
+}
+
+func specHasKeyShare(spec *utls.ClientHelloSpec) bool {
+	for _, extension := range spec.Extensions {
+		if _, ok := extension.(*utls.KeyShareExtension); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureMLKEMFirst делает X25519MLKEM768 первым элементом supported_groups и
+// key_shares в списке расширений ДО ApplyPreset (см. newRealityUConn). Данные
+// share оставляются пустыми — их сгенерирует ApplyPreset. Идемпотентно.
+func ensureMLKEMFirst(extensions []utls.TLSExtension) {
+	for _, extension := range extensions {
+		switch ext := extension.(type) {
+		case *utls.SupportedCurvesExtension:
+			curves := common.Filter(ext.Curves, func(id utls.CurveID) bool { return id != utls.X25519MLKEM768 })
+			ext.Curves = append([]utls.CurveID{utls.X25519MLKEM768}, curves...)
+		case *utls.KeyShareExtension:
+			shares := common.Filter(ext.KeyShares, func(ks utls.KeyShare) bool { return ks.Group != utls.X25519MLKEM768 })
+			ext.KeyShares = append([]utls.KeyShare{{Group: utls.X25519MLKEM768}}, shares...)
+		}
+	}
 }
